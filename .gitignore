@@ -7,3 +7,12 @@ node_modules/
 .DS_Store
 dump.rdb
 documentation/
+# Devenv
+.devenv*
+devenv.local.nix
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
