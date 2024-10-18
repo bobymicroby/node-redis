@@ -34,7 +34,14 @@ describe('Client', () => {
           },
           username: 'user',
           password: 'secret',
-          database: 0
+          database: 0,
+          credentialsProvider: {
+            credentials: {
+              password: 'secret',
+              username: 'user'
+            },
+            type: 'basic-auth'
+          },
         }
       );
     });
@@ -50,7 +57,14 @@ describe('Client', () => {
           },
           username: 'user',
           password: 'secret',
-          database: 0
+          database: 0,
+          credentialsProvider: {
+            credentials: {
+              password: 'secret',
+              username: 'user'
+            },
+            type: 'basic-auth'
+          },
         }
       );
     });
@@ -88,6 +102,13 @@ describe('Client', () => {
         'PONG'
       );
     }, GLOBAL.SERVERS.PASSWORD);
+
+    testUtils.testWithClient('Client can authenticate asynchronously ', async client => {
+      assert.equal(
+        await client.ping(),
+        'PONG'
+      );
+    }, GLOBAL.SERVERS.ASYNC_BASIC_AUTH);
 
     testUtils.testWithClient('should execute AUTH before SELECT', async client => {
       assert.equal(

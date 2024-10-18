@@ -1,4 +1,6 @@
 import TestUtils from '@redis/test-utils';
+import { CredentialsProvider } from '@redis/client/lib/client';
+
 import { SinonSpy } from 'sinon';
 import { setTimeout } from 'node:timers/promises';
 
@@ -14,6 +16,12 @@ const DEBUG_MODE_ARGS = utils.isVersionGreaterThan([7]) ?
   ['--enable-debug-command', 'yes'] :
   [];
 
+const asyncBasicAuthCredentialsProvider: CredentialsProvider =
+  {
+    type: 'async-basic-auth',
+    credentials: async () => ({ password: 'password' })
+  } as const;
+
 export const GLOBAL = {
   SERVERS: {
     OPEN: {
@@ -23,6 +31,12 @@ export const GLOBAL = {
       serverArguments: ['--requirepass', 'password', ...DEBUG_MODE_ARGS],
       clientOptions: {
         password: 'password'
+      }
+    },
+    ASYNC_BASIC_AUTH: {
+      serverArguments: ['--requirepass', 'password', ...DEBUG_MODE_ARGS],
+      clientOptions: {
+        credentialsProvider : asyncBasicAuthCredentialsProvider
       }
     }
   },
