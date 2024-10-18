@@ -1,0 +1,11 @@
+{
+  "git": {
+    "tagName": "search@${version}",
+    "commitMessage": "Release ${tagName}",
+    "tagAnnotation": "Release ${tagName}"
+  },
+  "npm": {
+    "versionArgs": ["--workspaces-update=false"],
+    "publishArgs": ["--access", "public"]
+  }
+}

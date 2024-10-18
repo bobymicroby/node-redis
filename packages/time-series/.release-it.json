@@ -1,0 +1,11 @@
+{
+  "git": {
+    "tagName": "time-series@${version}",
+    "commitMessage": "Release ${tagName}",
+    "tagAnnotation": "Release ${tagName}"
+  },
+  "npm": {
+    "versionArgs": ["--workspaces-update=false"],
+    "publishArgs": ["--access", "public"]
+  }
+}

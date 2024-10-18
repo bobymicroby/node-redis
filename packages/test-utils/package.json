@@ -1,0 +1,13 @@
+{
+  "name": "@redis/test-utils",
+  "private": true,
+  "main": "./dist/lib/index.js",
+  "types": "./dist/lib/index.d.ts",
+  "peerDependencies": {
+    "@redis/client": "*"
+  },
+  "devDependencies": {
+    "@types/yargs": "^17.0.32",
+    "yargs": "^17.7.2"
+  }
+}

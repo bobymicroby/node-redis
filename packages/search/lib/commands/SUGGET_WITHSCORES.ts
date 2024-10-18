@@ -1,0 +1,50 @@
+import { NullReply, ArrayReply, BlobStringReply, DoubleReply, UnwrapReply, Command, TypeMapping } from '@redis/client/dist/lib/RESP/types';
+import { isNullReply, transformDoubleReply } from '@redis/client/dist/lib/commands/generic-transformers';
+import SUGGET from './SUGGET';
+
+type SuggestScore = {
+  suggestion: BlobStringReply;
+  score: DoubleReply;
+}
+
+export default {
+  FIRST_KEY_INDEX: SUGGET.FIRST_KEY_INDEX,
+  IS_READ_ONLY: SUGGET.IS_READ_ONLY,
+  transformArguments(...args: Parameters<typeof SUGGET.transformArguments>) {
+    const transformedArguments = SUGGET.transformArguments(...args);
+    transformedArguments.push('WITHSCORES');
+    return transformedArguments;
+  },
+  transformReply: {
+    2: (reply: NullReply | UnwrapReply<ArrayReply<BlobStringReply>>, preserve?: any, typeMapping?: TypeMapping) => {
+      if (isNullReply(reply)) return null;
+
+      const transformedReply: Array<SuggestScore> = new Array(reply.length / 2);
+      let replyIndex = 0,
+        arrIndex = 0;
+      while (replyIndex < reply.length) {
+        transformedReply[arrIndex++] = {
+          suggestion: reply[replyIndex++],
+          score: transformDoubleReply[2](reply[replyIndex++], preserve, typeMapping)
+        };
+      }
+
+      return transformedReply;
+    },
+    3: (reply: UnwrapReply<ArrayReply<BlobStringReply | DoubleReply>>) => {
+      if (isNullReply(reply)) return null;
+      
+      const transformedReply: Array<SuggestScore> = new Array(reply.length / 2);
+      let replyIndex = 0,
+        arrIndex = 0;
+      while (replyIndex < reply.length) {
+        transformedReply[arrIndex++] = {
+          suggestion: reply[replyIndex++] as BlobStringReply,
+          score: reply[replyIndex++] as DoubleReply
+        };
+      }
+
+      return transformedReply;
+    }
+  }
+} as const satisfies Command;
