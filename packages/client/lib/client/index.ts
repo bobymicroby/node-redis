@@ -36,11 +36,52 @@ export interface RedisClientOptions<
   /**
    * ACL username ([see ACL guide](https://redis.io/topics/acl))
    */
+
+  /**
+   * @deprecated use 'credentialsProvider' with type: 'basic-auth'
+   */
   username?: string;
   /**
    * ACL password or the old "--requirepass" password
    */
+
+  /**
+   * @deprecated use 'credentialsProvider' with type: 'basic-auth'
+   */
   password?: string;
+
+  /**
+   *  Credentials provider abstracts the way of providing credentials to the client.
+   *
+   *  For example, you can provide a static username and password:
+   *  ```typescript
+   *  {
+   *    type: 'basic-auth',
+   *    credentials: {
+   *    username: 'my-username',
+   *    password: 'my-password'
+   *  },
+   *  }
+   *  ```
+   *
+   *
+   *  or a function that returns a promise with the credentials:
+   *
+   *  ```typescript
+   *  {
+   *  type: 'async-basic-auth',
+   *  credentials: async () => {
+   *  // fetch credentials from identity provider
+   *  return {
+   *  username: 'my-username',
+   *  password: 'my-password'
+   *  };
+   *
+   *  Check out the CredentialProvider type for more details.
+   *
+   *
+   */
+  credentialsProvider?: CredentialsProvider;
   /**
    * Client name ([see `CLIENT SETNAME`](https://redis.io/commands/client-setname))
    */
@@ -72,6 +113,12 @@ export interface RedisClientOptions<
    */
   commandOptions?: CommandOptions<TYPE_MAPPING>;
 }
+
+export type BasicAuth = { username?: string, password?: string }
+
+export type SyncBasicAuth = { type: 'basic-auth', credentials: BasicAuth };
+export type AsyncBasicAuth = { type: 'async-basic-auth', credentials: () => Promise<BasicAuth> }
+export type CredentialsProvider = SyncBasicAuth | AsyncBasicAuth
 
 type WithCommands<
   RESP extends RespVersions,
@@ -265,13 +312,23 @@ export default class RedisClient<
     if (port) {
       (parsed.socket as TcpSocketConnectOpts).port = Number(port);
     }
-
+    // TODO: Remove when old auth options are fully deprecated
     if (username) {
       parsed.username = decodeURIComponent(username);
     }
-
+    // TODO: Remove when old auth options are fully deprecated
     if (password) {
       parsed.password = decodeURIComponent(password);
+    }
+
+    if (username || password) {
+      parsed.credentialsProvider = {
+        type: 'basic-auth', credentials:
+          {
+            username: username ? decodeURIComponent(username) : undefined,
+            password: password ? decodeURIComponent(password) : undefined
+          }
+      };
     }
 
     if (pathname.length > 1) {
@@ -330,6 +387,25 @@ export default class RedisClient<
   }
 
   #initiateOptions(options?: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>): RedisClientOptions<M, F, S, RESP, TYPE_MAPPING> | undefined {
+
+    // Backwards compatibility: Convert deprecated username/password to credentialsProvider
+    // if no credentialsProvider is already in place
+    // TODO: Remove when old auth options are fully deprecated
+
+    if (!options?.credentialsProvider && (options?.username || options?.password)) {
+
+      console.log('Deprecated username/password options are used. Please use credentialsProvider instead.');
+
+      options.credentialsProvider = {
+        type: 'basic-auth',
+        credentials: {
+          username: options.username,
+          password: options.password
+        }
+      };
+    }
+
+
     if (options?.url) {
       const parsed = RedisClient.parseURL(options.url);
       if (options.socket) {
@@ -358,17 +434,28 @@ export default class RedisClient<
     );
   }
 
-  #handshake(selectedDB: number) {
+  async #handshake(selectedDB: number) {
     const commands = [];
+    const cp = this.#options?.credentialsProvider;
 
     if (this.#options?.RESP) {
       const hello: HelloOptions = {};
 
-      if (this.#options.password) {
+      if (cp && cp.type === 'basic-auth' && cp.credentials.password) {
         hello.AUTH = {
-          username: this.#options.username ?? 'default',
-          password: this.#options.password
+          username: cp.credentials.username ?? 'default',
+          password: cp.credentials.password
         };
+      }
+
+      if(cp && cp.type === 'async-basic-auth' ) {
+        const credentials = await cp.credentials();
+        if(credentials.password) {
+          hello.AUTH = {
+            username: credentials.username ?? 'default',
+            password: credentials.password
+          };
+        }
       }
 
       if (this.#options.name) {
@@ -379,13 +466,25 @@ export default class RedisClient<
         HELLO.transformArguments(this.#options.RESP, hello)
       );
     } else {
-      if (this.#options?.username || this.#options?.password) {
+      if (cp && cp.type === 'basic-auth' && (cp.credentials.username || cp.credentials.password)) {
         commands.push(
           COMMANDS.AUTH.transformArguments({
-            username: this.#options.username,
-            password: this.#options.password ?? ''
+            username: cp.credentials.username,
+            password: cp.credentials.password ?? ''
           })
         );
+      }
+
+      if(cp && cp.type === 'async-basic-auth' ) {
+        const credentials = await cp.credentials();
+        if (credentials.username || credentials.password) {
+          commands.push(
+            COMMANDS.AUTH.transformArguments({
+              username: credentials.username,
+              password: credentials.password ?? ''
+            })
+          );
+        }
       }
 
       if (this.#options?.name) {
@@ -409,7 +508,7 @@ export default class RedisClient<
   }
 
   #initiateSocket(): RedisSocket {
-    const socketInitiator = () => {
+    const socketInitiator =  async () => {
       const promises = [],
         chainId = Symbol('Socket Initiator');
 
@@ -431,7 +530,7 @@ export default class RedisClient<
         );
       }
 
-      const commands = this.#handshake(this.#selectedDB);
+      const commands =  await this.#handshake(this.#selectedDB);
       for (let i = commands.length - 1; i >= 0; --i) {
         promises.push(
           this.#queue.addCommand(commands[i], {
@@ -984,7 +1083,7 @@ export default class RedisClient<
     const chainId = Symbol('Reset Chain'),
       promises = [this._self.#queue.reset(chainId)],
       selectedDB = this._self.#options?.database ?? 0;
-    for (const command of this._self.#handshake(selectedDB)) {
+    for (const command of (await this._self.#handshake(selectedDB))) {
       promises.push(
         this._self.#queue.addCommand(command, {
           chainId

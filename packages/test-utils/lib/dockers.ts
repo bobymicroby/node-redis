@@ -2,6 +2,7 @@ import { createConnection } from 'node:net';
 import { once } from 'node:events';
 import { createClient } from '@redis/client/index';
 import { setTimeout } from 'node:timers/promises';
+import { platform } from 'os';
 // import { ClusterSlotsReply } from '@redis/client/dist/lib/commands/CLUSTER_SLOTS';
 import { promisify } from 'node:util';
 import { exec } from 'node:child_process';
@@ -48,7 +49,9 @@ export interface RedisServerDocker {
 async function spawnRedisServerDocker({ image, version }: RedisServerDockerConfig, serverArguments: Array<string>): Promise<RedisServerDocker> {
   const port = (await portIterator.next()).value,
     { stdout, stderr } = await execAsync(
-      `docker run -e REDIS_ARGS="--port ${port.toString()} ${serverArguments.join(' ')}" -d --network host ${image}:${version}`
+      platform() === 'linux' // --network host is working only on linux
+        ? `docker run -e REDIS_ARGS="--port ${port.toString()} ${serverArguments.join(' ')}" -d --network host ${image}:${version}`
+        : `docker run -p ${port}:${port} -e REDIS_ARGS="--port ${port} ${serverArguments.join(' ')} " -d ${image}:${version}`
     );
 
   if (!stdout) {
