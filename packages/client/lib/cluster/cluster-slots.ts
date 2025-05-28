@@ -30,11 +30,11 @@ export interface Node<
 }
 
 export interface ShardNode<
-  M extends RedisModules,
-  F extends RedisFunctions,
-  S extends RedisScripts,
-  RESP extends RespVersions,
-  TYPE_MAPPING extends TypeMapping
+  M extends RedisModules = never,
+  F extends RedisFunctions = never,
+  S extends RedisScripts = never,
+  RESP extends RespVersions = never,
+  TYPE_MAPPING extends TypeMapping = never
 > extends Node<M, F, S, RESP, TYPE_MAPPING>, NodeAddress {
   id: string;
   readonly: boolean;
