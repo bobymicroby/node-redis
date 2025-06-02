@@ -1,6 +1,7 @@
 import { BasicCommandParser, CommandParser } from '../client/parser';
 import { RESP_TYPES } from '../RESP/decoder';
 import { UnwrapReply, ArrayReply, BlobStringReply, BooleanReply, CommandArguments, DoubleReply, NullReply, NumberReply, RedisArgument, TuplesReply, MapReply, TypeMapping, Command } from '../RESP/types';
+import { RequestPolicy, ResponsePolicy, REQUEST_POLICIES, RESPONSE_POLICIES } from './COMMAND';
 
 export function isNullReply(reply: unknown): reply is NullReply {
   return reply === null;
@@ -329,7 +330,8 @@ export type CommandRawReply = [
   firstKeyIndex: number,
   lastKeyIndex: number,
   step: number,
-  categories: Array<CommandCategories>
+  categories: Array<CommandCategories>,
+  policies: Array<string>,
 ];
 
 export type CommandReply = {
@@ -339,13 +341,24 @@ export type CommandReply = {
   firstKeyIndex: number,
   lastKeyIndex: number,
   step: number,
-  categories: Set<CommandCategories>
+  categories: Set<CommandCategories>,
+  policies: { request: RequestPolicy | undefined, response: ResponsePolicy | undefined }
 };
 
 export function transformCommandReply(
   this: void,
-  [name, arity, flags, firstKeyIndex, lastKeyIndex, step, categories]: CommandRawReply
+  [name, arity, flags, firstKeyIndex, lastKeyIndex, step, categories, policies]: CommandRawReply
 ): CommandReply {
+  const requestPolicyRaw = policies[0]?.replace('request_policy:', '');
+  const requestPolicy = requestPolicyRaw && Object.values(REQUEST_POLICIES).includes(requestPolicyRaw as RequestPolicy)
+    ? requestPolicyRaw as RequestPolicy
+    : undefined;
+
+  const responsePolicyRaw = policies[1]?.replace('response_policy:', '');
+  const responsePolicy = responsePolicyRaw && Object.values(RESPONSE_POLICIES).includes(responsePolicyRaw as ResponsePolicy)
+    ? responsePolicyRaw as ResponsePolicy
+    : undefined;
+
   return {
     name,
     arity,
@@ -353,7 +366,11 @@ export function transformCommandReply(
     firstKeyIndex,
     lastKeyIndex,
     step,
-    categories: new Set(categories)
+    categories: new Set(categories),
+    policies: {
+      request: requestPolicy,
+      response: responsePolicy
+    }
   };
 }
 

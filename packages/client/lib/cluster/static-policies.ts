@@ -1,4 +1,4 @@
-import { CommandPolicies, REQUEST_POLICIES, RESPONSE_POLICIES } from "./routing-policies";
+import { CommandPolicies, REQUEST_POLICIES_WITH_DEFAULTS, RESPONSE_POLICIES_WITH_DEFAULTS, RESPONSE_POLICIES_WITH_DEFAULTS_WITH_DEFAULTS, } from "./routing-policies";
 
 export type CommandPolicyRecords = Record<string, CommandPolicies>;
 // The response of the COMMAND command uses "." to separate the module name from the command name.
@@ -6,57 +6,54 @@ export type CommandPolicyRecords = Record<string, CommandPolicies>;
 export type ModulePolicyRecords = Record<string, CommandPolicyRecords>;
 
 export const POLICIES: ModulePolicyRecords = {
-  std: {
-
-  },
   ft: {
     create: {
-      request: REQUEST_POLICIES.ALL_SHARDS,
-      response: RESPONSE_POLICIES.ALL_SUCCEEDED
+      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_SHARDS,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.ALL_SUCCEEDED
     },
     search: {
-      request: REQUEST_POLICIES.ALL_SHARDS,
-      response: RESPONSE_POLICIES.SPECIAL
+      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_SHARDS,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.SPECIAL
     },
     aggregate: {
-      request: REQUEST_POLICIES.ALL_SHARDS,
-      response: RESPONSE_POLICIES.SPECIAL
+      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_SHARDS,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.SPECIAL
     },
     sugadd: {
-      request: REQUEST_POLICIES.DEFAULT_KEYED,
-      response: RESPONSE_POLICIES.DEFAULT_KEYED
+      request: REQUEST_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED
     },
     sugget: {
-      request: REQUEST_POLICIES.DEFAULT_KEYED,
-      response: RESPONSE_POLICIES.DEFAULT_KEYED
+      request: REQUEST_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED
     },
     sugdel: {
-      request: REQUEST_POLICIES.DEFAULT_KEYED,
-      response: RESPONSE_POLICIES.DEFAULT_KEYED
+      request: REQUEST_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED
     },
     suglen: {
-      request: REQUEST_POLICIES.DEFAULT_KEYED,
-      response: RESPONSE_POLICIES.DEFAULT_KEYED
+      request: REQUEST_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.DEFAULT_KEYED
     },
     spellcheck: {
-      request: REQUEST_POLICIES.ALL_SHARDS,
-      response: RESPONSE_POLICIES.SPECIAL
+      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_SHARDS,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.SPECIAL
     },
     cursor: {
-      request: REQUEST_POLICIES.SPECIAL,
-      response: RESPONSE_POLICIES.DEFAULT_KEYLESS
+      request: REQUEST_POLICIES_WITH_DEFAULTS.SPECIAL,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.DEFAULT_KEYLESS
     },
     dictadd: {
-      request: REQUEST_POLICIES.ALL_SHARDS,
-      response: RESPONSE_POLICIES.ALL_SUCCEEDED
+      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_SHARDS,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.ALL_SUCCEEDED
     },
     dictdel: {
-      request: REQUEST_POLICIES.ALL_SHARDS,
-      response: RESPONSE_POLICIES.ALL_SUCCEEDED
+      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_SHARDS,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.ALL_SUCCEEDED
     },
     dictdump: {
-      request: REQUEST_POLICIES.DEFAULT_KEYLESS,
-      response: RESPONSE_POLICIES.DEFAULT_KEYLESS
+      request: REQUEST_POLICIES_WITH_DEFAULTS.DEFAULT_KEYLESS,
+      response: RESPONSE_POLICIES_WITH_DEFAULTS.DEFAULT_KEYLESS
     }
   }
 } as const;
