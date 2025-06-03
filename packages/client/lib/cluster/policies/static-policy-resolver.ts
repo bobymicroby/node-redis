@@ -1,5 +1,4 @@
-import type { CommandPolicies } from './policies-constants';
-import type { Either, PolicyResolver } from './types';
+import type { PolicyResult, PolicyResolver } from './types';
 import { POLICIES } from './static-policies-data';
 
 export class StaticPolicyResolver implements PolicyResolver {
@@ -14,7 +13,7 @@ export class StaticPolicyResolver implements PolicyResolver {
 
   /**
    * Sets a fallback resolver to use when policies are not found in this resolver.
-   * 
+   *
    * @param fallbackResolver The resolver to fall back to
    * @returns A new StaticPolicyResolver with the specified fallback
    */
@@ -22,7 +21,7 @@ export class StaticPolicyResolver implements PolicyResolver {
     return new StaticPolicyResolver(this.policies, fallbackResolver);
   }
 
-  resolvePolicy(command: string): Either<CommandPolicies> {
+  resolvePolicy(command: string): PolicyResult {
     const parts = command.split('.');
 
     if (parts.length > 2) {
@@ -37,7 +36,7 @@ export class StaticPolicyResolver implements PolicyResolver {
       if (this.fallbackResolver) {
         return this.fallbackResolver.resolvePolicy(command);
       }
-      
+
       // For std module commands, return 'unknown-command' instead of 'unknown-module'
       // to provide better UX for single-word commands
       if (moduleName === 'std') {

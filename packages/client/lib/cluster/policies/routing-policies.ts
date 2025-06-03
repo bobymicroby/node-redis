@@ -6,5 +6,5 @@ export interface CommandRouter {
   routeCommand(
     command: string,
     policy: RequestPolicy,
-  ): Either<ShardNode>;
+  ): Either<ShardNode, 'no-available-nodes' | 'routing-failed'>;
 }
