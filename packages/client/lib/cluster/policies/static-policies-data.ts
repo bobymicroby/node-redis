@@ -1,4 +1,4 @@
-import { CommandPolicies, REQUEST_POLICIES_WITH_DEFAULTS, RESPONSE_POLICIES_WITH_DEFAULTS, RESPONSE_POLICIES_WITH_DEFAULTS_WITH_DEFAULTS, } from "./routing-policies";
+import { CommandPolicies, REQUEST_POLICIES_WITH_DEFAULTS, RESPONSE_POLICIES_WITH_DEFAULTS } from './policies-constants';
 
 export type CommandPolicyRecords = Record<string, CommandPolicies>;
 // The response of the COMMAND command uses "." to separate the module name from the command name.
@@ -8,7 +8,7 @@ export type ModulePolicyRecords = Record<string, CommandPolicyRecords>;
 export const POLICIES: ModulePolicyRecords = {
   ft: {
     create: {
-      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_SHARDS,
+      request: REQUEST_POLICIES_WITH_DEFAULTS.ALL_NODES,
       response: RESPONSE_POLICIES_WITH_DEFAULTS.ALL_SUCCEEDED
     },
     search: {

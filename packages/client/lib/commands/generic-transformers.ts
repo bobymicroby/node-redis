@@ -1,6 +1,6 @@
 import { BasicCommandParser, CommandParser } from '../client/parser';
 import { RESP_TYPES } from '../RESP/decoder';
-import { UnwrapReply, ArrayReply, BlobStringReply, BooleanReply, CommandArguments, DoubleReply, NullReply, NumberReply, RedisArgument, TuplesReply, MapReply, TypeMapping, Command } from '../RESP/types';
+import { UnwrapReply, ArrayReply, BlobStringReply, BooleanReply, CommandArguments, DoubleReply, NullReply, NumberReply, RedisArgument, TuplesReply, MapReply, TypeMapping, Command, ReplyUnion } from '../RESP/types';
 import { RequestPolicy, ResponsePolicy, REQUEST_POLICIES, RESPONSE_POLICIES } from './COMMAND';
 
 export function isNullReply(reply: unknown): reply is NullReply {
@@ -47,7 +47,7 @@ export function transformStringDoubleArgument(num: RedisArgument | number): Redi
 export const transformDoubleReply = {
   2: (reply: BlobStringReply, preserve?: any, typeMapping?: TypeMapping): DoubleReply => {
     const double = typeMapping ? typeMapping[RESP_TYPES.DOUBLE] : undefined;
-    
+
     switch (double) {
       case String: {
         return reply as unknown as DoubleReply;
@@ -59,13 +59,13 @@ export const transformDoubleReply = {
           case 'inf':
           case '+inf':
             ret = Infinity;
-      
+
           case '-inf':
             ret = -Infinity;
-    
+
           case 'nan':
             ret = NaN;
-      
+
           default:
             ret = Number(reply);
         }
@@ -99,7 +99,7 @@ export function createTransformNullableDoubleReplyResp2Func(preserve?: any, type
 export const transformNullableDoubleReply = {
   2: (reply: BlobStringReply | NullReply, preserve?: any, typeMapping?: TypeMapping) => {
     if (reply === null) return null;
-  
+
     return transformDoubleReply[2](reply as BlobStringReply, preserve, typeMapping);
   },
   3: undefined as unknown as () => DoubleReply | NullReply
@@ -115,7 +115,7 @@ export function transformTuplesToMap<T>(
 ) {
   const message = Object.create(null);
 
-  for (let i = 0; i < reply.length; i+= 2) {
+  for (let i = 0; i < reply.length; i += 2) {
     message[reply[i].toString()] = func(reply[i + 1]);
   }
 
@@ -132,7 +132,7 @@ export function transformTuplesReply<T extends Stringable>(
   reply: ArrayReply<T>,
   preserve?: any,
   typeMapping?: TypeMapping
-): MapReply<T , T> {
+): MapReply<T, T> {
   const mapType = typeMapping ? typeMapping[RESP_TYPES.MAP] : undefined;
 
   const inferred = reply as unknown as UnwrapReply<typeof reply>
@@ -332,6 +332,7 @@ export type CommandRawReply = [
   step: number,
   categories: Array<CommandCategories>,
   policies: Array<string>,
+  keySpecification: Array<ReplyUnion>
 ];
 
 export type CommandReply = {
@@ -342,12 +343,13 @@ export type CommandReply = {
   lastKeyIndex: number,
   step: number,
   categories: Set<CommandCategories>,
-  policies: { request: RequestPolicy | undefined, response: ResponsePolicy | undefined }
+  policies: { request: RequestPolicy | undefined, response: ResponsePolicy | undefined },
+  keySpecification: 'keyless' | 'keyed'
 };
 
 export function transformCommandReply(
   this: void,
-  [name, arity, flags, firstKeyIndex, lastKeyIndex, step, categories, policies]: CommandRawReply
+  [name, arity, flags, firstKeyIndex, lastKeyIndex, step, categories, policies, keySpecification]: CommandRawReply
 ): CommandReply {
   const requestPolicyRaw = policies[0]?.replace('request_policy:', '');
   const requestPolicy = requestPolicyRaw && Object.values(REQUEST_POLICIES).includes(requestPolicyRaw as RequestPolicy)
@@ -370,7 +372,8 @@ export function transformCommandReply(
     policies: {
       request: requestPolicy,
       response: responsePolicy
-    }
+    },
+    keySpecification: keySpecification.length >= 1 ? 'keyed' : 'keyless'
   };
 }
 
@@ -540,7 +543,7 @@ export type StreamMessageReply = {
 };
 
 export function transformStreamMessageReply(typeMapping: TypeMapping | undefined, reply: StreamMessageRawReply): StreamMessageReply {
-  const [ id, message ] = reply as unknown as UnwrapReply<typeof reply>;
+  const [id, message] = reply as unknown as UnwrapReply<typeof reply>;
   return {
     id: id,
     message: transformTuplesReply(message, undefined, typeMapping)
@@ -574,62 +577,62 @@ export function transformStreamsMessagesReplyResp2(
   reply: UnwrapReply<StreamsMessagesRawReply2 | NullReply>,
   preserve?: any,
   typeMapping?: TypeMapping
-): StreamsMessagesReply | NullReply { 
+): StreamsMessagesReply | NullReply {
   // FUTURE: resposne type if resp3 was working, reverting to old v4 for now
   //: MapReply<BlobStringReply | string, StreamMessagesReply> | NullReply {
   if (reply === null) return null as unknown as NullReply;
 
-  switch (typeMapping? typeMapping[RESP_TYPES.MAP] : undefined) {
-/* FUTURE: a response type for when resp3 is working properly
-    case Map: {
-      const ret = new Map<string, StreamMessagesReply>();
+  switch (typeMapping ? typeMapping[RESP_TYPES.MAP] : undefined) {
+    /* FUTURE: a response type for when resp3 is working properly
+        case Map: {
+          const ret = new Map<string, StreamMessagesReply>();
 
-      for (let i=0; i < reply.length; i++) {
-        const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
-    
-        const name = stream[0];
-        const rawMessages = stream[1];
-    
-        ret.set(name.toString(), transformStreamMessagesReply(rawMessages, typeMapping));
-      }
-    
-      return ret as unknown as MapReply<string, StreamMessagesReply>;
-    }
-    case Array: {
-      const ret: Array<BlobStringReply | StreamMessagesReply> = [];
+          for (let i=0; i < reply.length; i++) {
+            const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
 
-      for (let i=0; i < reply.length; i++) {
-        const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
-    
-        const name = stream[0];
-        const rawMessages = stream[1];
-    
-        ret.push(name); 
-        ret.push(transformStreamMessagesReply(rawMessages, typeMapping));
-      }
+            const name = stream[0];
+            const rawMessages = stream[1];
 
-      return ret as unknown as MapReply<string, StreamMessagesReply>;
-    }
-    default: {
-      const ret: Record<string, StreamMessagesReply> = Object.create(null);
+            ret.set(name.toString(), transformStreamMessagesReply(rawMessages, typeMapping));
+          }
 
-      for (let i=0; i < reply.length; i++) {
-        const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
-    
-        const name = stream[0] as unknown as UnwrapReply<BlobStringReply>;
-        const rawMessages = stream[1];
-    
-        ret[name.toString()] = transformStreamMessagesReply(rawMessages);
-      }
-    
-      return ret as unknown as MapReply<string, StreamMessagesReply>;
-    }
-*/
+          return ret as unknown as MapReply<string, StreamMessagesReply>;
+        }
+        case Array: {
+          const ret: Array<BlobStringReply | StreamMessagesReply> = [];
+
+          for (let i=0; i < reply.length; i++) {
+            const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
+
+            const name = stream[0];
+            const rawMessages = stream[1];
+
+            ret.push(name);
+            ret.push(transformStreamMessagesReply(rawMessages, typeMapping));
+          }
+
+          return ret as unknown as MapReply<string, StreamMessagesReply>;
+        }
+        default: {
+          const ret: Record<string, StreamMessagesReply> = Object.create(null);
+
+          for (let i=0; i < reply.length; i++) {
+            const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
+
+            const name = stream[0] as unknown as UnwrapReply<BlobStringReply>;
+            const rawMessages = stream[1];
+
+            ret[name.toString()] = transformStreamMessagesReply(rawMessages);
+          }
+
+          return ret as unknown as MapReply<string, StreamMessagesReply>;
+        }
+    */
     // V4 compatible response type
     default: {
       const ret: StreamsMessagesReply = [];
 
-      for (let i=0; i < reply.length; i++) {
+      for (let i = 0; i < reply.length; i++) {
         const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
 
         ret.push({
@@ -647,7 +650,7 @@ type StreamsMessagesRawReply3 = MapReply<BlobStringReply, ArrayReply<StreamMessa
 
 export function transformStreamsMessagesReplyResp3(reply: UnwrapReply<StreamsMessagesRawReply3 | NullReply>): MapReply<BlobStringReply, StreamMessagesReply> | NullReply {
   if (reply === null) return null as unknown as NullReply;
-  
+
   if (reply instanceof Map) {
     const ret = new Map<string, StreamMessagesReply>();
 
@@ -661,9 +664,9 @@ export function transformStreamsMessagesReplyResp3(reply: UnwrapReply<StreamsMes
   } else if (reply instanceof Array) {
     const ret = [];
 
-    for (let i=0; i < reply.length; i += 2) {
+    for (let i = 0; i < reply.length; i += 2) {
       const name = reply[i] as BlobStringReply;
-      const rawMessages = reply[i+1] as ArrayReply<StreamMessageRawReply>;
+      const rawMessages = reply[i + 1] as ArrayReply<StreamMessageRawReply>;
 
       ret.push(name);
       ret.push(transformStreamMessagesReply(rawMessages));
