@@ -32,3 +32,27 @@ export {
   parseResponseHeader,
   startsWithBinaryHeader,
 } from './decoder';
+
+export type {
+  Either,
+  BlockingBehavior,
+  CommandBinhdrReply,
+  CommandBinhdrNode,
+  CommandBinhdrRecords,
+  CommandBinhdrRawReply,
+  CommandBinhdrFetcher,
+  EligibilityResolverError,
+  EligibilityResult,
+  EligibilityResolver,
+  EligibilityReason,
+  RuntimeEligibility,
+} from './eligibility';
+
+export {
+  StaticEligibilityResolver,
+  DynamicEligibilityResolverFactory,
+  checkRuntimeEligibility,
+  STATIC_BINHDR_RECORDS,
+  createMockBinhdrFetcher,
+  createDefaultResolver,
+} from './eligibility';

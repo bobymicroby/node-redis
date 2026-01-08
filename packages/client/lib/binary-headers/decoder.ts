@@ -173,3 +173,4 @@ export function parseRequestHeader(
  */
 export function startsWithBinaryHeader(buffer: Buffer, offset: number = 0): boolean {
   return buffer.length > offset && isBinaryHeaderDesignator(buffer[offset]);
+}
