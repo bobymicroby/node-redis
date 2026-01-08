@@ -14,4 +14,21 @@ export {
   createRequestHeader,
   encodeRequestHeader,
   encodeRequestHeaderInto,
+  encodeResponseHeader,
 } from './encoder';
+
+export type {
+  ParseRequestHeaderError,
+  ParseRequestHeaderResult,
+  ParseResponseHeaderError,
+  ParseResponseHeaderResult,
+} from './decoder';
+
+export {
+  isBinaryHeaderDesignator,
+  extractCommandCount,
+  hasProtocolError,
+  parseRequestHeader,
+  parseResponseHeader,
+  startsWithBinaryHeader,
+} from './decoder';

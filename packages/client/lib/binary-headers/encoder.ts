@@ -1,6 +1,7 @@
 import { BINHDR } from './constants';
 import type {
   BinaryRequestHeader,
+  BinaryResponseHeader,
   CreateRequestHeaderResult,
   EncodeRequestHeaderIntoResult,
 } from './types';
@@ -105,4 +106,29 @@ export function encodeRequestHeaderInto(
   buffer.writeUInt16BE(header.clientIdx, offset + 8);
 
   return { success: true, bytesWritten: BINHDR.REQUEST_HEADER_SIZE };
+}
+
+/**
+ * Encodes a response header into a new Buffer.
+ *
+ * Wire format (8 bytes):
+ * - Byte 0: DESIG (0x80)
+ * - Bytes 1-4: LENGTH (32-bit big-endian)
+ * - Byte 5: NCMD/FLAGS (bits 0-6 = command count, bit 7 = protocol error)
+ * - Bytes 6-7: CLIENT_IDX (16-bit big-endian)
+ *
+ * @param header - The binary response header
+ * @returns New Buffer containing the encoded 8-byte header
+ */
+export function encodeResponseHeader(header: BinaryResponseHeader): Buffer {
+  const buffer = Buffer.allocUnsafe(BINHDR.RESPONSE_HEADER_SIZE);
+
+  buffer[0] = header.designator;
+  buffer.writeUInt32BE(header.length, 1);
+  buffer[5] = header.protocolError
+    ? header.commandCount | BINHDR.PROTOCOL_ERROR_BIT
+    : header.commandCount;
+  buffer.writeUInt16BE(header.clientIdx, 6);
+
+  return buffer;
 }
