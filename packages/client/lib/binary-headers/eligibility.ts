@@ -306,14 +306,15 @@ function isBlockingAtRuntime(
   info: CommandBinhdrReply,
   redisArgs: ReadonlyArray<RedisArgument>
 ): boolean {
-  switch (info.blocking.type) {
+  const blocking = info.blocking;
+  switch (blocking.type) {
     case 'always':
       return true;
     case 'never':
       return false;
     case 'conditional':
       return redisArgs.some(arg =>
-        argToString(arg).toUpperCase() === info.blocking.triggerArg
+        argToString(arg).toUpperCase() === blocking.triggerArg
       );
   }
 }
@@ -544,4 +545,65 @@ export function createMockBinhdrFetcher(): CommandBinhdrFetcher {
  */
 export async function createDefaultResolver(): Promise<StaticEligibilityResolver> {
   return DynamicEligibilityResolverFactory.create(createMockBinhdrFetcher());
+}
+
+/**
+ * A resolver that returns "not eligible" for all commands.
+ * Used as initial state before async eligibility data is fetched.
+ */
+class PendingEligibilityResolver implements EligibilityResolver {
+  resolveEligibility(_redisArgs: ReadonlyArray<RedisArgument>): EligibilityResult {
+    return {
+      ok: false,
+      error: 'unknown-command'
+    };
+  }
+
+  withFallback(_fallbackResolver: EligibilityResolver): EligibilityResolver {
+    return this;
+  }
+}
+
+/**
+ * A resolver that starts pending and upgrades to a real resolver once fetched.
+ * All commands are ineligible until the async fetch completes.
+ */
+export class AsyncEligibilityResolver implements EligibilityResolver {
+  #inner: EligibilityResolver = new PendingEligibilityResolver();
+  #ready = false;
+
+  get isReady(): boolean {
+    return this.#ready;
+  }
+
+  /**
+   * Start fetching eligibility data in the background.
+   * Returns a promise that resolves when the resolver is ready.
+   */
+  async initialize(fetcher: CommandBinhdrFetcher = createMockBinhdrFetcher()): Promise<void> {
+    const resolver = await DynamicEligibilityResolverFactory.create(fetcher);
+    this.#inner = resolver;
+    this.#ready = true;
+  }
+
+  resolveEligibility(redisArgs: ReadonlyArray<RedisArgument>): EligibilityResult {
+    return this.#inner.resolveEligibility(redisArgs);
+  }
+
+  withFallback(fallbackResolver: EligibilityResolver): EligibilityResolver {
+    return this.#inner.withFallback(fallbackResolver);
+  }
+}
+
+/**
+ * Create an async resolver that starts pending and fetches eligibility in background.
+ * All commands are ineligible until initialization completes.
+ */
+export function createAsyncResolver(): AsyncEligibilityResolver {
+  const resolver = new AsyncEligibilityResolver();
+  // Fire and forget - initialization happens in background
+  resolver.initialize().catch(() => {
+    // Silently ignore errors - resolver stays in pending state
+  });
+  return resolver;
 }

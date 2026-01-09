@@ -112,6 +112,15 @@ export interface RedisClusterOptions<
    * ```
    */
   clientSideCache?: PooledClientSideCacheProvider | ClientSideCacheConfig;
+  /**
+   * Enable binary headers for optimized cluster communication.
+   * Binary headers reduce protocol overhead by adding a compact binary prefix
+   * to commands, enabling faster routing through DMC proxies.
+   *
+   * When enabled, eligible commands are automatically encoded with binary headers
+   * for all node clients in the cluster.
+   */
+  binaryHeaders?: boolean;
 }
 
 export type RedisClusterType<

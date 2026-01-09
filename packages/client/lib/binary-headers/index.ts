@@ -56,3 +56,40 @@ export {
   createMockBinhdrFetcher,
   createDefaultResolver,
 } from './eligibility';
+
+// State machine
+export type {
+  BinhdrState,
+  BinhdrEvent,
+  BinhdrStateMachine,
+} from './state';
+
+export {
+  transitionState,
+  createBinhdrStateMachine,
+} from './state';
+
+// Packing
+export type {
+  PackSingleCommandResult,
+} from './packing';
+
+export {
+  calculatePayloadLength,
+  packSingleCommand,
+  calculateSlotFromKeys,
+} from './packing';
+
+// Interceptor
+export type {
+  DataHandler,
+  DataInterceptor,
+  OnBinhdrHeader,
+  OnBinhdrProtocolError,
+  BinhdrInterceptorOptions,
+} from './interceptor';
+
+export {
+  createBinhdrInterceptor,
+  createPassthroughInterceptor,
+} from './interceptor';
