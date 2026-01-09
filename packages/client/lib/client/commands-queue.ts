@@ -59,6 +59,13 @@ const RESP2_PUSH_TYPE_MAPPING = {
 // succeed.
 type PushHandler = (pushItems: Array<any>) => boolean;
 
+export interface CommandsQueueOptions {
+  respVersion: RespVersions;
+  maxLength: number | null | undefined;
+  onShardedChannelMoved: OnShardedChannelMoved;
+  decoder: Decoder;
+}
+
 export default class RedisCommandsQueue {
   readonly #respVersion;
   readonly #maxLength;
@@ -120,15 +127,12 @@ export default class RedisCommandsQueue {
     return this.#pubSub.isActive;
   }
 
-  constructor(
-    respVersion: RespVersions,
-    maxLength: number | null | undefined,
-    onShardedChannelMoved: OnShardedChannelMoved
-  ) {
-    this.#respVersion = respVersion;
-    this.#maxLength = maxLength;
-    this.#onShardedChannelMoved = onShardedChannelMoved;
-    this.decoder = this.#initiateDecoder();
+  constructor(options: CommandsQueueOptions) {
+    this.#respVersion = options.respVersion;
+    this.#maxLength = options.maxLength;
+    this.#onShardedChannelMoved = options.onShardedChannelMoved;
+    this.decoder = options.decoder;
+    this.#initDecoderCallbacks();
   }
 
   #onReply(reply: ReplyUnion) {
@@ -168,18 +172,15 @@ export default class RedisCommandsQueue {
     return this.#waitingForReply.head!.value.typeMapping ?? {};
   }
 
-  #initiateDecoder() {
-    return new Decoder({
-      onReply: reply => this.#onReply(reply),
-      onErrorReply: err => this.#onErrorReply(err),
-      //TODO: we can shave off a few cycles by not adding onPush handler at all if CSC is not used
-      onPush: push => {
-        for(const pushHandler of this.#pushHandlers) {
-          if(pushHandler(push)) return
-        }
-      },
-      getTypeMapping: () => this.#getTypeMapping()
-    });
+  #initDecoderCallbacks() {
+    this.decoder.onReply = (reply: ReplyUnion) => this.#onReply(reply);
+    this.decoder.onErrorReply = (err: ErrorReply) => this.#onErrorReply(err);
+    this.decoder.onPush = (push: Array<any>) => {
+      for (const pushHandler of this.#pushHandlers) {
+        if (pushHandler(push)) return;
+      }
+    };
+    this.decoder.getTypeMapping = () => this.#getTypeMapping();
   }
 
   addPushHandler(handler: PushHandler): void {

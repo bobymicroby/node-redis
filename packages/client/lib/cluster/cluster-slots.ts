@@ -350,6 +350,7 @@ export default class RedisClusterSlots<
         RESP: this.#options.RESP,
         socket,
         readonly,
+        binaryHeaders: this.#options.binaryHeaders,
       }))
       .on('error', error => emit('node-error', error, clientInfo))
       .on('reconnecting', () => emit('node-reconnecting', clientInfo))
