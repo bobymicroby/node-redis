@@ -29,11 +29,6 @@ export function calculatePayloadLength(
 
 /**
  * Pack a single RESP-encoded command with a binary header.
- *
- * @param respEncoded - The RESP-encoded command parts from encodeCommand()
- * @param slot - Slot number (0-16383) or BINHDR.SLOT_NO_SLOT
- * @param clientIdx - Client correlation ID (0-65535), use 0 for FIFO mode
- * @returns Packed command with binary header prepended
  */
 export function packSingleCommand(
   respEncoded: ReadonlyArray<RedisArgument>,
@@ -44,7 +39,7 @@ export function packSingleCommand(
 
   const headerResult = createRequestHeader(
     payloadLength,
-    1, // commandCount = 1 for single command packing
+    1,
     slot,
     clientIdx
   );
@@ -54,8 +49,6 @@ export function packSingleCommand(
   }
 
   const headerBuffer = encodeRequestHeader(headerResult.header);
-
-  // Prepend header to the RESP-encoded parts
   const packed: RedisArgument[] = [headerBuffer, ...respEncoded];
 
   return { success: true, packed };
