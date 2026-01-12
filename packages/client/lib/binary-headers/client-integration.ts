@@ -1,40 +1,20 @@
 import type { RedisArgument } from '../RESP/types';
+import type { CommandCodec } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility-types';
 import { createDefaultResolver } from './eligibility-static-data';
-import { createBinhdrInterceptor, type DataHandler } from './interceptor';
+import { createBinhdrInterceptor } from './interceptor';
 import { packSingleCommand, calculateSlotFromKeys } from './packing';
 
-export interface CommandFlags {
-  eligibleForBinhdr: boolean;
-}
-
-export interface CommandToWrite {
-  payload: ReadonlyArray<RedisArgument>;
-  flags: CommandFlags;
-}
-
-export type CommandsGenerator = Generator<CommandToWrite>;
-export type EncodedGenerator = Generator<ReadonlyArray<RedisArgument>>;
-
-export interface BinhdrHandler {
-  /** Checks if command args are eligible for binary headers */
-  checkEligibility(args: ReadonlyArray<RedisArgument>): boolean;
-  /** Packs eligible commands with binary headers */
-  pack(commands: CommandsGenerator): EncodedGenerator;
-  /** Processes incoming data, stripping binary headers */
-  processData(chunk: Buffer, onData: DataHandler): void;
-}
-
 /**
- * Creates a binary headers handler for client integration.
- * Encapsulates all binhdr logic in one place.
+ * Creates a binary headers codec for the command queue.
+ * Handles eligibility checking, command packing, and response interception.
  */
-export function createBinhdrHandler(
+export function createBinhdrCodec(
   onProtocolError?: (clientIdx: number) => void
-): BinhdrHandler {
+): CommandCodec {
   let resolver: EligibilityResolver | null = null;
 
-  // Fetch eligibility in background
+  // Initialize eligibility resolver asynchronously
   createDefaultResolver()
     .then(r => {
       resolver = r;
@@ -42,6 +22,7 @@ export function createBinhdrHandler(
     })
     .catch(() => { /* stays null - all commands ineligible */ });
 
+  // Create interceptor for incoming data
   const interceptor = createBinhdrInterceptor({
     onProtocolError: onProtocolError
       ? (header) => onProtocolError(header.clientIdx)
@@ -49,39 +30,34 @@ export function createBinhdrHandler(
   });
 
   return {
-    checkEligibility(args: ReadonlyArray<RedisArgument>): boolean {
+    encode(
+      command: ReadonlyArray<RedisArgument>,
+      resp: ReadonlyArray<RedisArgument>
+    ): ReadonlyArray<RedisArgument> {
+      // Check eligibility
       if (!resolver) {
-        console.log('[binhdr] Resolver not ready, skipping:', args[0]);
-        return false;
+        console.log('[binhdr] Resolver not ready, skipping:', command[0]);
+        return resp;
       }
 
-      const result = resolver.resolveEligibility(args);
+      const result = resolver.resolveEligibility(command);
       if (!result.ok || !result.value.binhdrFlag) {
-        console.log('[binhdr] Command not eligible:', args[0]);
-        return false;
+        console.log('[binhdr] Command not eligible:', command[0]);
+        return resp;
       }
 
-      console.log('[binhdr] Command eligible:', args[0]);
-      return true;
+      console.log('[binhdr] Command eligible:', command[0]);
+      console.log('[binhdr] Packing command');
+
+      // Pack with binary header
+      // TODO: extract keys properly from command
+      const slot = calculateSlotFromKeys([]);
+      const packResult = packSingleCommand(resp, slot);
+      return packResult.success ? packResult.packed : resp;
     },
 
-    *pack(commands: CommandsGenerator): EncodedGenerator {
-      for (const { payload, flags } of commands) {
-        if (!flags.eligibleForBinhdr) {
-          yield payload;
-          continue;
-        }
-
-        console.log('[binhdr] Packing command');
-        // TODO: extract keys properly from command
-        const slot = calculateSlotFromKeys([]);
-        const result = packSingleCommand(payload, slot);
-        yield result.success ? result.packed : payload;
-      }
-    },
-
-    processData(chunk: Buffer, onData: DataHandler): void {
-      interceptor(chunk, onData);
+    decode(chunk: Buffer, push: (data: Buffer) => void): void {
+      interceptor(chunk, push);
     }
   };
 }

@@ -59,6 +59,43 @@ const RESP2_PUSH_TYPE_MAPPING = {
 // succeed.
 type PushHandler = (pushItems: Array<any>) => boolean;
 
+/**
+ * Codec for encoding outgoing commands and decoding incoming data.
+ * Allows plugging in binary headers or other wire-level transformations
+ * without modifying the queue itself.
+ */
+export interface CommandCodec {
+  /**
+   * Encode a command before sending.
+   * @param command - Raw command arguments (for inspection/eligibility)
+   * @param resp - RESP-encoded payload
+   * @returns The (possibly transformed) payload to send
+   */
+  encode(
+    command: ReadonlyArray<RedisArgument>,
+    resp: ReadonlyArray<RedisArgument>
+  ): ReadonlyArray<RedisArgument>;
+
+  /**
+   * Decode incoming data from the socket before passing to RESP decoder.
+   * @param chunk - Raw data from socket
+   * @param push - Function to push data to the decoder
+   */
+  decode(chunk: Buffer, push: (data: Buffer) => void): void;
+}
+
+/**
+ * Default no-op codec - passes through commands and data unchanged.
+ */
+export const DEFAULT_CODEC: CommandCodec = {
+  encode(command, resp) {
+    return resp;
+  },
+  decode(chunk, push) {
+    push(chunk);
+  }
+};
+
 export default class RedisCommandsQueue {
   readonly #respVersion;
   readonly #maxLength;
@@ -68,6 +105,7 @@ export default class RedisCommandsQueue {
   #chainInExecution: symbol | undefined;
   readonly decoder;
   readonly #pubSub = new PubSub();
+  readonly #codec: CommandCodec;
 
   #pushHandlers: PushHandler[] = [this.#onPush.bind(this)];
 
@@ -123,11 +161,13 @@ export default class RedisCommandsQueue {
   constructor(
     respVersion: RespVersions,
     maxLength: number | null | undefined,
-    onShardedChannelMoved: OnShardedChannelMoved
+    onShardedChannelMoved: OnShardedChannelMoved,
+    codec: CommandCodec
   ) {
     this.#respVersion = respVersion;
     this.#maxLength = maxLength;
     this.#onShardedChannelMoved = onShardedChannelMoved;
+    this.#codec = codec;
     this.decoder = this.#initiateDecoder();
   }
 
@@ -450,7 +490,7 @@ export default class RedisCommandsQueue {
     return this.#toWrite.length > 0;
   }
 
-  *commandsToWrite(eligibilityChecker?: (args: ReadonlyArray<RedisArgument>) => boolean) {
+  *commandsToWrite() {
     let toSend = this.#toWrite.shift();
     while (toSend) {
       const args = toSend.args;
@@ -462,8 +502,6 @@ export default class RedisCommandsQueue {
         toSend = this.#toWrite.shift();
         continue;
       }
-
-      const eligibleForBinhdr = eligibilityChecker ? eligibilityChecker(args) : false;
 
       // TODO reuse `toSend` or create new object?
       (toSend as any).args = undefined;
@@ -479,9 +517,17 @@ export default class RedisCommandsQueue {
       toSend.chainId = undefined;
       this.#waitingForReply.push(toSend);
 
-      yield { payload: encoded, flags: { eligibleForBinhdr } };
+      yield this.#codec.encode(args, encoded);
       toSend = this.#toWrite.shift();
     }
+  }
+
+  /**
+   * Process incoming data from the socket.
+   * Delegates to codec for potential transformation before decoding.
+   */
+  processIncomingData(chunk: Buffer) {
+    this.#codec.decode(chunk, data => this.decoder.write(data));
   }
 
   #flushWaitingForReply(err: Error): void {
