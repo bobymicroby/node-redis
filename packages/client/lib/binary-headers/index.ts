@@ -57,22 +57,8 @@ export {
   createDefaultResolver,
 } from './eligibility';
 
-// State machine
-export type {
-  BinhdrState,
-  BinhdrEvent,
-  BinhdrStateMachine,
-} from './state';
-
-export {
-  transitionState,
-  createBinhdrStateMachine,
-} from './state';
-
 // Packing
-export type {
-  PackSingleCommandResult,
-} from './packing';
+export type { PackSingleCommandResult } from './packing';
 
 export {
   calculatePayloadLength,
@@ -89,7 +75,8 @@ export type {
   BinhdrInterceptorOptions,
 } from './interceptor';
 
-export {
-  createBinhdrInterceptor,
-  createPassthroughInterceptor,
-} from './interceptor';
+export { createBinhdrInterceptor } from './interceptor';
+
+// Client integration
+export type { BinhdrHandler, CommandsGenerator } from './client-integration';
+export { createBinhdrHandler } from './client-integration';

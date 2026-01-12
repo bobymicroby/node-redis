@@ -2,8 +2,6 @@ import COMMANDS from '../commands';
 import RedisSocket, { RedisSocketOptions } from './socket';
 import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
 import RedisCommandsQueue, { CommandOptions } from './commands-queue';
-import { Decoder } from '../RESP/decoder';
-import { BinhdrCommandsQueue } from '../binary-headers/binhdr-commands-queue';
 import { EventEmitter } from 'node:events';
 import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';
 import { ClientClosedError, ClientOfflineError, DisconnectsClientError, WatchError } from '../errors';
@@ -23,9 +21,6 @@ import { BasicCommandParser, CommandParser } from './parser';
 import SingleEntryCache from '../single-entry-cache';
 import { version } from '../../package.json'
 import EnterpriseMaintenanceManager, { MaintenanceUpdate, MovingEndpointType } from './enterprise-maintenance-manager';
-import { createBinhdrStateMachine, type BinhdrStateMachine } from '../binary-headers/state';
-import { createBinhdrInterceptor, createPassthroughInterceptor, type DataInterceptor } from '../binary-headers/interceptor';
-import { createAsyncResolver } from '../binary-headers/eligibility';
 
 export interface RedisClientOptions<
   M extends RedisModules = RedisModules,
@@ -450,7 +445,7 @@ export default class RedisClient<
 
   readonly #options: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>;
   #socket: RedisSocket;
-  readonly #queue: RedisCommandsQueue | BinhdrCommandsQueue;
+  readonly #queue: RedisCommandsQueue;
   #selectedDB = 0;
   #monitorCallback?: MonitorCallback<TYPE_MAPPING>;
   private _self = this;
@@ -468,9 +463,8 @@ export default class RedisClient<
   // 2. In-flight commands on the old socket to complete
   #paused = false;
 
-  // Binary headers support (cluster mode only)
-  #binhdrStateMachine?: BinhdrStateMachine;
-  #binhdrInterceptor: DataInterceptor = createPassthroughInterceptor();
+  // Binary headers handler (cluster mode only)
+  #binhdr?: import('../binary-headers/client-integration').BinhdrHandler;
 
   get clientSideCache() {
     return this._self.#clientSideCache;
@@ -528,8 +522,7 @@ export default class RedisClient<
 
 
     if(this.#options.maintNotifications !== 'disabled') {
-      // BinhdrCommandsQueue has the same interface as RedisCommandsQueue
-      new EnterpriseMaintenanceManager(this.#queue as RedisCommandsQueue, this, this.#options);
+      new EnterpriseMaintenanceManager(this.#queue, this, this.#options);
     };
 
     if (this.#options.clientSideCache) {
@@ -620,52 +613,20 @@ export default class RedisClient<
     return options;
   }
 
-  #initiateQueue(): RedisCommandsQueue | BinhdrCommandsQueue {
-    // Create decoder with placeholder callbacks - queue will set real ones
-    const decoder = new Decoder({
-      onReply: () => {},
-      onErrorReply: () => {},
-      onPush: () => {},
-      getTypeMapping: () => ({})
-    });
-
-    const queueOptions = {
-      respVersion: (this.#options.RESP ?? 2) as RespVersions,
-      maxLength: this.#options.commandsQueueMaxLength,
-      onShardedChannelMoved: (channel: string, listeners: ChannelListeners) => this.emit('sharded-channel-moved', channel, listeners),
-      decoder
-    };
-
-    // Use BinhdrCommandsQueue for binary headers mode (cluster only)
-    if (this.#options.binaryHeaders) {
-      // Create resolver synchronously - it starts pending and fetches eligibility in background
-      // Until eligibility is resolved, all commands are treated as ineligible (normal RESP)
-      const resolver = createAsyncResolver();
-
-      // Create and enable state machine immediately
-      this.#binhdrStateMachine = createBinhdrStateMachine({ state: 'enabled', resolver });
-
-      return new BinhdrCommandsQueue({
-        ...queueOptions,
-        binhdrStateMachine: this.#binhdrStateMachine
-      });
-    }
-
-    return new RedisCommandsQueue(queueOptions);
+  #initiateQueue(): RedisCommandsQueue {
+    return new RedisCommandsQueue(
+      this.#options.RESP ?? 2,
+      this.#options.commandsQueueMaxLength,
+      (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners)
+    );
   }
 
   #initBinaryHeaders(): void {
-    if (!this.#binhdrStateMachine) return;
+    if (!this.#options.binaryHeaders) return;
 
-    // Create interceptor for response parsing
-    this.#binhdrInterceptor = createBinhdrInterceptor({
-      onHeader: (_header) => {
-        // For now, just log headers in debug mode
-        // In the future, this could be used for metrics or debugging
-      },
-      onProtocolError: (header) => {
-        this.emit('error', new Error(`Binary header protocol error: clientIdx=${header.clientIdx}`));
-      }
+    const { createBinhdrHandler } = require('../binary-headers/client-integration');
+    this.#binhdr = createBinhdrHandler((clientIdx: number) => {
+      this.emit('error', new Error(`Binary header protocol error: clientIdx=${clientIdx}`));
     });
   }
 
@@ -847,10 +808,11 @@ export default class RedisClient<
   #attachListeners(socket: RedisSocket) {
     socket.on('data', chunk => {
       try {
-        // Use interceptor to handle binary headers if enabled
-        this.#binhdrInterceptor(chunk, (processedChunk) => {
-          this.#queue.decoder.write(processedChunk);
-        });
+        if (this.#binhdr) {
+          this.#binhdr.processData(chunk, data => this.#queue.decoder.write(data));
+        } else {
+          this.#queue.decoder.write(chunk);
+        }
       } catch (err) {
         this.#queue.resetDecoder();
         this.emit('error', err);
@@ -1022,7 +984,7 @@ export default class RedisClient<
   }
 
   async connect() {
-    // Initialize binary headers interceptor if enabled (cluster mode)
+    // Initialize binary headers interceptor if enabled
     if (this._self.#options.binaryHeaders) {
       this._self.#initBinaryHeaders();
     }
@@ -1304,11 +1266,23 @@ export default class RedisClient<
     );
   }
 
+  static *#extractPayload(commands: Generator<{ payload: ReadonlyArray<RedisArgument>; flags: { eligibleForBinhdr: boolean } }>) {
+    for (const { payload } of commands) {
+      yield payload;
+    }
+  }
+
   #write() {
     if(this.#paused) {
       return
     }
-    this.#socket.write(this.#queue.commandsToWrite());
+    if (this.#binhdr) {
+      const commands = this.#queue.commandsToWrite(this.#binhdr.checkEligibility.bind(this.#binhdr));
+      this.#socket.write(this.#binhdr.pack(commands));
+    } else {
+      const commands = this.#queue.commandsToWrite();
+      this.#socket.write(RedisClient.#extractPayload(commands));
+    }
   }
 
   #scheduledWrite?: NodeJS.Immediate;

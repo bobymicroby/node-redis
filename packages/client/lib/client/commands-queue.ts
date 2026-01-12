@@ -59,13 +59,6 @@ const RESP2_PUSH_TYPE_MAPPING = {
 // succeed.
 type PushHandler = (pushItems: Array<any>) => boolean;
 
-export interface CommandsQueueOptions {
-  respVersion: RespVersions;
-  maxLength: number | null | undefined;
-  onShardedChannelMoved: OnShardedChannelMoved;
-  decoder: Decoder;
-}
-
 export default class RedisCommandsQueue {
   readonly #respVersion;
   readonly #maxLength;
@@ -127,12 +120,15 @@ export default class RedisCommandsQueue {
     return this.#pubSub.isActive;
   }
 
-  constructor(options: CommandsQueueOptions) {
-    this.#respVersion = options.respVersion;
-    this.#maxLength = options.maxLength;
-    this.#onShardedChannelMoved = options.onShardedChannelMoved;
-    this.decoder = options.decoder;
-    this.#initDecoderCallbacks();
+  constructor(
+    respVersion: RespVersions,
+    maxLength: number | null | undefined,
+    onShardedChannelMoved: OnShardedChannelMoved
+  ) {
+    this.#respVersion = respVersion;
+    this.#maxLength = maxLength;
+    this.#onShardedChannelMoved = onShardedChannelMoved;
+    this.decoder = this.#initiateDecoder();
   }
 
   #onReply(reply: ReplyUnion) {
@@ -172,15 +168,18 @@ export default class RedisCommandsQueue {
     return this.#waitingForReply.head!.value.typeMapping ?? {};
   }
 
-  #initDecoderCallbacks() {
-    this.decoder.onReply = (reply: ReplyUnion) => this.#onReply(reply);
-    this.decoder.onErrorReply = (err: ErrorReply) => this.#onErrorReply(err);
-    this.decoder.onPush = (push: Array<any>) => {
-      for (const pushHandler of this.#pushHandlers) {
-        if (pushHandler(push)) return;
-      }
-    };
-    this.decoder.getTypeMapping = () => this.#getTypeMapping();
+  #initiateDecoder() {
+    return new Decoder({
+      onReply: reply => this.#onReply(reply),
+      onErrorReply: err => this.#onErrorReply(err),
+      //TODO: we can shave off a few cycles by not adding onPush handler at all if CSC is not used
+      onPush: push => {
+        for(const pushHandler of this.#pushHandlers) {
+          if(pushHandler(push)) return
+        }
+      },
+      getTypeMapping: () => this.#getTypeMapping()
+    });
   }
 
   addPushHandler(handler: PushHandler): void {
@@ -451,17 +450,20 @@ export default class RedisCommandsQueue {
     return this.#toWrite.length > 0;
   }
 
-  *commandsToWrite() {
+  *commandsToWrite(eligibilityChecker?: (args: ReadonlyArray<RedisArgument>) => boolean) {
     let toSend = this.#toWrite.shift();
     while (toSend) {
+      const args = toSend.args;
       let encoded: ReadonlyArray<RedisArgument>
       try {
-        encoded = encodeCommand(toSend.args);
+        encoded = encodeCommand(args);
       } catch (err) {
         toSend.reject(err);
         toSend = this.#toWrite.shift();
         continue;
       }
+
+      const eligibleForBinhdr = eligibilityChecker ? eligibilityChecker(args) : false;
 
       // TODO reuse `toSend` or create new object?
       (toSend as any).args = undefined;
@@ -477,7 +479,7 @@ export default class RedisCommandsQueue {
       toSend.chainId = undefined;
       this.#waitingForReply.push(toSend);
 
-      yield encoded;
+      yield { payload: encoded, flags: { eligibleForBinhdr } };
       toSend = this.#toWrite.shift();
     }
   }
