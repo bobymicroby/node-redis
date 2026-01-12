@@ -78,5 +78,4 @@ export type {
 export { createBinhdrInterceptor } from './interceptor';
 
 // Client integration
-export type { BinhdrHandler, CommandsGenerator } from './client-integration';
-export { createBinhdrHandler } from './client-integration';
+export { createBinhdrCodec } from './client-integration';
