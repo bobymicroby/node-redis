@@ -1,5 +1,10 @@
 import type { CommandBinhdrRawReply, CommandBinhdrFetcher } from './eligibility-types';
-import { StaticEligibilityResolver, DynamicEligibilityResolverFactory } from './eligibility-resolver';
+import {
+  StaticEligibilityResolver,
+  FastEligibilityResolver,
+  UltraFastEligibilityChecker,
+  DynamicEligibilityResolverFactory
+} from './eligibility-resolver';
 
 const NEVER = 'never' as const;
 const ALWAYS = 'always' as const;
@@ -181,4 +186,41 @@ export function createMockBinhdrFetcher(): CommandBinhdrFetcher {
 
 export async function createDefaultResolver(): Promise<StaticEligibilityResolver> {
   return DynamicEligibilityResolverFactory.create(createMockBinhdrFetcher());
+}
+
+export async function createFastResolver(): Promise<FastEligibilityResolver> {
+  return DynamicEligibilityResolverFactory.createFast(createMockBinhdrFetcher());
+}
+
+export async function createUltraFastChecker(): Promise<UltraFastEligibilityChecker> {
+  const commands = await createMockBinhdrFetcher()();
+  const records: Record<string, any> = {};
+
+  // Build records structure
+  for (const command of commands) {
+    const name = command.name.toUpperCase();
+    const self = {
+      name: name,
+      binhdrFlag: command.binhdrFlag,
+      hasKeys: command.hasKeys,
+      blocking: { type: command.blockingType },
+    };
+
+    if (command.subcommands?.length) {
+      const subcommands: Record<string, any> = {};
+      for (const sub of command.subcommands) {
+        subcommands[sub.name.toUpperCase()] = {
+          name: sub.name.toUpperCase(),
+          binhdrFlag: sub.binhdrFlag,
+          hasKeys: sub.hasKeys,
+          blocking: { type: sub.blockingType },
+        };
+      }
+      records[name] = { self, subcommands };
+    } else {
+      records[name] = { self };
+    }
+  }
+
+  return UltraFastEligibilityChecker.fromRecords(records);
 }
