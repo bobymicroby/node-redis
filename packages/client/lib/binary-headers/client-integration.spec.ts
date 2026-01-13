@@ -3,9 +3,7 @@ import { describe, it } from 'mocha';
 import { once } from 'node:events';
 import net from 'node:net';
 import { createClient } from '../..';
-import { encodeResponseHeader } from './encoder';
-import { BINHDR } from './constants';
-import type { BinaryResponseHeader } from './types';
+import { createBinhdrResponse } from './test-utils';
 
 describe('Binary Headers Client Integration', function () {
   this.timeout(5000);
@@ -23,18 +21,6 @@ describe('Binary Headers Client Integration', function () {
         }
       });
     });
-  }
-
-  function createBinhdrResponse(respPayload: string): Buffer {
-    const payload = Buffer.from(respPayload);
-    const header: BinaryResponseHeader = {
-      designator: BINHDR.DESIGNATOR,
-      length: payload.length,
-      commandCount: 1,
-      clientIdx: 0,
-      protocolError: false,
-    };
-    return Buffer.concat([encodeResponseHeader(header), payload]);
   }
 
   it('client receives response through binary header interceptor', async function () {

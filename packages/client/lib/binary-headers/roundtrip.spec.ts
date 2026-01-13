@@ -1,27 +1,9 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'mocha';
 import { BINHDR } from './constants';
-import type { BinaryResponseHeader } from './types';
 import { createRequestHeader, encodeRequestHeader, encodeRequestHeaderInto, encodeResponseHeader } from './encoder';
 import { parseRequestHeader, parseResponseHeader } from './decoder';
-
-/**
- * Creates a valid response header object.
- */
-function createResponseHeader(
-  length: number,
-  commandCount: number,
-  clientIdx: number,
-  protocolError: boolean = false
-): BinaryResponseHeader {
-  return {
-    designator: BINHDR.DESIGNATOR,
-    length,
-    commandCount,
-    protocolError,
-    clientIdx,
-  };
-}
+import { createResponseHeader } from './test-utils';
 
 describe('Binary Headers Round-trip', () => {
   describe('Request Header: encode → decode', () => {
