@@ -34,24 +34,14 @@ export {
 } from './decoder';
 
 export type {
-  Either,
-  BlockingBehavior,
-  CommandBinhdrReply,
-  CommandBinhdrNode,
-  CommandBinhdrRecords,
+  EligibleNode,
   CommandBinhdrRawReply,
   CommandBinhdrFetcher,
-  EligibilityResolverError,
-  EligibilityResult,
-  EligibilityResolver,
-  EligibilityReason,
-  RuntimeEligibility,
 } from './eligibility';
 
 export {
-  StaticEligibilityResolver,
+  EligibilityResolver,
   DynamicEligibilityResolverFactory,
-  checkRuntimeEligibility,
   STATIC_BINHDR_RECORDS,
   createMockBinhdrFetcher,
   createDefaultResolver,
