@@ -1,10 +1,8 @@
 import type { RedisArgument } from '../RESP/types';
 import type { CommandCodec } from '../client/commands-queue';
-import type { EligibilityResolver } from './eligibility-types';
-import { createDefaultResolver, createUltraFastChecker } from './eligibility-static-data';
-import { UltraFastEligibilityChecker } from './eligibility-resolver';
+import { EligibilityResolver } from './eligibility-resolver';
+import { createDefaultResolver } from './eligibility-static-data';
 import { createBinhdrInterceptor } from './interceptor';
-import { packSingleCommand, calculateSlotFromKeys } from './packing';
 import { BINHDR } from './constants';
 
 /**
@@ -20,55 +18,6 @@ export function createBinhdrCodec(
   createDefaultResolver()
     .then(r => { resolver = r; })
     .catch(() => { /* stays null - all commands ineligible */ });
-
-  // Create interceptor for incoming data
-  const interceptor = createBinhdrInterceptor({
-    onProtocolError: onProtocolError
-      ? (header) => onProtocolError(header.clientIdx)
-      : undefined
-  });
-
-  return {
-    encode(
-      command: ReadonlyArray<RedisArgument>,
-      resp: ReadonlyArray<RedisArgument>
-    ): ReadonlyArray<RedisArgument> {
-      // Check eligibility
-      if (!resolver) {
-        return resp;
-      }
-
-      const result = resolver.resolveEligibility(command);
-      if (!result.ok || !result.value.binhdrFlag) {
-        return resp;
-      }
-
-      // Pack with binary header
-      // TODO: extract keys properly from command
-      const slot = calculateSlotFromKeys([]);
-      const packResult = packSingleCommand(resp, slot);
-      return packResult.success ? packResult.packed : resp;
-    },
-
-    decode(chunk: Buffer, push: (data: Buffer) => void): void {
-      interceptor(chunk, push);
-    }
-  };
-}
-
-/**
- * Optimized binary headers codec - avoids allocations in hot path.
- * Uses UltraFastEligibilityChecker and ring buffer for headers.
- */
-export function createBinhdrCodecOptimized(
-  onProtocolError?: (clientIdx: number) => void
-): CommandCodec {
-  // Use UltraFastEligibilityChecker for boolean-only lookups (no object allocation)
-  let checker: UltraFastEligibilityChecker | null = null;
-
-  createUltraFastChecker()
-    .then(c => { checker = c; })
-    .catch(() => { /* stays null */ });
 
   // Create interceptor for incoming data
   const interceptor = createBinhdrInterceptor({
@@ -98,12 +47,8 @@ export function createBinhdrCodecOptimized(
       command: ReadonlyArray<RedisArgument>,
       resp: ReadonlyArray<RedisArgument>
     ): ReadonlyArray<RedisArgument> {
-      if (!checker || command.length === 0) {
-        return resp;
-      }
-
-      // Ultra-fast eligibility check (returns boolean, no allocation)
-      if (!checker.isEligible(command)) {
+      // Check eligibility
+      if (!resolver || !resolver.isEligible(command)) {
         return resp;
       }
 
