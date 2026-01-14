@@ -5,7 +5,6 @@ import {
   DynamicEligibilityResolverFactory,
   createMockBinhdrFetcher,
   createDefaultResolver,
-  STATIC_BINHDR_RECORDS,
   type CommandBinhdrRawReply,
 } from './eligibility';
 
@@ -26,6 +25,10 @@ describe('Eligibility', () => {
         assert.equal(resolver.isEligible(['GET', 'key']), true);
       });
 
+      it('returns true for eligible HSET command', () => {
+        assert.equal(resolver.isEligible(['HSET', 'key', 'field', 'value']), true);
+      });
+
       it('handles Buffer command names', () => {
         assert.equal(resolver.isEligible([Buffer.from('SET'), 'key', 'value']), true);
       });
@@ -39,44 +42,54 @@ describe('Eligibility', () => {
       });
     });
 
-    describe('ineligible commands', () => {
-      it('returns false for BLPOP (blocking)', () => {
-        assert.equal(resolver.isEligible(['BLPOP', 'key', '0']), false);
+    describe('keyless commands', () => {
+      it('returns true for TIME', () => {
+        assert.equal(resolver.isEligible(['TIME']), true);
       });
 
-      it('returns false for DBSIZE', () => {
-        assert.equal(resolver.isEligible(['DBSIZE']), false);
-      });
-
-      it('returns false for BINDHR', () => {
-        assert.equal(resolver.isEligible(['BINDHR', 'ENABLE']), false);
+      it('returns true for PING', () => {
+        assert.equal(resolver.isEligible(['PING']), true);
       });
     });
 
     describe('commands with subcommands', () => {
-      it('returns true for eligible CLUSTER SLOTS', () => {
-        assert.equal(resolver.isEligible(['CLUSTER', 'SLOTS']), true);
-      });
-
-      it('returns true for eligible CLIENT SETINFO', () => {
-        assert.equal(resolver.isEligible(['CLIENT', 'SETINFO', 'LIB-NAME', 'node-redis']), true);
-      });
-
-      it('returns false for ineligible CLIENT PAUSE', () => {
-        assert.equal(resolver.isEligible(['CLIENT', 'PAUSE', '1000']), false);
+      it('returns true for eligible OBJECT ENCODING', () => {
+        assert.equal(resolver.isEligible(['OBJECT', 'ENCODING', 'mykey']), true);
       });
 
       it('returns false when subcommand not found (falls back to parent)', () => {
-        // CLIENT itself is not eligible, so unknown subcommand returns false
-        assert.equal(resolver.isEligible(['CLIENT', 'UNKNOWNSUB']), false);
+        // OBJECT itself is not eligible, so unknown subcommand returns false
+        assert.equal(resolver.isEligible(['OBJECT', 'UNKNOWNSUB']), false);
       });
 
-      it('returns true for eligible CONFIG GET', () => {
-        assert.equal(resolver.isEligible(['CONFIG', 'GET', 'maxmemory']), true);
+      it('returns false for parent command without subcommand', () => {
+        assert.equal(resolver.isEligible(['OBJECT']), false);
+      });
+    });
+
+    describe('getEligibility with firstKeyIndex', () => {
+      it('returns firstKeyIndex 1 for SET', () => {
+        const result = resolver.getEligibility(['SET', 'key', 'value']);
+        assert.equal(result.eligible, true);
+        if (result.eligible) {
+          assert.equal(result.firstKeyIndex, 1);
+        }
       });
 
-      it('returns true for eligible XGROUP CREATE', () => {
-        assert.equal(resolver.isEligible(['XGROUP', 'CREATE', 'stream', 'group', '$']), true);
+      it('returns firstKeyIndex null for keyless PING', () => {
+        const result = resolver.getEligibility(['PING']);
+        assert.equal(result.eligible, true);
+        if (result.eligible) {
+          assert.equal(result.firstKeyIndex, null);
+        }
+      });
+
+      it('returns firstKeyIndex 2 for OBJECT ENCODING', () => {
+        const result = resolver.getEligibility(['OBJECT', 'ENCODING', 'mykey']);
+        assert.equal(result.eligible, true);
+        if (result.eligible) {
+          assert.equal(result.firstKeyIndex, 2);
+        }
       });
     });
   });
@@ -124,6 +137,43 @@ describe('Eligibility', () => {
       assert.equal(resolver.isEligible(['ELIGIBLE']), true);
       assert.equal(resolver.isEligible(['NOTELIGIBLE']), false);
     });
-  });
 
- });
+    it('handles keyPosition in subcommands', async () => {
+      const records: CommandBinhdrRawReply[] = [
+        {
+          name: 'CMD',
+          binhdrFlag: false,
+          subcommands: [
+            { name: 'SUB', binhdrFlag: true, keyPosition: 3 },
+          ],
+        },
+      ];
+
+      const resolver = await DynamicEligibilityResolverFactory.create(
+        async () => records
+      );
+
+      const result = resolver.getEligibility(['CMD', 'SUB', 'arg', 'mykey']);
+      assert.equal(result.eligible, true);
+      if (result.eligible) {
+        assert.equal(result.firstKeyIndex, 3);
+      }
+    });
+
+    it('handles keyless commands', async () => {
+      const records: CommandBinhdrRawReply[] = [
+        { name: 'NOKEYS', binhdrFlag: true, keyless: true },
+      ];
+
+      const resolver = await DynamicEligibilityResolverFactory.create(
+        async () => records
+      );
+
+      const result = resolver.getEligibility(['NOKEYS']);
+      assert.equal(result.eligible, true);
+      if (result.eligible) {
+        assert.equal(result.firstKeyIndex, null);
+      }
+    });
+  });
+});
