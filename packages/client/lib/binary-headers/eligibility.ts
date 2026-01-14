@@ -2,6 +2,8 @@
 
 export type {
   EligibleNode,
+  EligibilityResult,
+  KeyPositionInfo,
   CommandBinhdrRawReply,
   CommandBinhdrFetcher,
 } from './eligibility-types';

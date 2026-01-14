@@ -35,6 +35,8 @@ export {
 
 export type {
   EligibleNode,
+  EligibilityResult,
+  KeyPositionInfo,
   CommandBinhdrRawReply,
   CommandBinhdrFetcher,
 } from './eligibility';
@@ -48,12 +50,18 @@ export {
 } from './eligibility';
 
 // Packing
-export type { PackSingleCommandResult } from './packing';
+export type {
+  BufferedCommand,
+  PackingStrategy,
+} from './packing';
 
 export {
+  CommandPacker,
+  createDefaultPackingStrategy,
+  createBufferedCommand,
+  calculateCommandSlot,
   calculatePayloadLength,
-  packSingleCommand,
-  calculateSlotFromKeys,
+  packCommands,
 } from './packing';
 
 // Interceptor
@@ -68,4 +76,6 @@ export type {
 export { createBinhdrInterceptor } from './interceptor';
 
 // Client integration
+export type { BinhdrCodecOptions } from './client-integration';
+
 export { createBinhdrCodec } from './client-integration';

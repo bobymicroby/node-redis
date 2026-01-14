@@ -69,12 +69,18 @@ export interface CommandCodec {
    * Encode a command before sending.
    * @param command - Raw command arguments (for inspection/eligibility)
    * @param resp - RESP-encoded payload
-   * @returns The (possibly transformed) payload to send
+   * @returns Encoded payload, or null if command was buffered for packing
    */
   encode(
     command: ReadonlyArray<RedisArgument>,
     resp: ReadonlyArray<RedisArgument>
-  ): ReadonlyArray<RedisArgument>;
+  ): ReadonlyArray<RedisArgument> | null;
+
+  /**
+   * Flush any buffered commands that were held for packing.
+   * @returns Packed payload, or null if no commands were buffered
+   */
+  flush(): ReadonlyArray<RedisArgument> | null;
 
   /**
    * Decode incoming data from the socket before passing to RESP decoder.
@@ -90,6 +96,9 @@ export interface CommandCodec {
 export const DEFAULT_CODEC: CommandCodec = {
   encode(command, resp) {
     return resp;
+  },
+  flush() {
+    return null;
   },
   decode(chunk, push) {
     push(chunk);
@@ -517,8 +526,18 @@ export default class RedisCommandsQueue {
       toSend.chainId = undefined;
       this.#waitingForReply.push(toSend);
 
-      yield this.#codec.encode(args, encoded);
+      const result = this.#codec.encode(args, encoded);
+      // null means command was buffered for packing, continue to next
+      if (result !== null) {
+        yield result;
+      }
       toSend = this.#toWrite.shift();
+    }
+
+    // Flush any remaining buffered commands
+    const flushed = this.#codec.flush();
+    if (flushed !== null) {
+      yield flushed;
     }
   }
 

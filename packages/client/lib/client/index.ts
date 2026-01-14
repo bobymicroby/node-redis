@@ -612,9 +612,9 @@ export default class RedisClient<
 
   #initiateQueue(): RedisCommandsQueue {
     const codec = this.#options.binaryHeaders
-      ? createBinhdrCodec(
-          (clientIdx: number) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${clientIdx}`))
-        )
+      ? createBinhdrCodec({
+          onProtocolError: (clientIdx: number) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${clientIdx}`))
+        })
       : DEFAULT_CODEC;
 
     return new RedisCommandsQueue(
