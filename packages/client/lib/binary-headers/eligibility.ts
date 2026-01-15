@@ -1,20 +1,17 @@
-// Barrel export for eligibility module
-
 export type {
-  EligibleNode,
+  KeyPosition,
+  BlockingBehavior,
+  CommandAttrs,
+  CommandNode,
+  CommandRecord,
+  CommandRecordFetcher,
   EligibilityResult,
-  KeyPositionInfo,
-  CommandBinhdrRawReply,
-  CommandBinhdrFetcher,
 } from './eligibility-types';
 
-export {
-  EligibilityResolver,
-  DynamicEligibilityResolverFactory,
-} from './eligibility-resolver';
+export { EligibilityResolver, createEligibilityResolver } from './eligibility-resolver';
 
 export {
-  STATIC_BINHDR_RECORDS,
-  createMockBinhdrFetcher,
+  STATIC_COMMAND_RECORDS,
+  createMockRecordFetcher,
   createDefaultResolver,
 } from './eligibility-static-data';

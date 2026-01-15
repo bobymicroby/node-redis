@@ -1,128 +1,108 @@
 import type { RedisArgument } from '../RESP/types';
 import type {
-  EligibleNode,
+  CommandNode,
+  CommandAttrs,
+  CommandRecord,
+  CommandRecordFetcher,
+  KeyPosition,
+  BlockingBehavior,
   EligibilityResult,
-  KeyPositionInfo,
-  CommandBinhdrRawReply,
-  CommandBinhdrFetcher,
 } from './eligibility-types';
+import calculateSlot from 'cluster-key-slot';
 
 const DEFAULT_KEY_INDEX = 1;
+const SLOT_NO_SLOT = 0xFFFF;
 
-function keyInfoToFirstKeyIndex(keyInfo: KeyPositionInfo | undefined): number | null {
-  if (!keyInfo) {
-    return DEFAULT_KEY_INDEX;
-  }
-  if ('keyless' in keyInfo) {
-    return null;
-  }
-  return keyInfo.keyPosition;
+function argToString(arg: RedisArgument): string {
+  return typeof arg === 'string' ? arg : arg.toString('utf8');
 }
 
-/**
- * High-performance eligibility resolver.
- *
- * Optimizations:
- * - Map for O(1) command lookup
- * - Map for O(1) subcommand lookup
- * - UPPERCASE only (client always sends UPPERCASE)
- */
-export class EligibilityResolver {
-  readonly #map: Map<string, EligibleNode>;
+function keyPositionToIndex(keyPosition: KeyPosition | undefined): number | null {
+  if (!keyPosition) return DEFAULT_KEY_INDEX;
+  if ('keyless' in keyPosition) return null;
+  return keyPosition.index;
+}
 
-  constructor(map: Map<string, EligibleNode>) {
+function calculateCommandSlot(args: ReadonlyArray<RedisArgument>, firstKeyIndex: number | null): number {
+  if (firstKeyIndex === null || firstKeyIndex >= args.length) return SLOT_NO_SLOT;
+  const key = args[firstKeyIndex];
+  const keyStr = typeof key === 'string' ? key : key.toString();
+  return calculateSlot(keyStr);
+}
+
+function hasBlockingArg(args: ReadonlyArray<RedisArgument>, argName: string): boolean {
+  const upperArgName = argName.toUpperCase();
+  for (let i = 1; i < args.length; i++) {
+    const str = argToString(args[i]);
+    if (str.toUpperCase() === upperArgName) return true;
+  }
+  return false;
+}
+
+function isBlocking(args: ReadonlyArray<RedisArgument>, blocking: BlockingBehavior | undefined): boolean {
+  if (!blocking) return false;
+  if (blocking.type === 'always') return true;
+  return hasBlockingArg(args, blocking.argName);
+}
+
+function calculateEligibility(args: ReadonlyArray<RedisArgument>, attrs: CommandAttrs): EligibilityResult {
+  if (isBlocking(args, attrs.blocking)) {
+    return { eligible: false };
+  }
+  const firstKeyIndex = keyPositionToIndex(attrs.keyPosition);
+  const slot = calculateCommandSlot(args, firstKeyIndex);
+  return { eligible: true, slot };
+}
+
+export class EligibilityResolver {
+  readonly #map: Map<string, CommandNode>;
+
+  constructor(map: Map<string, CommandNode>) {
     this.#map = map;
   }
 
-  getEligibility(redisArgs: ReadonlyArray<RedisArgument>): EligibilityResult {
-    const len = redisArgs.length;
-    if (len === 0) {
-      return { eligible: false };
-    }
+  getEligibility(args: ReadonlyArray<RedisArgument>): EligibilityResult {
+    if (args.length === 0) return { eligible: false };
 
-    const arg0 = redisArgs[0];
-    const cmd = typeof arg0 === 'string' ? arg0 : arg0.toString('utf8');
-
+    const cmd = argToString(args[0]);
     const node = this.#map.get(cmd);
-    if (!node) {
-      return { eligible: false };
+    if (!node) return { eligible: false };
+
+    if (node.subs && args.length >= 2) {
+      const subcmd = argToString(args[1]);
+      const subAttrs = node.subs.get(subcmd);
+      if (subAttrs) return calculateEligibility(args, subAttrs);
     }
 
-    // Check subcommand if present
-    if (node.subs && len >= 2) {
-      const arg1 = redisArgs[1];
-      const subcmd = typeof arg1 === 'string' ? arg1 : arg1.toString('utf8');
-      if (node.subs.has(subcmd)) {
-        const subKeyInfo = node.subs.get(subcmd);
-        return { eligible: true, firstKeyIndex: keyInfoToFirstKeyIndex(subKeyInfo) };
-      }
-    }
-
-    // Fall back to base command eligibility
-    if (node.self) {
-      return { eligible: true, firstKeyIndex: keyInfoToFirstKeyIndex(node.keyInfo) };
-    }
-
-    return { eligible: false };
-  }
-
-  /**
-   * Check if command is eligible for binary headers.
-   * Convenience method that wraps getEligibility().
-   */
-  isEligible(redisArgs: ReadonlyArray<RedisArgument>): boolean {
-    return this.getEligibility(redisArgs).eligible;
+    return calculateEligibility(args, node);
   }
 }
 
-function rawToKeyInfo(raw: CommandBinhdrRawReply): KeyPositionInfo | undefined {
-  if (raw.keyless) {
-    return { keyless: true };
+function buildCommandNode(record: CommandRecord): CommandNode {
+  const { keyPosition, blocking } = record;
+
+  if (!record.subcommands?.length) {
+    return { keyPosition, blocking };
   }
-  if (raw.keyPosition !== undefined) {
-    return { keyPosition: raw.keyPosition };
+
+  const subs = new Map<string, CommandAttrs>();
+  for (const sub of record.subcommands) {
+    subs.set(sub.name.toUpperCase(), {
+      keyPosition: sub.keyPosition,
+      blocking: sub.blocking,
+    });
   }
-  return undefined;
+
+  return { keyPosition, blocking, subs };
 }
 
-/**
- * Factory to create resolver from COMMAND BINHDR data.
- */
-export class DynamicEligibilityResolverFactory {
-  static async create(fetcher: CommandBinhdrFetcher): Promise<EligibilityResolver> {
-    const commands = await fetcher();
-    const map = new Map<string, EligibleNode>();
+export async function createEligibilityResolver(fetcher: CommandRecordFetcher): Promise<EligibilityResolver> {
+  const commands = await fetcher();
+  const map = new Map<string, CommandNode>();
 
-    for (const command of commands) {
-      const name = command.name.toUpperCase();
-      const node = this.#buildNode(command);
-
-      if (node.self || node.subs) {
-        map.set(name, node);
-      }
-    }
-
-    return new EligibilityResolver(map);
+  for (const command of commands) {
+    map.set(command.name.toUpperCase(), buildCommandNode(command));
   }
 
-  static #buildNode(raw: CommandBinhdrRawReply): EligibleNode {
-    const self = raw.binhdrFlag;
-    const keyInfo = rawToKeyInfo(raw);
-
-    if (raw.subcommands?.length) {
-      const eligibleSubs = new Map<string, KeyPositionInfo | undefined>();
-
-      for (const sub of raw.subcommands) {
-        if (sub.binhdrFlag) {
-          eligibleSubs.set(sub.name.toUpperCase(), rawToKeyInfo(sub));
-        }
-      }
-
-      if (eligibleSubs.size > 0) {
-        return { self, keyInfo, subs: eligibleSubs };
-      }
-    }
-
-    return { self, keyInfo };
-  }
+  return new EligibilityResolver(map);
 }
