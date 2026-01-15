@@ -1,55 +1,82 @@
-import type { RedisArgument } from '../RESP/types';
-import type { CommandCodec } from '../client/commands-queue';
+import type {
+  CommandCodec,
+  OutboundCommand,
+  OutboundInterceptor,
+  InboundInterceptor,
+} from '../client/commands-queue';
 import { EligibilityResolver } from './eligibility-resolver';
 import { createDefaultResolver } from './eligibility-static-data';
 import { createBinhdrInterceptor } from './interceptor';
-import {
-  CommandPacker,
-  createDefaultPackingStrategy,
-  createBufferedCommand,
-} from './packing';
+import { CommandPacker, createDefaultPackingStrategy, createBufferedCommand } from './packing';
 
-export interface BinhdrCodecOptions {
+export interface OutboundCodecOptions {
+  readonly resolver?: EligibilityResolver | null;
+}
+
+export interface InboundCodecOptions {
   readonly onProtocolError?: (clientIdx: number) => void;
 }
 
-export function createBinhdrCodec(options: BinhdrCodecOptions = {}): CommandCodec {
+export interface CodecOptions extends OutboundCodecOptions, InboundCodecOptions {}
+
+export function createBinhdrOutboundInterceptor(
+  getResolver: () => EligibilityResolver | null,
+  packer: CommandPacker = new CommandPacker(createDefaultPackingStrategy())
+): OutboundInterceptor {
+  return {
+    process(command: OutboundCommand): OutboundCommand | null {
+      const resolver = getResolver();
+      if (!resolver) {
+        return command;
+      }
+
+      const eligibility = resolver.getEligibility(command.args);
+      if (!eligibility.eligible) {
+        return command;
+      }
+
+      const buffered = createBufferedCommand(command.args, command.encoded, eligibility);
+      const packed = packer.add(buffered);
+      if (packed === null) {
+        return null;
+      }
+      return { args: command.args, encoded: packed };
+    },
+
+    drain(): OutboundCommand | null {
+      const packed = packer.drain();
+      if (packed === null) {
+        return null;
+      }
+      return { args: [], encoded: packed };
+    }
+  };
+}
+
+export function createBinhdrInboundInterceptor(options: InboundCodecOptions = {}): InboundInterceptor {
+  const { onProtocolError } = options;
+
+  return createBinhdrInterceptor({
+    onProtocolError: onProtocolError
+      ? (header) => onProtocolError(header.clientIdx)
+      : undefined,
+  });
+}
+
+export function createBinhdrCodec(options: CodecOptions = {}): CommandCodec {
   const { onProtocolError } = options;
 
   let resolver: EligibilityResolver | null = null;
 
   createDefaultResolver()
-    .then(r => { resolver = r; })
-    .catch(() => { /* resolver stays null, all commands pass through */ });
+    .then((r) => { resolver = r; })
+    .catch(() => { /* resolver stays null, commands pass through */ });
 
-  const packer = new CommandPacker(createDefaultPackingStrategy());
-
-  const interceptor = createBinhdrInterceptor({
-    onProtocolError: onProtocolError
-      ? (header) => onProtocolError(header.clientIdx)
-      : undefined
-  });
+  const outbound = createBinhdrOutboundInterceptor(() => resolver);
+  const inbound = createBinhdrInboundInterceptor({ onProtocolError });
 
   return {
-    encode(
-      command: ReadonlyArray<RedisArgument>,
-      resp: ReadonlyArray<RedisArgument>
-    ): ReadonlyArray<RedisArgument> | null {
-      if (!resolver) return resp;
-
-      const eligibility = resolver.getEligibility(command);
-      if (!eligibility.eligible) return resp;
-
-      const buffered = createBufferedCommand(command, resp, eligibility);
-      return packer.add(buffered);
-    },
-
-    flush(): ReadonlyArray<RedisArgument> | null {
-      return packer.flush();
-    },
-
-    decode(chunk: Buffer, push: (data: Buffer) => void): void {
-      interceptor(chunk, push);
-    }
+    outbound,
+    inbound,
   };
 }

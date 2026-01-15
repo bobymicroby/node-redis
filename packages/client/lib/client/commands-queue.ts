@@ -60,50 +60,56 @@ const RESP2_PUSH_TYPE_MAPPING = {
 type PushHandler = (pushItems: Array<any>) => boolean;
 
 /**
- * Codec for encoding outgoing commands and decoding incoming data.
- * Allows plugging in binary headers or other wire-level transformations
- * without modifying the queue itself.
+ * Represents a command flowing through the outbound pipeline.
  */
-export interface CommandCodec {
-  /**
-   * Encode a command before sending.
-   * @param command - Raw command arguments (for inspection/eligibility)
-   * @param resp - RESP-encoded payload
-   * @returns Encoded payload, or null if command was buffered for packing
-   */
-  encode(
-    command: ReadonlyArray<RedisArgument>,
-    resp: ReadonlyArray<RedisArgument>
-  ): ReadonlyArray<RedisArgument> | null;
-
-  /**
-   * Flush any buffered commands that were held for packing.
-   * @returns Packed payload, or null if no commands were buffered
-   */
-  flush(): ReadonlyArray<RedisArgument> | null;
-
-  /**
-   * Decode incoming data from the socket before passing to RESP decoder.
-   * @param chunk - Raw data from socket
-   * @param push - Function to push data to the decoder
-   */
-  decode(chunk: Buffer, push: (data: Buffer) => void): void;
+export interface OutboundCommand {
+  /** Original command arguments (for inspection/eligibility checks) */
+  readonly args: ReadonlyArray<RedisArgument>;
+  /** RESP-encoded payload ready for wire transmission */
+  readonly encoded: ReadonlyArray<RedisArgument>;
 }
 
 /**
- * Default no-op codec - passes through commands and data unchanged.
+ * Intercepts outbound commands before they are sent to the server.
+ *
+ * Interceptors can transform commands or buffer them for batching.
+ * For non-buffering interceptors, `process` should always return a command
+ * and `drain` should always return `null`.
  */
-export const DEFAULT_CODEC: CommandCodec = {
-  encode(command, resp) {
-    return resp;
-  },
-  flush() {
-    return null;
-  },
-  decode(chunk, push) {
-    push(chunk);
-  }
-};
+export interface OutboundInterceptor {
+  /**
+   * Process a command before sending.
+   * @param command - The command to process
+   * @returns The transformed command, or `null` if buffered for later batching
+   */
+  readonly process: (command: OutboundCommand) => OutboundCommand | null;
+
+  /**
+   * Drain any buffered commands.
+   * Called at the end of a write batch to flush remaining buffered commands.
+   * @returns Buffered command(s) packed together, or `null` if nothing buffered
+   */
+  readonly drain: () => OutboundCommand | null;
+}
+
+export type InboundNext = (chunk: Buffer) => void;
+
+/**
+ * Intercepts inbound data from the server before it reaches the decoder.
+ * Uses callback-based `next` for streaming support (can emit multiple chunks).
+ */
+export type InboundInterceptor = (chunk: Buffer, next: InboundNext) => void;
+
+/**
+ * Codec for transforming commands and data on the wire.
+ * Allows plugging in binary headers or other wire-level transformations.
+ */
+export interface CommandCodec {
+  readonly outbound: OutboundInterceptor;
+  readonly inbound: InboundInterceptor;
+}
+
+
 
 export default class RedisCommandsQueue {
   readonly #respVersion;
@@ -114,7 +120,9 @@ export default class RedisCommandsQueue {
   #chainInExecution: symbol | undefined;
   readonly decoder;
   readonly #pubSub = new PubSub();
-  readonly #codec: CommandCodec;
+  readonly #codec: CommandCodec | undefined;
+  readonly commandsToWrite: () => Generator<ReadonlyArray<RedisArgument>>;
+  readonly processIncomingData: (chunk: Buffer) => void;
 
   #pushHandlers: PushHandler[] = [this.#onPush.bind(this)];
 
@@ -171,13 +179,21 @@ export default class RedisCommandsQueue {
     respVersion: RespVersions,
     maxLength: number | null | undefined,
     onShardedChannelMoved: OnShardedChannelMoved,
-    codec: CommandCodec
+    codec?: CommandCodec
   ) {
     this.#respVersion = respVersion;
     this.#maxLength = maxLength;
     this.#onShardedChannelMoved = onShardedChannelMoved;
     this.#codec = codec;
     this.decoder = this.#initiateDecoder();
+
+    if (codec) {
+      this.commandsToWrite = this.#commandsToWriteWithCodec.bind(this);
+      this.processIncomingData = this.#processIncomingDataWithCodec.bind(this);
+    } else {
+      this.commandsToWrite = this.#commandsToWriteNoCodec.bind(this);
+      this.processIncomingData = (chunk: Buffer) => this.decoder.write(chunk);
+    }
   }
 
   #onReply(reply: ReplyUnion) {
@@ -499,20 +515,18 @@ export default class RedisCommandsQueue {
     return this.#toWrite.length > 0;
   }
 
-  *commandsToWrite() {
+  *#commandsToWriteNoCodec(): Generator<ReadonlyArray<RedisArgument>> {
     let toSend = this.#toWrite.shift();
     while (toSend) {
-      const args = toSend.args;
-      let encoded: ReadonlyArray<RedisArgument>
+      let encoded: ReadonlyArray<RedisArgument>;
       try {
-        encoded = encodeCommand(args);
+        encoded = encodeCommand(toSend.args);
       } catch (err) {
         toSend.reject(err);
         toSend = this.#toWrite.shift();
         continue;
       }
 
-      // TODO reuse `toSend` or create new object?
       (toSend as any).args = undefined;
       if (toSend.abort) {
         RedisCommandsQueue.#removeAbortListener(toSend);
@@ -526,27 +540,55 @@ export default class RedisCommandsQueue {
       toSend.chainId = undefined;
       this.#waitingForReply.push(toSend);
 
-      const result = this.#codec.encode(args, encoded);
-      // null means command was buffered for packing, continue to next
-      if (result !== null) {
-        yield result;
-      }
-      toSend = this.#toWrite.shift();
-    }
+      yield encoded;
 
-    // Flush any remaining buffered commands
-    const flushed = this.#codec.flush();
-    if (flushed !== null) {
-      yield flushed;
+      toSend = this.#toWrite.shift();
     }
   }
 
-  /**
-   * Process incoming data from the socket.
-   * Delegates to codec for potential transformation before decoding.
-   */
-  processIncomingData(chunk: Buffer) {
-    this.#codec.decode(chunk, data => this.decoder.write(data));
+  *#commandsToWriteWithCodec(): Generator<ReadonlyArray<RedisArgument>> {
+    const codec = this.#codec!;
+    let toSend = this.#toWrite.shift();
+    while (toSend) {
+      const args = toSend.args;
+      let encoded: ReadonlyArray<RedisArgument>;
+      try {
+        encoded = encodeCommand(args);
+      } catch (err) {
+        toSend.reject(err);
+        toSend = this.#toWrite.shift();
+        continue;
+      }
+
+      (toSend as any).args = undefined;
+      if (toSend.abort) {
+        RedisCommandsQueue.#removeAbortListener(toSend);
+        toSend.abort = undefined;
+      }
+      if (toSend.timeout) {
+        RedisCommandsQueue.#removeTimeoutListener(toSend);
+        toSend.timeout = undefined;
+      }
+      this.#chainInExecution = toSend.chainId;
+      toSend.chainId = undefined;
+      this.#waitingForReply.push(toSend);
+
+      const result = codec.outbound.process({ args, encoded });
+      if (result !== null) {
+        yield result.encoded;
+      }
+
+      toSend = this.#toWrite.shift();
+    }
+
+    const drained = codec.outbound.drain();
+    if (drained !== null) {
+      yield drained.encoded;
+    }
+  }
+
+  #processIncomingDataWithCodec(chunk: Buffer) {
+    this.#codec!.inbound(chunk, data => this.decoder.write(data));
   }
 
   #flushWaitingForReply(err: Error): void {

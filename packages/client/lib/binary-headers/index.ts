@@ -65,15 +65,26 @@ export {
 } from './packing';
 
 export type {
-  DataHandler,
-  DataInterceptor,
-  OnBinhdrHeader,
-  OnBinhdrProtocolError,
-  BinhdrInterceptorOptions,
+  OnHeader,
+  OnProtocolError,
+  InterceptorOptions,
 } from './interceptor';
 
-export { createBinhdrInterceptor } from './interceptor';
+export {
+  createBinhdrInterceptor,
+  chainInbound,
+  passthroughInbound,
+  passthroughOutbound
+} from './interceptor';
 
-export type { BinhdrCodecOptions } from './client-integration';
+export type {
+  CodecOptions,
+  OutboundCodecOptions,
+  InboundCodecOptions,
+} from './client-integration';
 
-export { createBinhdrCodec } from './client-integration';
+export {
+  createBinhdrCodec,
+  createBinhdrOutboundInterceptor,
+  createBinhdrInboundInterceptor,
+} from './client-integration';

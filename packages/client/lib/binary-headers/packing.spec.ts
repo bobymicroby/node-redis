@@ -271,27 +271,27 @@ describe('Packing', () => {
       }
     });
 
-    it('flush returns packed commands and empties buffer', () => {
+    it('drain returns packed commands and empties buffer', () => {
       const packer = new CommandPacker();
 
       packer.add(makeBuffered(1000));
       packer.add(makeBuffered(1000));
 
-      const flushed = packer.flush();
+      const drained = packer.drain();
 
-      assert.ok(flushed !== null);
+      assert.ok(drained !== null);
       assert.equal(packer.bufferSize, 0);
 
-      const header = parseRequestHeader(flushed![0] as Buffer);
+      const header = parseRequestHeader(drained![0] as Buffer);
       assert.ok(header.success);
       if (header.success) {
         assert.equal(header.header.commandCount, 2);
       }
     });
 
-    it('flush returns null when buffer is empty', () => {
+    it('drain returns null when buffer is empty', () => {
       const packer = new CommandPacker();
-      assert.equal(packer.flush(), null);
+      assert.equal(packer.drain(), null);
     });
 
     it('uses custom strategy', () => {

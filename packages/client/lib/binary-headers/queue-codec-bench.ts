@@ -5,7 +5,7 @@
  * Usage: npx ts-node lib/binary-headers/queue-codec-bench.ts
  */
 
-import RedisCommandsQueue, { DEFAULT_CODEC, CommandCodec } from '../client/commands-queue';
+import RedisCommandsQueue, { CommandCodec } from '../client/commands-queue';
 import MasterQueue from './master-queue';
 import { createBinhdrCodec } from './client-integration';
 import { createBinhdrResponse } from './test-utils';
@@ -22,7 +22,7 @@ const ROUNDS = 5;
 // Queue Factory
 // ============================================================================
 
-function createQueue(codec: CommandCodec): RedisCommandsQueue {
+function createQueue(codec?: CommandCodec): RedisCommandsQueue {
   return new RedisCommandsQueue(
     2,
     null,
@@ -49,7 +49,7 @@ interface BenchQueue {
   decode(chunk: Buffer): void;
 }
 
-function wrapCurrentQueue(codec: CommandCodec): BenchQueue {
+function wrapCurrentQueue(codec?: CommandCodec): BenchQueue {
   const queue = createQueue(codec);
   return {
     addCommand: (args) => { queue.addCommand(args); },
@@ -245,7 +245,7 @@ function runDecodeBatchBenchmark(
 function verifyEncoding(): void {
   console.log('Verifying encoding works correctly...\n');
 
-  const queue = wrapCurrentQueue(DEFAULT_CODEC);
+  const queue = wrapCurrentQueue(undefined);
 
   // Before addCommand - should yield nothing
   let countBefore = 0;
@@ -314,7 +314,7 @@ async function main(): Promise<void> {
   console.log('-'.repeat(60));
 
   const encodeMaster = runEncodeBenchmark('Master (no codec)', wrapMasterQueue, testCommand);
-  const encodeDefault = runEncodeBenchmark('Default codec', () => wrapCurrentQueue(DEFAULT_CODEC), testCommand);
+  const encodeDefault = runEncodeBenchmark('No codec', () => wrapCurrentQueue(undefined), testCommand);
   const encodeBinhdr = runEncodeBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), testCommand);
 
   printResult(encodeMaster);
@@ -324,7 +324,7 @@ async function main(): Promise<void> {
   const codecOverhead = encodeDefault.medianNs / encodeMaster.medianNs;
   const binhdrOverhead = encodeBinhdr.medianNs / encodeMaster.medianNs;
   console.log(`\nOverhead vs master:`);
-  console.log(`  Default codec:    ${((codecOverhead - 1) * 100).toFixed(1)}% (${codecOverhead.toFixed(2)}x)`);
+  console.log(`  No codec:         ${((codecOverhead - 1) * 100).toFixed(1)}% (${codecOverhead.toFixed(2)}x)`);
   console.log(`  Binhdr codec:     ${((binhdrOverhead - 1) * 100).toFixed(1)}% (${binhdrOverhead.toFixed(2)}x)\n`);
 
   // Decode benchmarks
@@ -332,7 +332,7 @@ async function main(): Promise<void> {
   console.log('-'.repeat(60));
 
   const decodeMaster = runDecodeBenchmark('Master (no codec)', wrapMasterQueue, plainResp);
-  const decodeDefault = runDecodeBenchmark('Default codec', () => wrapCurrentQueue(DEFAULT_CODEC), plainResp);
+  const decodeDefault = runDecodeBenchmark('No codec', () => wrapCurrentQueue(undefined), plainResp);
   const decodeBinhdr = runDecodeBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), binhdrResp);
 
   printResult(decodeMaster);
@@ -342,7 +342,7 @@ async function main(): Promise<void> {
   const decodeCodecOverhead = decodeDefault.medianNs / decodeMaster.medianNs;
   const decodeBinhdrOverhead = decodeBinhdr.medianNs / decodeMaster.medianNs;
   console.log(`\nOverhead vs master:`);
-  console.log(`  Default codec:    ${((decodeCodecOverhead - 1) * 100).toFixed(1)}% (${decodeCodecOverhead.toFixed(2)}x)`);
+  console.log(`  No codec:         ${((decodeCodecOverhead - 1) * 100).toFixed(1)}% (${decodeCodecOverhead.toFixed(2)}x)`);
   console.log(`  Binhdr codec:     ${((decodeBinhdrOverhead - 1) * 100).toFixed(1)}% (${decodeBinhdrOverhead.toFixed(2)}x)\n`);
 
   // ============================================================================
@@ -363,7 +363,7 @@ async function main(): Promise<void> {
   console.log('-'.repeat(60));
 
   const encodeBatchMaster = runEncodeBatchBenchmark('Master (no codec)', wrapMasterQueue, batchCommands);
-  const encodeBatchDefault = runEncodeBatchBenchmark('Default codec', () => wrapCurrentQueue(DEFAULT_CODEC), batchCommands);
+  const encodeBatchDefault = runEncodeBatchBenchmark('No codec', () => wrapCurrentQueue(undefined), batchCommands);
   const encodeBatchBinhdr = runEncodeBatchBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), batchCommands);
 
   printResult(encodeBatchMaster);
@@ -373,14 +373,14 @@ async function main(): Promise<void> {
   const batchCodecOverhead = encodeBatchDefault.medianNs / encodeBatchMaster.medianNs;
   const batchBinhdrOverhead = encodeBatchBinhdr.medianNs / encodeBatchMaster.medianNs;
   console.log(`\nOverhead vs master:`);
-  console.log(`  Default codec:    ${((batchCodecOverhead - 1) * 100).toFixed(1)}% (${batchCodecOverhead.toFixed(2)}x)`);
+  console.log(`  No codec:         ${((batchCodecOverhead - 1) * 100).toFixed(1)}% (${batchCodecOverhead.toFixed(2)}x)`);
   console.log(`  Binhdr codec:     ${((batchBinhdrOverhead - 1) * 100).toFixed(1)}% (${batchBinhdrOverhead.toFixed(2)}x)\n`);
 
   console.log(`DECODE BATCH (${BATCH_SIZE} +OK responses)`);
   console.log('-'.repeat(60));
 
   const decodeBatchMaster = runDecodeBatchBenchmark('Master (no codec)', wrapMasterQueue, batchCommands, plainBatchResp);
-  const decodeBatchDefault = runDecodeBatchBenchmark('Default codec', () => wrapCurrentQueue(DEFAULT_CODEC), batchCommands, plainBatchResp);
+  const decodeBatchDefault = runDecodeBatchBenchmark('No codec', () => wrapCurrentQueue(undefined), batchCommands, plainBatchResp);
   const decodeBatchBinhdr = runDecodeBatchBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), batchCommands, binhdrBatchResp);
 
   printResult(decodeBatchMaster);
@@ -390,7 +390,7 @@ async function main(): Promise<void> {
   const decodeBatchCodecOverhead = decodeBatchDefault.medianNs / decodeBatchMaster.medianNs;
   const decodeBatchBinhdrOverhead = decodeBatchBinhdr.medianNs / decodeBatchMaster.medianNs;
   console.log(`\nOverhead vs master:`);
-  console.log(`  Default codec:    ${((decodeBatchCodecOverhead - 1) * 100).toFixed(1)}% (${decodeBatchCodecOverhead.toFixed(2)}x)`);
+  console.log(`  No codec:         ${((decodeBatchCodecOverhead - 1) * 100).toFixed(1)}% (${decodeBatchCodecOverhead.toFixed(2)}x)`);
   console.log(`  Binhdr codec:     ${((decodeBatchBinhdrOverhead - 1) * 100).toFixed(1)}% (${decodeBatchBinhdrOverhead.toFixed(2)}x)\n`);
 }
 

@@ -133,7 +133,7 @@ export class CommandPacker {
     return null;
   }
 
-  flush(): ReadonlyArray<RedisArgument> | null {
+  drain(): ReadonlyArray<RedisArgument> | null {
     if (this.#buffer.length === 0) return null;
     const packed = packCommands(this.#buffer);
     this.#buffer.length = 0;

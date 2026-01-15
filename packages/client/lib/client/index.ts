@@ -1,7 +1,7 @@
 import COMMANDS from '../commands';
 import RedisSocket, { RedisSocketOptions } from './socket';
 import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
-import RedisCommandsQueue, { CommandOptions, DEFAULT_CODEC } from './commands-queue';
+import RedisCommandsQueue, { CommandOptions } from './commands-queue';
 import { createBinhdrCodec } from '../binary-headers/client-integration';
 import { EventEmitter } from 'node:events';
 import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';
@@ -615,7 +615,7 @@ export default class RedisClient<
       ? createBinhdrCodec({
           onProtocolError: (clientIdx: number) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${clientIdx}`))
         })
-      : DEFAULT_CODEC;
+      : undefined;
 
     return new RedisCommandsQueue(
       this.#options.RESP ?? 2,
