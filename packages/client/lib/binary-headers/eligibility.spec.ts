@@ -2,10 +2,10 @@ import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach } from 'mocha';
 import {
   EligibilityResolver,
-  DynamicEligibilityResolverFactory,
-  createMockBinhdrFetcher,
+  createEligibilityResolver,
+  createMockRecordFetcher,
   createDefaultResolver,
-  type CommandBinhdrRawReply,
+  type CommandRecord,
 } from './eligibility';
 
 describe('Eligibility', () => {
@@ -17,163 +17,205 @@ describe('Eligibility', () => {
     });
 
     describe('simple commands', () => {
-      it('returns true for eligible SET command', () => {
-        assert.equal(resolver.isEligible(['SET', 'key', 'value']), true);
+      it('returns eligible true for SET command', () => {
+        assert.equal(resolver.getEligibility(['SET', 'key', 'value']).eligible, true);
       });
 
-      it('returns true for eligible GET command', () => {
-        assert.equal(resolver.isEligible(['GET', 'key']), true);
+      it('returns eligible true for GET command', () => {
+        assert.equal(resolver.getEligibility(['GET', 'key']).eligible, true);
       });
 
-      it('returns true for eligible HSET command', () => {
-        assert.equal(resolver.isEligible(['HSET', 'key', 'field', 'value']), true);
+      it('returns eligible true for HSET command', () => {
+        assert.equal(resolver.getEligibility(['HSET', 'key', 'field', 'value']).eligible, true);
       });
 
       it('handles Buffer command names', () => {
-        assert.equal(resolver.isEligible([Buffer.from('SET'), 'key', 'value']), true);
+        assert.equal(resolver.getEligibility([Buffer.from('SET'), 'key', 'value']).eligible, true);
       });
 
       it('returns false for unknown command', () => {
-        assert.equal(resolver.isEligible(['UNKNOWNCOMMAND', 'arg']), false);
+        assert.equal(resolver.getEligibility(['UNKNOWNCOMMAND', 'arg']).eligible, false);
       });
 
       it('returns false for empty args', () => {
-        assert.equal(resolver.isEligible([]), false);
+        assert.equal(resolver.getEligibility([]).eligible, false);
       });
     });
 
     describe('keyless commands', () => {
-      it('returns true for TIME', () => {
-        assert.equal(resolver.isEligible(['TIME']), true);
+      it('returns eligible true for TIME', () => {
+        assert.equal(resolver.getEligibility(['TIME']).eligible, true);
       });
 
-      it('returns true for PING', () => {
-        assert.equal(resolver.isEligible(['PING']), true);
+      it('returns eligible true for PING', () => {
+        assert.equal(resolver.getEligibility(['PING']).eligible, true);
       });
     });
 
     describe('commands with subcommands', () => {
-      it('returns true for eligible OBJECT ENCODING', () => {
-        assert.equal(resolver.isEligible(['OBJECT', 'ENCODING', 'mykey']), true);
+      it('returns eligible true for OBJECT ENCODING', () => {
+        assert.equal(resolver.getEligibility(['OBJECT', 'ENCODING', 'mykey']).eligible, true);
       });
 
-      it('returns false when subcommand not found (falls back to parent)', () => {
-        // OBJECT itself is not eligible, so unknown subcommand returns false
-        assert.equal(resolver.isEligible(['OBJECT', 'UNKNOWNSUB']), false);
+      it('returns eligible for parent command without subcommand', () => {
+        const result = resolver.getEligibility(['OBJECT']);
+        assert.equal(result.eligible, true);
       });
 
-      it('returns false for parent command without subcommand', () => {
-        assert.equal(resolver.isEligible(['OBJECT']), false);
+      it('returns eligible for unknown subcommand (uses parent attrs)', () => {
+        const result = resolver.getEligibility(['OBJECT', 'UNKNOWNSUB']);
+        assert.equal(result.eligible, true);
       });
     });
 
-    describe('getEligibility with firstKeyIndex', () => {
-      it('returns firstKeyIndex 1 for SET', () => {
+    describe('getEligibility with slot', () => {
+      it('returns slot for SET command', () => {
         const result = resolver.getEligibility(['SET', 'key', 'value']);
         assert.equal(result.eligible, true);
         if (result.eligible) {
-          assert.equal(result.firstKeyIndex, 1);
+          assert.equal(typeof result.slot, 'number');
+          assert.ok(result.slot >= 0 && result.slot <= 16383);
         }
       });
 
-      it('returns firstKeyIndex null for keyless PING', () => {
+      it('returns SLOT_NO_SLOT (0xFFFF) for keyless PING', () => {
         const result = resolver.getEligibility(['PING']);
         assert.equal(result.eligible, true);
         if (result.eligible) {
-          assert.equal(result.firstKeyIndex, null);
+          assert.equal(result.slot, 0xFFFF);
         }
       });
 
-      it('returns firstKeyIndex 2 for OBJECT ENCODING', () => {
+      it('returns slot for OBJECT ENCODING using key at index 2', () => {
         const result = resolver.getEligibility(['OBJECT', 'ENCODING', 'mykey']);
         assert.equal(result.eligible, true);
         if (result.eligible) {
-          assert.equal(result.firstKeyIndex, 2);
+          assert.equal(typeof result.slot, 'number');
+          assert.ok(result.slot >= 0 && result.slot <= 16383);
         }
+      });
+    });
+
+    describe('blocking commands', () => {
+      it('returns eligible true for XREAD without BLOCK', () => {
+        const result = resolver.getEligibility(['XREAD', 'STREAMS', 'mystream', '0']);
+        assert.equal(result.eligible, true);
+      });
+
+      it('returns eligible false for XREAD with BLOCK', () => {
+        const result = resolver.getEligibility(['XREAD', 'BLOCK', '0', 'STREAMS', 'mystream', '0']);
+        assert.equal(result.eligible, false);
+      });
+
+      it('returns eligible false for XREAD with lowercase block', () => {
+        const result = resolver.getEligibility(['XREAD', 'block', '0', 'STREAMS', 'mystream', '0']);
+        assert.equal(result.eligible, false);
+      });
+
+      it('returns eligible true for XREADGROUP without BLOCK', () => {
+        const result = resolver.getEligibility(['XREADGROUP', 'GROUP', 'mygroup', 'myconsumer', 'STREAMS', 'mystream', '>']);
+        assert.equal(result.eligible, true);
+      });
+
+      it('returns eligible false for XREADGROUP with BLOCK', () => {
+        const result = resolver.getEligibility(['XREADGROUP', 'GROUP', 'mygroup', 'myconsumer', 'BLOCK', '0', 'STREAMS', 'mystream', '>']);
+        assert.equal(result.eligible, false);
       });
     });
   });
 
-  describe('DynamicEligibilityResolverFactory', () => {
+  describe('createEligibilityResolver', () => {
     it('creates resolver from fetcher', async () => {
-      const resolver = await DynamicEligibilityResolverFactory.create(
-        createMockBinhdrFetcher()
-      );
-
-      assert.equal(resolver.isEligible(['SET', 'key', 'value']), true);
+      const resolver = await createEligibilityResolver(createMockRecordFetcher());
+      assert.equal(resolver.getEligibility(['SET', 'key', 'value']).eligible, true);
     });
 
     it('builds structure for subcommands', async () => {
-      const records: CommandBinhdrRawReply[] = [
+      const records: CommandRecord[] = [
         {
           name: 'PARENT',
-          binhdrFlag: false,
           subcommands: [
-            { name: 'SUB1', binhdrFlag: true },
-            { name: 'SUB2', binhdrFlag: false },
+            { name: 'SUB1' },
+            { name: 'SUB2', blocking: { type: 'always' } },
           ],
         },
       ];
 
-      const resolver = await DynamicEligibilityResolverFactory.create(
-        async () => records
-      );
+      const resolver = await createEligibilityResolver(async () => records);
 
-      assert.equal(resolver.isEligible(['PARENT', 'SUB1']), true);
-      assert.equal(resolver.isEligible(['PARENT', 'SUB2']), false);
-      assert.equal(resolver.isEligible(['PARENT', 'UNKNOWN']), false);
-    });
-
-    it('only stores eligible commands', async () => {
-      const records: CommandBinhdrRawReply[] = [
-        { name: 'ELIGIBLE', binhdrFlag: true },
-        { name: 'NOTELIGIBLE', binhdrFlag: false },
-      ];
-
-      const resolver = await DynamicEligibilityResolverFactory.create(
-        async () => records
-      );
-
-      assert.equal(resolver.isEligible(['ELIGIBLE']), true);
-      assert.equal(resolver.isEligible(['NOTELIGIBLE']), false);
+      assert.equal(resolver.getEligibility(['PARENT', 'SUB1']).eligible, true);
+      assert.equal(resolver.getEligibility(['PARENT', 'SUB2']).eligible, false);
     });
 
     it('handles keyPosition in subcommands', async () => {
-      const records: CommandBinhdrRawReply[] = [
+      const records: CommandRecord[] = [
         {
           name: 'CMD',
-          binhdrFlag: false,
           subcommands: [
-            { name: 'SUB', binhdrFlag: true, keyPosition: 3 },
+            { name: 'SUB', keyPosition: { index: 3 } },
           ],
         },
       ];
 
-      const resolver = await DynamicEligibilityResolverFactory.create(
-        async () => records
-      );
+      const resolver = await createEligibilityResolver(async () => records);
 
       const result = resolver.getEligibility(['CMD', 'SUB', 'arg', 'mykey']);
       assert.equal(result.eligible, true);
       if (result.eligible) {
-        assert.equal(result.firstKeyIndex, 3);
+        assert.equal(typeof result.slot, 'number');
       }
     });
 
     it('handles keyless commands', async () => {
-      const records: CommandBinhdrRawReply[] = [
-        { name: 'NOKEYS', binhdrFlag: true, keyless: true },
+      const records: CommandRecord[] = [
+        { name: 'NOKEYS', keyPosition: { keyless: true } },
       ];
 
-      const resolver = await DynamicEligibilityResolverFactory.create(
-        async () => records
-      );
+      const resolver = await createEligibilityResolver(async () => records);
 
       const result = resolver.getEligibility(['NOKEYS']);
       assert.equal(result.eligible, true);
       if (result.eligible) {
-        assert.equal(result.firstKeyIndex, null);
+        assert.equal(result.slot, 0xFFFF);
       }
+    });
+
+    it('handles always blocking commands', async () => {
+      const records: CommandRecord[] = [
+        { name: 'BLPOP', blocking: { type: 'always' } },
+      ];
+
+      const resolver = await createEligibilityResolver(async () => records);
+
+      assert.equal(resolver.getEligibility(['BLPOP', 'key', '0']).eligible, false);
+    });
+
+    it('handles conditional blocking commands', async () => {
+      const records: CommandRecord[] = [
+        { name: 'XREAD', blocking: { type: 'conditional', argName: 'BLOCK' } },
+      ];
+
+      const resolver = await createEligibilityResolver(async () => records);
+
+      assert.equal(resolver.getEligibility(['XREAD', 'STREAMS', 'stream', '0']).eligible, true);
+      assert.equal(resolver.getEligibility(['XREAD', 'BLOCK', '0', 'STREAMS', 'stream', '0']).eligible, false);
+    });
+
+    it('handles blocking in subcommands', async () => {
+      const records: CommandRecord[] = [
+        {
+          name: 'PARENT',
+          subcommands: [
+            { name: 'BLOCKING', blocking: { type: 'always' } },
+            { name: 'NONBLOCKING' },
+          ],
+        },
+      ];
+
+      const resolver = await createEligibilityResolver(async () => records);
+
+      assert.equal(resolver.getEligibility(['PARENT', 'BLOCKING', 'arg']).eligible, false);
+      assert.equal(resolver.getEligibility(['PARENT', 'NONBLOCKING', 'arg']).eligible, true);
     });
   });
 });

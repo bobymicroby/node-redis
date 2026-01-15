@@ -1,45 +1,30 @@
-import type { CommandBinhdrRawReply, CommandBinhdrFetcher } from './eligibility-types';
-import {
-  EligibilityResolver,
-  DynamicEligibilityResolverFactory
-} from './eligibility-resolver';
+import type { CommandRecord, CommandRecordFetcher } from './eligibility-types';
+import { EligibilityResolver, createEligibilityResolver } from './eligibility-resolver';
 
-/**
- * Static eligibility records (test/fallback data).
- *
- * Key position rules:
- * - If keyless/keyPosition absent: first key is at index 1 (default)
- * - keyless: true = command has no keys
- * - keyPosition: number = first key is at that index (when != 1)
- */
-export const STATIC_BINHDR_RECORDS: ReadonlyArray<CommandBinhdrRawReply> = [
-  // Commands with keys at default position (index 1)
-  { name: 'SET', binhdrFlag: true },
-  { name: 'GET', binhdrFlag: true },
-  { name: 'MSET', binhdrFlag: true },
-  { name: 'MGET', binhdrFlag: true },
-  { name: 'DEL', binhdrFlag: true },
-  { name: 'HSET', binhdrFlag: true },
-  { name: 'HGET', binhdrFlag: true },
-
-  // Commands without keys
-  { name: 'TIME', binhdrFlag: true, keyless: true },
-  { name: 'PING', binhdrFlag: true, keyless: true },
-
-  // Command with subcommands (key at index 2 for OBJECT subcommands)
+export const STATIC_COMMAND_RECORDS: ReadonlyArray<CommandRecord> = [
+  { name: 'SET' },
+  { name: 'GET' },
+  { name: 'MSET' },
+  { name: 'MGET' },
+  { name: 'DEL' },
+  { name: 'HSET' },
+  { name: 'HGET' },
+  { name: 'TIME', keyPosition: { keyless: true } },
+  { name: 'PING', keyPosition: { keyless: true } },
+  { name: 'XREAD', blocking: { type: 'conditional', argName: 'BLOCK' } },
+  { name: 'XREADGROUP', blocking: { type: 'conditional', argName: 'BLOCK' } },
   {
     name: 'OBJECT',
-    binhdrFlag: false,
     subcommands: [
-      { name: 'ENCODING', binhdrFlag: true, keyPosition: 2 },
+      { name: 'ENCODING', keyPosition: { index: 2 } },
     ]
   },
 ];
 
-export function createMockBinhdrFetcher(): CommandBinhdrFetcher {
-  return async () => STATIC_BINHDR_RECORDS;
+export function createMockRecordFetcher(): CommandRecordFetcher {
+  return async () => STATIC_COMMAND_RECORDS;
 }
 
 export async function createDefaultResolver(): Promise<EligibilityResolver> {
-  return DynamicEligibilityResolverFactory.create(createMockBinhdrFetcher());
+  return createEligibilityResolver(createMockRecordFetcher());
 }

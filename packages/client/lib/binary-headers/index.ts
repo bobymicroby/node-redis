@@ -34,22 +34,23 @@ export {
 } from './decoder';
 
 export type {
-  EligibleNode,
+  KeyPosition,
+  BlockingBehavior,
+  CommandAttrs,
+  CommandNode,
+  CommandRecord,
+  CommandRecordFetcher,
   EligibilityResult,
-  KeyPositionInfo,
-  CommandBinhdrRawReply,
-  CommandBinhdrFetcher,
 } from './eligibility';
 
 export {
   EligibilityResolver,
-  DynamicEligibilityResolverFactory,
-  STATIC_BINHDR_RECORDS,
-  createMockBinhdrFetcher,
+  createEligibilityResolver,
+  STATIC_COMMAND_RECORDS,
+  createMockRecordFetcher,
   createDefaultResolver,
 } from './eligibility';
 
-// Packing
 export type {
   BufferedCommand,
   PackingStrategy,
@@ -59,12 +60,10 @@ export {
   CommandPacker,
   createDefaultPackingStrategy,
   createBufferedCommand,
-  calculateCommandSlot,
   calculatePayloadLength,
   packCommands,
 } from './packing';
 
-// Interceptor
 export type {
   DataHandler,
   DataInterceptor,
@@ -75,7 +74,6 @@ export type {
 
 export { createBinhdrInterceptor } from './interceptor';
 
-// Client integration
 export type { BinhdrCodecOptions } from './client-integration';
 
 export { createBinhdrCodec } from './client-integration';

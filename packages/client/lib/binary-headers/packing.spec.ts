@@ -4,7 +4,6 @@ import {
   CommandPacker,
   createDefaultPackingStrategy,
   createBufferedCommand,
-  calculateCommandSlot,
   calculatePayloadLength,
   packCommands,
   type BufferedCommand,
@@ -38,66 +37,24 @@ describe('Packing', () => {
     });
   });
 
-  describe('calculateCommandSlot', () => {
-    it('calculates slot for key at index 1', () => {
-      const command = ['SET', 'mykey', 'value'];
-      const slot = calculateCommandSlot(command, 1);
-      assert.ok(slot >= 0 && slot <= BINHDR.SLOT_MAX_VALID);
-    });
-
-    it('returns SLOT_NO_SLOT for keyless command', () => {
-      const command = ['PING'];
-      const slot = calculateCommandSlot(command, null);
-      assert.equal(slot, BINHDR.SLOT_NO_SLOT);
-    });
-
-    it('returns SLOT_NO_SLOT when keyIndex exceeds command length', () => {
-      const command = ['SET'];
-      const slot = calculateCommandSlot(command, 5);
-      assert.equal(slot, BINHDR.SLOT_NO_SLOT);
-    });
-
-    it('calculates same slot for keys with same hash tag', () => {
-      const slot1 = calculateCommandSlot(['SET', '{user}:name', 'alice'], 1);
-      const slot2 = calculateCommandSlot(['GET', '{user}:age'], 1);
-      assert.equal(slot1, slot2);
-    });
-
-    it('handles buffer keys', () => {
-      const command = ['SET', Buffer.from('mykey'), 'value'];
-      const slot = calculateCommandSlot(command, 1);
-      assert.ok(slot >= 0 && slot <= BINHDR.SLOT_MAX_VALID);
-    });
-  });
-
   describe('createBufferedCommand', () => {
-    it('creates buffered command with calculated slot for eligible command', () => {
+    it('creates buffered command with provided slot for eligible command', () => {
       const command = ['SET', 'key', 'value'];
       const resp = ['*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n'];
-      const eligibility: EligibilityResult = { eligible: true, firstKeyIndex: 1 };
+      const eligibility: EligibilityResult = { eligible: true, slot: 5000 };
 
       const buffered = createBufferedCommand(command, resp, eligibility);
 
       assert.deepEqual(buffered.command, command);
       assert.deepEqual(buffered.resp, resp);
-      assert.ok(buffered.slot >= 0 && buffered.slot <= BINHDR.SLOT_MAX_VALID);
+      assert.equal(buffered.slot, 5000);
       assert.equal(buffered.payloadLength, calculatePayloadLength(resp));
     });
 
     it('creates buffered command with SLOT_NO_SLOT for keyless command', () => {
       const command = ['PING'];
       const resp = ['*1\r\n$4\r\nPING\r\n'];
-      const eligibility: EligibilityResult = { eligible: true, firstKeyIndex: null };
-
-      const buffered = createBufferedCommand(command, resp, eligibility);
-
-      assert.equal(buffered.slot, BINHDR.SLOT_NO_SLOT);
-    });
-
-    it('creates buffered command with SLOT_NO_SLOT for ineligible command', () => {
-      const command = ['BLPOP', 'key', '0'];
-      const resp = ['*3\r\n$5\r\nBLPOP\r\n$3\r\nkey\r\n$1\r\n0\r\n'];
-      const eligibility: EligibilityResult = { eligible: false };
+      const eligibility: EligibilityResult = { eligible: true, slot: BINHDR.SLOT_NO_SLOT };
 
       const buffered = createBufferedCommand(command, resp, eligibility);
 
