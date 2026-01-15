@@ -1,6 +1,13 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'mocha';
-import { createBinhdrInterceptor } from './interceptor';
+import {
+  createBinhdrInterceptor,
+  passthroughInbound,
+  passthroughOutbound,
+  chainInbound,
+} from './interceptor';
+import type { InboundInterceptor, OutboundInterceptor, OutboundCommand, CommandCodec } from '../client/commands-queue';
+import RedisCommandsQueue from '../client/commands-queue';
 import { encodeResponseHeader } from './encoder';
 import { BINHDR } from './constants';
 import type { BinaryResponseHeader } from './types';
@@ -286,6 +293,348 @@ describe('Binary Headers Interceptor', function () {
         interceptor1(chunk2, (chunk) => received1.push(chunk));
         assert.equal(received1.length, 1);
       });
+    });
+
+    describe('chainInbound', function () {
+      it('returns passthroughInbound for empty array', function () {
+        const chained = chainInbound([]);
+        const received: Buffer[] = [];
+        const data = Buffer.from('hello');
+
+        chained(data, (chunk) => received.push(chunk));
+
+        assert.equal(received.length, 1);
+        assert.deepEqual(received[0], data);
+      });
+
+      it('returns single interceptor for array of one', function () {
+        const interceptor = createBinhdrInterceptor();
+        const chained = chainInbound([interceptor]);
+
+        assert.strictEqual(chained, interceptor);
+      });
+
+      it('chains two interceptors in order', function () {
+        const log: string[] = [];
+
+        const first: InboundInterceptor = (chunk, next) => {
+          log.push(`first: ${chunk.toString()}`);
+          next(Buffer.from(chunk.toString() + '-A'));
+        };
+
+        const second: InboundInterceptor = (chunk, next) => {
+          log.push(`second: ${chunk.toString()}`);
+          next(Buffer.from(chunk.toString() + '-B'));
+        };
+
+        const chained = chainInbound([first, second]);
+        const received: Buffer[] = [];
+
+        chained(Buffer.from('X'), (chunk) => received.push(chunk));
+
+        assert.deepEqual(log, ['first: X', 'second: X-A']);
+        assert.equal(received.length, 1);
+        assert.equal(received[0].toString(), 'X-A-B');
+      });
+
+      it('chains three interceptors in order', function () {
+        const log: string[] = [];
+
+        const interceptors: InboundInterceptor[] = ['A', 'B', 'C'].map(
+          (name) => (chunk, next) => {
+            log.push(name);
+            next(chunk);
+          }
+        );
+
+        const chained = chainInbound(interceptors);
+        const received: Buffer[] = [];
+
+        chained(Buffer.from('data'), (chunk) => received.push(chunk));
+
+        assert.deepEqual(log, ['A', 'B', 'C']);
+        assert.equal(received.length, 1);
+      });
+
+      it('allows interceptor to call next multiple times', function () {
+        const splitter: InboundInterceptor = (chunk, next) => {
+          const mid = Math.floor(chunk.length / 2);
+          next(chunk.subarray(0, mid));
+          next(chunk.subarray(mid));
+        };
+
+        const chained = chainInbound([splitter]);
+        const received: Buffer[] = [];
+
+        chained(Buffer.from('ABCD'), (chunk) => received.push(chunk));
+
+        assert.equal(received.length, 2);
+        assert.equal(received[0].toString(), 'AB');
+        assert.equal(received[1].toString(), 'CD');
+      });
+
+      it('allows interceptor to not call next (filtering)', function () {
+        const filter: InboundInterceptor = (chunk, next) => {
+          if (chunk[0] !== 0x00) {
+            next(chunk);
+          }
+        };
+
+        const chained = chainInbound([filter]);
+        const received: Buffer[] = [];
+
+        chained(Buffer.from([0x00, 0x01]), (chunk) => received.push(chunk));
+        chained(Buffer.from([0x01, 0x02]), (chunk) => received.push(chunk));
+
+        assert.equal(received.length, 1);
+        assert.deepEqual(received[0], Buffer.from([0x01, 0x02]));
+      });
+
+      it('chains binhdr interceptor with custom interceptor', function () {
+        const payload = Buffer.from('+OK\r\n');
+        const frame = createFrame(payload);
+
+        const uppercaser: InboundInterceptor = (chunk, next) => {
+          next(Buffer.from(chunk.toString().toUpperCase()));
+        };
+
+        const chained = chainInbound([
+          createBinhdrInterceptor(),
+          uppercaser,
+        ]);
+
+        const received: Buffer[] = [];
+        chained(frame, (chunk) => received.push(chunk));
+
+        assert.equal(received.length, 1);
+        assert.equal(received[0].toString(), '+OK\r\n');
+      });
+    });
+
+    describe('passthroughInbound', function () {
+      it('passes through data unchanged', function () {
+        const interceptor = passthroughInbound();
+        const received: Buffer[] = [];
+        const data = Buffer.from('test data');
+
+        interceptor(data, (chunk) => received.push(chunk));
+
+        assert.equal(received.length, 1);
+        assert.deepEqual(received[0], data);
+      });
+    });
+
+    describe('passthroughOutbound', function () {
+      it('returns command unchanged', function () {
+        const interceptor = passthroughOutbound();
+        const command: OutboundCommand = {
+          args: ['SET', 'key', 'value'],
+          encoded: ['*3\r\n', '$3\r\n', 'SET\r\n'],
+        };
+
+        const result = interceptor.process(command);
+
+        assert.deepEqual(result, command);
+      });
+
+      it('drain returns null', function () {
+        const interceptor = passthroughOutbound();
+
+        const result = interceptor.drain();
+
+        assert.equal(result, null);
+      });
+    });
+
+    describe('Queue + Codec Integration', function () {
+      function createQueue(codec?: CommandCodec): RedisCommandsQueue {
+        return new RedisCommandsQueue(
+          2,
+          null,
+          () => {},
+          codec
+        );
+      }
+
+      function collectYielded(queue: RedisCommandsQueue): string[] {
+        const results: string[] = [];
+        for (const encoded of queue.commandsToWrite()) {
+          results.push(encoded.join(''));
+        }
+        return results;
+      }
+
+      describe('queue without codec', function () {
+        it('yields encoded command directly', function () {
+          const queue = createQueue();
+          queue.addCommand(['PING']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 1);
+          assert.ok(results[0].includes('PING'));
+        });
+
+        it('yields multiple commands in order', function () {
+          const queue = createQueue();
+          queue.addCommand(['SET', 'a', '1']);
+          queue.addCommand(['SET', 'b', '2']);
+          queue.addCommand(['GET', 'a']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 3);
+          assert.ok(results[0].includes('SET'));
+          assert.ok(results[0].includes('a'));
+          assert.ok(results[1].includes('SET'));
+          assert.ok(results[1].includes('b'));
+          assert.ok(results[2].includes('GET'));
+        });
+
+        it('yields nothing when queue is empty', function () {
+          const queue = createQueue();
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 0);
+        });
+      });
+
+      describe('queue with passthrough codec', function () {
+        it('yields encoded command unchanged', function () {
+          const codec: CommandCodec = {
+            outbound: passthroughOutbound(),
+            inbound: passthroughInbound(),
+          };
+          const queue = createQueue(codec);
+          queue.addCommand(['PING']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 1);
+          assert.ok(results[0].includes('PING'));
+        });
+      });
+
+      describe('queue with buffering codec', function () {
+        function createBufferingCodec(maxBuffer: number): { codec: CommandCodec; getBufferSize: () => number } {
+          const buffer: OutboundCommand[] = [];
+          return {
+            codec: {
+              outbound: {
+                process(command) {
+                  buffer.push(command);
+                  if (buffer.length >= maxBuffer) {
+                    const result: OutboundCommand = {
+                      args: [],
+                      encoded: ['[BATCH:', ...buffer.flatMap(c => c.encoded), ']'],
+                    };
+                    buffer.length = 0;
+                    return result;
+                  }
+                  return null;
+                },
+                drain() {
+                  if (buffer.length === 0) return null;
+                  const result: OutboundCommand = {
+                    args: [],
+                    encoded: ['[BATCH:', ...buffer.flatMap(c => c.encoded), ']'],
+                  };
+                  buffer.length = 0;
+                  return result;
+                }
+              },
+              inbound: passthroughInbound(),
+            },
+            getBufferSize: () => buffer.length,
+          };
+        }
+
+        it('buffers commands and drains at end', function () {
+          const { codec } = createBufferingCodec(10);
+          const queue = createQueue(codec);
+
+          queue.addCommand(['SET', 'a', '1']);
+          queue.addCommand(['SET', 'b', '2']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 1);
+          assert.ok(results[0].startsWith('[BATCH:'));
+          assert.ok(results[0].endsWith(']'));
+          assert.ok(results[0].includes('SET'));
+        });
+
+        it('flushes when buffer is full and drains remainder', function () {
+          const { codec } = createBufferingCodec(2);
+          const queue = createQueue(codec);
+
+          queue.addCommand(['CMD1']);
+          queue.addCommand(['CMD2']);
+          queue.addCommand(['CMD3']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 2);
+          assert.ok(results[0].includes('CMD1'));
+          assert.ok(results[0].includes('CMD2'));
+          assert.ok(results[1].includes('CMD3'));
+        });
+
+        it('drain returns null when buffer is empty', function () {
+          const { codec } = createBufferingCodec(10);
+          const queue = createQueue(codec);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 0);
+        });
+
+        it('handles single command buffer', function () {
+          const { codec } = createBufferingCodec(10);
+          const queue = createQueue(codec);
+
+          queue.addCommand(['SINGLE']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 1);
+          assert.ok(results[0].includes('SINGLE'));
+        });
+
+        it('handles exact buffer size boundary', function () {
+          const { codec } = createBufferingCodec(3);
+          const queue = createQueue(codec);
+
+          queue.addCommand(['A']);
+          queue.addCommand(['B']);
+          queue.addCommand(['C']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 1);
+          assert.ok(results[0].includes('A'));
+          assert.ok(results[0].includes('B'));
+          assert.ok(results[0].includes('C'));
+        });
+
+        it('multiple batches with remainder', function () {
+          const { codec } = createBufferingCodec(2);
+          const queue = createQueue(codec);
+
+          queue.addCommand(['A']);
+          queue.addCommand(['B']);
+          queue.addCommand(['C']);
+          queue.addCommand(['D']);
+          queue.addCommand(['E']);
+
+          const results = collectYielded(queue);
+
+          assert.equal(results.length, 3);
+        });
+      });
+
+
     });
   });
 });

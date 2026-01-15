@@ -1,8 +1,6 @@
 import { BINHDR } from './constants';
 
 /**
- * Binary request header structure.
- *
  * Wire format (10 bytes):
  * - Byte 0: DESIG (0x80)
  * - Bytes 1-4: LENGTH (32-bit big-endian)
@@ -19,8 +17,6 @@ export interface BinaryRequestHeader {
 }
 
 /**
- * Binary response header structure.
- *
  * Wire format (8 bytes):
  * - Byte 0: DESIG (0x80)
  * - Bytes 1-4: LENGTH (32-bit big-endian)
@@ -35,31 +31,18 @@ export interface BinaryResponseHeader {
   readonly clientIdx: number;
 }
 
-/**
- * Error codes for request header creation failures.
- */
 export type CreateRequestHeaderError =
   | 'invalid_length'
   | 'invalid_command_count'
   | 'invalid_slot'
   | 'invalid_client_idx';
 
-/**
- * Result of creating a request header.
- * Uses discriminated union to represent success or failure with specific error.
- */
 export type CreateRequestHeaderResult =
   | { readonly success: true; readonly header: BinaryRequestHeader }
   | { readonly success: false; readonly error: CreateRequestHeaderError };
 
-/**
- * Error codes for encoding a header into an existing buffer.
- */
 export type EncodeRequestHeaderIntoError = 'buffer_too_small';
 
-/**
- * Result of encoding a request header into an existing buffer.
- */
 export type EncodeRequestHeaderIntoResult =
   | { readonly success: true; readonly bytesWritten: typeof BINHDR.REQUEST_HEADER_SIZE }
   | { readonly success: false; readonly error: EncodeRequestHeaderIntoError };
