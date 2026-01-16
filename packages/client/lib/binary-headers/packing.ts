@@ -11,28 +11,21 @@ export interface BufferedCommand {
 }
 
 export interface PackingStrategy {
-  shouldFlush(
-    buffer: ReadonlyArray<BufferedCommand>,
+  canAdd(
+    count: number,
+    slot: number,
+    payloadLength: number,
     incoming: BufferedCommand
   ): boolean;
 }
 
 export function createDefaultPackingStrategy(): PackingStrategy {
   return {
-    shouldFlush(
-      buffer: ReadonlyArray<BufferedCommand>,
-      incoming: BufferedCommand
-    ): boolean {
-      if (buffer.length === 0) return false;
-      if (buffer.length >= BINHDR.MAX_COMMANDS_PER_PACK) return true;
-
-      const bufferSlot = resolveBufferSlot(buffer);
-      if (!areSlotsCompatible(bufferSlot, incoming.slot)) return true;
-
-      const totalPayload = sumPayloadLength(buffer) + incoming.payloadLength;
-      if (totalPayload > BINHDR.MAX_PAYLOAD_LENGTH) return true;
-
-      return false;
+    canAdd(count, slot, payloadLength, incoming) {
+      if (count >= BINHDR.MAX_COMMANDS_PER_PACK) return false;
+      if (!areSlotsCompatible(slot, incoming.slot)) return false;
+      if (payloadLength + incoming.payloadLength > BINHDR.MAX_PAYLOAD_LENGTH) return false;
+      return true;
     }
   };
 }
@@ -46,26 +39,9 @@ export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): numb
   return length;
 }
 
-function resolveBufferSlot(buffer: ReadonlyArray<BufferedCommand>): number {
-  for (let i = 0; i < buffer.length; i++) {
-    if (buffer[i].slot !== BINHDR.SLOT_NO_SLOT) {
-      return buffer[i].slot;
-    }
-  }
-  return BINHDR.SLOT_NO_SLOT;
-}
-
 function areSlotsCompatible(slotA: number, slotB: number): boolean {
   if (slotA === BINHDR.SLOT_NO_SLOT || slotB === BINHDR.SLOT_NO_SLOT) return true;
   return slotA === slotB;
-}
-
-function sumPayloadLength(buffer: ReadonlyArray<BufferedCommand>): number {
-  let total = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    total += buffer[i].payloadLength;
-  }
-  return total;
 }
 
 export function createBufferedCommand(
@@ -83,12 +59,12 @@ export function createBufferedCommand(
 
 export function packCommands(
   buffer: ReadonlyArray<BufferedCommand>,
+  slot: number,
+  totalPayload: number,
   clientIdx: number = 0
 ): ReadonlyArray<RedisArgument> | null {
   if (buffer.length === 0) return null;
 
-  const slot = resolveBufferSlot(buffer);
-  const totalPayload = sumPayloadLength(buffer);
   const headerResult = createRequestHeader(totalPayload, buffer.length, slot, clientIdx);
 
   if (!headerResult.success) return null;
@@ -117,27 +93,45 @@ export function packCommands(
 export class CommandPacker {
   readonly #strategy: PackingStrategy;
   readonly #buffer: BufferedCommand[] = [];
+  #slot: number = BINHDR.SLOT_NO_SLOT;
+  #payloadLength: number = 0;
 
   constructor(strategy: PackingStrategy = createDefaultPackingStrategy()) {
     this.#strategy = strategy;
   }
 
-  add(buffered: BufferedCommand): ReadonlyArray<RedisArgument> | null {
-    if (this.#strategy.shouldFlush(this.#buffer, buffered)) {
-      const packed = packCommands(this.#buffer);
-      this.#buffer.length = 0;
-      this.#buffer.push(buffered);
+  add(command: BufferedCommand): ReadonlyArray<RedisArgument> | null {
+    const count = this.#buffer.length;
+
+    if (count > 0 && !this.#strategy.canAdd(count, this.#slot, this.#payloadLength, command)) {
+      const packed = this.#flush();
+      this.#push(command);
       return packed;
     }
-    this.#buffer.push(buffered);
+
+    this.#push(command);
     return null;
+  }
+
+  #push(command: BufferedCommand): void {
+    this.#buffer.push(command);
+    this.#payloadLength += command.payloadLength;
+    if (command.slot !== BINHDR.SLOT_NO_SLOT) {
+      this.#slot = command.slot;
+    }
+  }
+
+  #flush(): ReadonlyArray<RedisArgument> | null {
+    const packed = packCommands(this.#buffer, this.#slot, this.#payloadLength);
+    this.#buffer.length = 0;
+    this.#slot = BINHDR.SLOT_NO_SLOT;
+    this.#payloadLength = 0;
+    return packed;
   }
 
   drain(): ReadonlyArray<RedisArgument> | null {
     if (this.#buffer.length === 0) return null;
-    const packed = packCommands(this.#buffer);
-    this.#buffer.length = 0;
-    return packed;
+    return this.#flush();
   }
 
   get bufferSize(): number {

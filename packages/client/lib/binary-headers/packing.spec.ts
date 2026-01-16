@@ -13,6 +13,20 @@ import { BINHDR } from './constants';
 import { parseRequestHeader } from './decoder';
 import type { EligibilityResult } from './eligibility-types';
 
+// Shared test helper for creating buffered commands
+function makeBuffered(
+  slot: number,
+  resp: string[] = ['*1\r\n$4\r\nPING\r\n'],
+  command: string[] = ['PING']
+): BufferedCommand {
+  return {
+    command,
+    resp,
+    slot,
+    payloadLength: calculatePayloadLength(resp),
+  };
+}
+
 describe('Packing', () => {
   describe('calculatePayloadLength', () => {
     it('calculates length for string parts', () => {
@@ -65,154 +79,101 @@ describe('Packing', () => {
   describe('createDefaultPackingStrategy', () => {
     const strategy = createDefaultPackingStrategy();
 
-    function makeBuffered(slot: number, payloadLength: number = 100): BufferedCommand {
-      return {
-        command: ['SET', 'key', 'value'],
-        resp: ['x'], // placeholder, we use payloadLength directly
-        slot,
-        payloadLength,
-      };
-    }
-
-    it('does not flush empty buffer', () => {
+    it('can add when slots are compatible (same slot)', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.shouldFlush([], incoming), false);
+      assert.equal(strategy.canAdd(1, 1000, 14, incoming), true);
     });
 
-    it('does not flush when slots are compatible (same slot)', () => {
-      const buffer = [makeBuffered(1000)];
-      const incoming = makeBuffered(1000);
-      assert.equal(strategy.shouldFlush(buffer, incoming), false);
-    });
-
-    it('does not flush when incoming is SLOT_NO_SLOT', () => {
-      const buffer = [makeBuffered(1000)];
+    it('can add when incoming is SLOT_NO_SLOT', () => {
       const incoming = makeBuffered(BINHDR.SLOT_NO_SLOT);
-      assert.equal(strategy.shouldFlush(buffer, incoming), false);
+      assert.equal(strategy.canAdd(1, 1000, 14, incoming), true);
     });
 
-    it('does not flush when buffer has SLOT_NO_SLOT and incoming has known slot', () => {
-      const buffer = [makeBuffered(BINHDR.SLOT_NO_SLOT)];
+    it('can add when current slot is SLOT_NO_SLOT and incoming has known slot', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.shouldFlush(buffer, incoming), false);
+      assert.equal(strategy.canAdd(1, BINHDR.SLOT_NO_SLOT, 14, incoming), true);
     });
 
-    it('flushes when slots are incompatible', () => {
-      const buffer = [makeBuffered(1000)];
+    it('cannot add when slots are incompatible', () => {
       const incoming = makeBuffered(2000);
-      assert.equal(strategy.shouldFlush(buffer, incoming), true);
+      assert.equal(strategy.canAdd(1, 1000, 14, incoming), false);
     });
 
-    it('flushes when buffer reaches max commands', () => {
-      const buffer: BufferedCommand[] = [];
-      for (let i = 0; i < BINHDR.MAX_COMMANDS_PER_PACK; i++) {
-        buffer.push(makeBuffered(1000));
-      }
+    it('cannot add when count reaches max commands', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.shouldFlush(buffer, incoming), true);
+      assert.equal(strategy.canAdd(BINHDR.MAX_COMMANDS_PER_PACK, 1000, 14, incoming), false);
     });
 
-    it('does not flush at max commands - 1', () => {
-      const buffer: BufferedCommand[] = [];
-      for (let i = 0; i < BINHDR.MAX_COMMANDS_PER_PACK - 1; i++) {
-        buffer.push(makeBuffered(1000));
-      }
+    it('can add at max commands - 1', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.shouldFlush(buffer, incoming), false);
+      assert.equal(strategy.canAdd(BINHDR.MAX_COMMANDS_PER_PACK - 1, 1000, 14, incoming), true);
     });
 
-    it('flushes when payload would exceed max length', () => {
-      // Use realistic payload sizes that won't cause string length issues
-      const largePayload = 1000000; // 1MB each
-      const buffer = [makeBuffered(1000, largePayload)];
-
-      // Create incoming with payload that would exceed max when combined
+    it('cannot add when payload would exceed max length', () => {
+      const largePayload = 1000000; // 1MB
       const incomingPayload = BINHDR.MAX_PAYLOAD_LENGTH - largePayload + 1;
-      const incoming = makeBuffered(1000, incomingPayload);
-      assert.equal(strategy.shouldFlush(buffer, incoming), true);
+      const incoming = { ...makeBuffered(1000), payloadLength: incomingPayload };
+      assert.equal(strategy.canAdd(1, 1000, largePayload, incoming), false);
     });
   });
 
   describe('packCommands', () => {
-    function makeBuffered(slot: number, resp: string[]): BufferedCommand {
-      return {
-        command: ['SET', 'key', 'value'],
-        resp,
-        slot,
-        payloadLength: calculatePayloadLength(resp),
-      };
-    }
-
     it('returns null for empty buffer', () => {
-      assert.equal(packCommands([]), null);
+      assert.equal(packCommands([], BINHDR.SLOT_NO_SLOT, 0), null);
     });
 
     it('packs single command', () => {
-      const resp = ['*1\r\n$4\r\nPING\r\n'];
-      const buffer = [makeBuffered(BINHDR.SLOT_NO_SLOT, resp)];
+      const pingResp = ['*1\r\n$4\r\nPING\r\n'];
+      const buffer = [makeBuffered(BINHDR.SLOT_NO_SLOT, pingResp)];
+      const totalPayload = calculatePayloadLength(pingResp);
 
-      const packed = packCommands(buffer, 123);
+      const packed = packCommands(buffer, BINHDR.SLOT_NO_SLOT, totalPayload, 123);
 
       assert.ok(packed !== null);
       assert.equal(packed.length, 2); // header + resp
       assert.ok(packed[0] instanceof Buffer);
 
-      // Verify header
       const header = parseRequestHeader(packed[0] as Buffer);
       assert.ok(header.success);
       if (header.success) {
         assert.equal(header.header.commandCount, 1);
         assert.equal(header.header.slot, BINHDR.SLOT_NO_SLOT);
         assert.equal(header.header.clientIdx, 123);
-        assert.equal(header.header.length, calculatePayloadLength(resp));
+        assert.equal(header.header.length, totalPayload);
       }
     });
 
     it('packs multiple commands', () => {
-      const resp1 = ['*1\r\n$4\r\nPING\r\n'];
-      const resp2 = ['*1\r\n$4\r\nTIME\r\n'];
+      const pingResp = ['*1\r\n$4\r\nPING\r\n'];
+      const timeResp = ['*1\r\n$4\r\nTIME\r\n'];
       const buffer = [
-        makeBuffered(BINHDR.SLOT_NO_SLOT, resp1),
-        makeBuffered(BINHDR.SLOT_NO_SLOT, resp2),
+        makeBuffered(BINHDR.SLOT_NO_SLOT, pingResp),
+        makeBuffered(BINHDR.SLOT_NO_SLOT, timeResp),
       ];
+      const totalPayload = calculatePayloadLength(pingResp) + calculatePayloadLength(timeResp);
 
-      const packed = packCommands(buffer, 0);
+      const packed = packCommands(buffer, BINHDR.SLOT_NO_SLOT, totalPayload, 0);
 
       assert.ok(packed !== null);
-      assert.equal(packed.length, 3); // header + resp1 + resp2
+      assert.equal(packed.length, 3); // header + 2 payloads
 
       const header = parseRequestHeader(packed[0] as Buffer);
       assert.ok(header.success);
       if (header.success) {
         assert.equal(header.header.commandCount, 2);
-        assert.equal(header.header.length, calculatePayloadLength(resp1) + calculatePayloadLength(resp2));
+        assert.equal(header.header.length, totalPayload);
       }
     });
 
-    it('uses known slot from buffer', () => {
+    it('uses provided slot', () => {
       const buffer = [
         makeBuffered(BINHDR.SLOT_NO_SLOT, ['*1\r\n$4\r\nPING\r\n']),
-        makeBuffered(5000, ['*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n']),
-        makeBuffered(BINHDR.SLOT_NO_SLOT, ['*1\r\n$4\r\nTIME\r\n']),
+        makeBuffered(5000, ['*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n'], ['GET', 'key']),
+        makeBuffered(BINHDR.SLOT_NO_SLOT, ['*1\r\n$4\r\nTIME\r\n'], ['TIME']),
       ];
+      const totalPayload = buffer.reduce((sum, b) => sum + b.payloadLength, 0);
 
-      const packed = packCommands(buffer, 0);
-
-      assert.ok(packed !== null);
-      const header = parseRequestHeader(packed[0] as Buffer);
-      assert.ok(header.success);
-      if (header.success) {
-        assert.equal(header.header.slot, 5000);
-      }
-    });
-
-    it('uses first known slot when multiple commands have slots', () => {
-      const buffer = [
-        makeBuffered(5000, ['*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n']),
-        makeBuffered(5000, ['*2\r\n$3\r\nGET\r\n$4\r\nkey2\r\n']),
-      ];
-
-      const packed = packCommands(buffer, 0);
+      const packed = packCommands(buffer, 5000, totalPayload, 0);
 
       assert.ok(packed !== null);
       const header = parseRequestHeader(packed[0] as Buffer);
@@ -224,16 +185,6 @@ describe('Packing', () => {
   });
 
   describe('CommandPacker', () => {
-    function makeBuffered(slot: number): BufferedCommand {
-      const resp = ['*1\r\n$4\r\nPING\r\n'];
-      return {
-        command: ['PING'],
-        resp,
-        slot,
-        payloadLength: calculatePayloadLength(resp),
-      };
-    }
-
     it('buffers first command and returns null', () => {
       const packer = new CommandPacker();
       const result = packer.add(makeBuffered(1000));
@@ -295,10 +246,10 @@ describe('Packing', () => {
     });
 
     it('uses custom strategy', () => {
-      // Strategy that flushes after every 2 commands (flush before adding 3rd)
+      // Strategy that allows max 2 commands (cannot add when count >= 2)
       const customStrategy: PackingStrategy = {
-        shouldFlush(buffer) {
-          return buffer.length >= 2;
+        canAdd(count) {
+          return count < 2;
         },
       };
 
