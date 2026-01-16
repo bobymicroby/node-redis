@@ -6,34 +6,14 @@ import {
   passthroughOutbound,
   chainInbound,
 } from './interceptor';
-import type { InboundInterceptor, OutboundInterceptor, OutboundCommand, CommandCodec } from '../client/commands-queue';
+import type { InboundInterceptor, OutboundCommand, CommandCodec } from '../client/commands-queue';
 import RedisCommandsQueue from '../client/commands-queue';
 import { encodeResponseHeader } from './encoder';
 import { BINHDR } from './constants';
+import { createResponseHeader, createBinhdrFrame, parseRespCommands } from './test-utils';
 import type { BinaryResponseHeader } from './types';
 
 describe('Binary Headers Interceptor', function () {
-  function createResponseBuffer(
-    payloadLength: number,
-    commandCount: number,
-    clientIdx: number = 0,
-    protocolError: boolean = false
-  ): Buffer {
-    const header: BinaryResponseHeader = {
-      designator: BINHDR.DESIGNATOR,
-      length: payloadLength,
-      commandCount,
-      clientIdx,
-      protocolError,
-    };
-    return encodeResponseHeader(header);
-  }
-
-  function createFrame(payload: Buffer, commandCount: number = 1, clientIdx: number = 0): Buffer {
-    const header = createResponseBuffer(payload.length, commandCount, clientIdx);
-    return Buffer.concat([header, payload]);
-  }
-
   describe('createBinhdrInterceptor', function () {
     describe('passthrough behavior', function () {
       it('passes through non-binary-header data unchanged', function () {
@@ -64,7 +44,7 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor();
         const received: Buffer[] = [];
         const payload = Buffer.from('+OK\r\n');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
 
         interceptor(frame, (chunk) => received.push(chunk));
 
@@ -75,7 +55,7 @@ describe('Binary Headers Interceptor', function () {
       it('handles empty payload', function () {
         const interceptor = createBinhdrInterceptor();
         const received: Buffer[] = [];
-        const header = createResponseBuffer(0, 1);
+        const header = encodeResponseHeader(createResponseHeader(0, 1, 0));
 
         interceptor(header, (chunk) => received.push(chunk));
 
@@ -86,7 +66,7 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor();
         const received: Buffer[] = [];
         const payload = Buffer.alloc(10000, 'x');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
 
         interceptor(frame, (chunk) => received.push(chunk));
 
@@ -100,7 +80,7 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor();
         const received: Buffer[] = [];
         const payload = Buffer.from('+OK\r\n');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
 
         const chunk1 = frame.subarray(0, 4);
         const chunk2 = frame.subarray(4);
@@ -117,7 +97,7 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor();
         const received: Buffer[] = [];
         const payload = Buffer.from('Hello, World!');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
 
         const chunk1 = frame.subarray(0, 10);
         const chunk2 = frame.subarray(10);
@@ -133,7 +113,7 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor();
         const received: Buffer[] = [];
         const payload = Buffer.from('+OK\r\n');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
 
         const chunk1 = frame.subarray(0, 8);
         const chunk2 = frame.subarray(8);
@@ -150,7 +130,7 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor();
         const received: Buffer[] = [];
         const payload = Buffer.from('+OK\r\n');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
 
         for (let i = 0; i < frame.length; i++) {
           interceptor(frame.subarray(i, i + 1), (chunk) => received.push(chunk));
@@ -167,8 +147,8 @@ describe('Binary Headers Interceptor', function () {
         const received: Buffer[] = [];
         const payload1 = Buffer.from('+OK\r\n');
         const payload2 = Buffer.from(':123\r\n');
-        const frame1 = createFrame(payload1);
-        const frame2 = createFrame(payload2);
+        const frame1 = createBinhdrFrame(payload1);
+        const frame2 = createBinhdrFrame(payload2);
         const combined = Buffer.concat([frame1, frame2]);
 
         interceptor(combined, (chunk) => received.push(chunk));
@@ -183,8 +163,8 @@ describe('Binary Headers Interceptor', function () {
         const received: Buffer[] = [];
         const payload1 = Buffer.from('+OK\r\n');
         const payload2 = Buffer.from(':456\r\n');
-        const frame1 = createFrame(payload1);
-        const frame2 = createFrame(payload2);
+        const frame1 = createBinhdrFrame(payload1);
+        const frame2 = createBinhdrFrame(payload2);
         const combined = Buffer.concat([frame1, frame2]);
 
         const splitPoint = frame1.length + 3;
@@ -207,7 +187,7 @@ describe('Binary Headers Interceptor', function () {
           onHeader: (h) => headers.push(h),
         });
         const payload = Buffer.from('+OK\r\n');
-        const frame = createFrame(payload, 3, 42);
+        const frame = createBinhdrFrame(payload, 3, 42);
 
         interceptor(frame, () => {});
 
@@ -223,17 +203,8 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor({
           onProtocolError: (h) => errors.push(h),
         });
-
-        const header: BinaryResponseHeader = {
-          designator: BINHDR.DESIGNATOR,
-          length: 5,
-          commandCount: 1,
-          clientIdx: 99,
-          protocolError: true,
-        };
-        const headerBuf = encodeResponseHeader(header);
         const payload = Buffer.from('+OK\r\n');
-        const frame = Buffer.concat([headerBuf, payload]);
+        const frame = createBinhdrFrame(payload, 1, 99, true);
 
         interceptor(frame, () => {});
 
@@ -247,7 +218,7 @@ describe('Binary Headers Interceptor', function () {
         const interceptor = createBinhdrInterceptor({
           onProtocolError: () => { errorCalled = true; },
         });
-        const frame = createFrame(Buffer.from('+OK\r\n'));
+        const frame = createBinhdrFrame(Buffer.from('+OK\r\n'));
 
         interceptor(frame, () => {});
 
@@ -261,7 +232,7 @@ describe('Binary Headers Interceptor', function () {
         const received: Buffer[] = [];
         const binhdrPayload = Buffer.from('+OK\r\n');
         const respData = Buffer.from(':999\r\n');
-        const frame = createFrame(binhdrPayload);
+        const frame = createBinhdrFrame(binhdrPayload);
         const combined = Buffer.concat([frame, respData]);
 
         interceptor(combined, (chunk) => received.push(chunk));
@@ -280,7 +251,7 @@ describe('Binary Headers Interceptor', function () {
         const received2: Buffer[] = [];
 
         const payload = Buffer.from('+OK\r\n');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
         const chunk1 = frame.subarray(0, 4);
         const chunk2 = frame.subarray(4);
 
@@ -392,7 +363,7 @@ describe('Binary Headers Interceptor', function () {
 
       it('chains binhdr interceptor with custom interceptor', function () {
         const payload = Buffer.from('+OK\r\n');
-        const frame = createFrame(payload);
+        const frame = createBinhdrFrame(payload);
 
         const uppercaser: InboundInterceptor = (chunk, next) => {
           next(Buffer.from(chunk.toString().toUpperCase()));
@@ -456,10 +427,13 @@ describe('Binary Headers Interceptor', function () {
         );
       }
 
-      function collectYielded(queue: RedisCommandsQueue): string[] {
-        const results: string[] = [];
+      // Collects yielded commands and parses them back using the RESP decoder
+      function collectYielded(queue: RedisCommandsQueue): unknown[][] {
+        const results: unknown[][] = [];
         for (const encoded of queue.commandsToWrite()) {
-          results.push(encoded.join(''));
+          const data = encoded.join('');
+          const parsed = parseRespCommands(data);
+          results.push(parsed as unknown[][]);
         }
         return results;
       }
@@ -472,7 +446,7 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 1);
-          assert.ok(results[0].includes('PING'));
+          assert.deepEqual(results[0], [['PING']]);
         });
 
         it('yields multiple commands in order', function () {
@@ -484,11 +458,9 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 3);
-          assert.ok(results[0].includes('SET'));
-          assert.ok(results[0].includes('a'));
-          assert.ok(results[1].includes('SET'));
-          assert.ok(results[1].includes('b'));
-          assert.ok(results[2].includes('GET'));
+          assert.deepEqual(results[0], [['SET', 'a', '1']]);
+          assert.deepEqual(results[1], [['SET', 'b', '2']]);
+          assert.deepEqual(results[2], [['GET', 'a']]);
         });
 
         it('yields nothing when queue is empty', function () {
@@ -512,11 +484,12 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 1);
-          assert.ok(results[0].includes('PING'));
+          assert.deepEqual(results[0], [['PING']]);
         });
       });
 
       describe('queue with buffering codec', function () {
+        // Simulates command packing by concatenating RESP-encoded commands
         function createBufferingCodec(maxBuffer: number): { codec: CommandCodec; getBufferSize: () => number } {
           const buffer: OutboundCommand[] = [];
           return {
@@ -526,8 +499,8 @@ describe('Binary Headers Interceptor', function () {
                   buffer.push(command);
                   if (buffer.length >= maxBuffer) {
                     const result: OutboundCommand = {
-                      args: [],
-                      encoded: ['[BATCH:', ...buffer.flatMap(c => c.encoded), ']'],
+                      args: buffer.flatMap(c => c.args),
+                      encoded: buffer.flatMap(c => c.encoded),
                     };
                     buffer.length = 0;
                     return result;
@@ -537,8 +510,8 @@ describe('Binary Headers Interceptor', function () {
                 drain() {
                   if (buffer.length === 0) return null;
                   const result: OutboundCommand = {
-                    args: [],
-                    encoded: ['[BATCH:', ...buffer.flatMap(c => c.encoded), ']'],
+                    args: buffer.flatMap(c => c.args),
+                    encoded: buffer.flatMap(c => c.encoded),
                   };
                   buffer.length = 0;
                   return result;
@@ -560,9 +533,7 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 1);
-          assert.ok(results[0].startsWith('[BATCH:'));
-          assert.ok(results[0].endsWith(']'));
-          assert.ok(results[0].includes('SET'));
+          assert.deepEqual(results[0], [['SET', 'a', '1'], ['SET', 'b', '2']]);
         });
 
         it('flushes when buffer is full and drains remainder', function () {
@@ -576,9 +547,8 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 2);
-          assert.ok(results[0].includes('CMD1'));
-          assert.ok(results[0].includes('CMD2'));
-          assert.ok(results[1].includes('CMD3'));
+          assert.deepEqual(results[0], [['CMD1'], ['CMD2']]);
+          assert.deepEqual(results[1], [['CMD3']]);
         });
 
         it('drain returns null when buffer is empty', function () {
@@ -599,7 +569,7 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 1);
-          assert.ok(results[0].includes('SINGLE'));
+          assert.deepEqual(results[0], [['SINGLE']]);
         });
 
         it('handles exact buffer size boundary', function () {
@@ -613,9 +583,7 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 1);
-          assert.ok(results[0].includes('A'));
-          assert.ok(results[0].includes('B'));
-          assert.ok(results[0].includes('C'));
+          assert.deepEqual(results[0], [['A'], ['B'], ['C']]);
         });
 
         it('multiple batches with remainder', function () {
@@ -631,10 +599,11 @@ describe('Binary Headers Interceptor', function () {
           const results = collectYielded(queue);
 
           assert.equal(results.length, 3);
+          assert.deepEqual(results[0], [['A'], ['B']]);
+          assert.deepEqual(results[1], [['C'], ['D']]);
+          assert.deepEqual(results[2], [['E']]);
         });
       });
-
-
     });
   });
 });

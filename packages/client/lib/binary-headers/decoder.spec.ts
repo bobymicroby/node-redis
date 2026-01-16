@@ -8,6 +8,8 @@ import {
   parseResponseHeader,
   startsWithBinaryHeader,
 } from './decoder';
+import { encodeResponseHeader } from './encoder';
+import { createResponseHeader } from './test-utils';
 
 describe('Binary Headers Decoder', () => {
   describe('isBinaryHeaderDesignator', () => {
@@ -69,23 +71,14 @@ describe('Binary Headers Decoder', () => {
   });
 
   describe('parseResponseHeader', () => {
-    /**
-     * Helper to create a valid response header buffer.
-     */
+    // Uses shared helpers from test-utils.ts
     function createResponseBuffer(
       length: number,
       commandCount: number,
       clientIdx: number,
       protocolError: boolean = false
     ): Buffer {
-      const buffer = Buffer.allocUnsafe(BINHDR.RESPONSE_HEADER_SIZE);
-      buffer[0] = BINHDR.DESIGNATOR;
-      buffer.writeUInt32BE(length, 1);
-      buffer[5] = protocolError
-        ? commandCount | BINHDR.PROTOCOL_ERROR_BIT
-        : commandCount;
-      buffer.writeUInt16BE(clientIdx, 6);
-      return buffer;
+      return encodeResponseHeader(createResponseHeader(length, commandCount, clientIdx, protocolError));
     }
 
     describe('valid inputs', () => {
