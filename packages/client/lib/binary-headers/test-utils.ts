@@ -9,15 +9,16 @@ import { Decoder } from '../RESP/decoder';
 export function createResponseHeader(
   length: number,
   commandCount: number,
-  clientIdx: number,
+  requestId: number,
   protocolError: boolean = false
 ): BinaryResponseHeader {
   return {
     designator: BINHDR.DESIGNATOR,
+    version: BINHDR.VERSION,
     length,
     commandCount,
     protocolError,
-    clientIdx,
+    requestId,
   };
 }
 
@@ -37,10 +38,10 @@ export function createBinhdrResponse(respPayload: string): Buffer {
 export function createBinhdrFrame(
   payload: Buffer,
   commandCount: number = 1,
-  clientIdx: number = 0,
+  requestId: number = 0,
   protocolError: boolean = false
 ): Buffer {
-  const header = createResponseHeader(payload.length, commandCount, clientIdx, protocolError);
+  const header = createResponseHeader(payload.length, commandCount, requestId, protocolError);
   return Buffer.concat([encodeResponseHeader(header), payload]);
 }
 

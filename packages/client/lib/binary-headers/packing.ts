@@ -66,11 +66,11 @@ export function packCommands(
   buffer: ReadonlyArray<BufferedCommand>,
   slot: number,
   totalPayload: number,
-  clientIdx: number = 0
+  requestId: number = 0
 ): ReadonlyArray<RedisArgument> | null {
   if (buffer.length === 0) return null;
 
-  const headerResult = createRequestHeader(totalPayload, buffer.length, slot, clientIdx);
+  const headerResult = createRequestHeader(totalPayload, buffer.length, slot, requestId);
 
   if (!headerResult.success) return null;
 

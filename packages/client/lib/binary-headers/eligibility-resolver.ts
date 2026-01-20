@@ -24,7 +24,7 @@ function keyPositionToIndex(keyPosition: KeyPosition | undefined): number | null
 }
 
 function calculateCommandSlot(args: ReadonlyArray<RedisArgument>, firstKeyIndex: number | null): number {
-  if (firstKeyIndex === null || firstKeyIndex >= args.length) return SLOT_NO_SLOT;
+  if (firstKeyIndex === null || firstKeyIndex >= args.length) return 0;
   const key = args[firstKeyIndex];
   const keyStr = typeof key === 'string' ? key : key.toString();
   return calculateSlot(keyStr);
