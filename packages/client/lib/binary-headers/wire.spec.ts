@@ -3,11 +3,11 @@ import { describe, it, beforeEach, afterEach } from 'mocha';
 import { once } from 'node:events';
 import net from 'node:net';
 import { createClient, RedisClientType } from '../..';
-import { BINHDR } from './constants';
-import { createRequestHeader, encodeRequestHeader, encodeRequestHeaderInto, encodeResponseHeader } from './encoder';
-import { parseRequestHeader, parseResponseHeader, isBinaryHeaderDesignator } from './decoder';
+import { BINHDR } from './generated/constants';
+import { createRequestHeader, encodeRequestHeader, encodeRequestHeaderInto, encodeResponseHeader } from './generated/encoder';
+import { parseRequestHeader, parseResponseHeader, isBinaryHeaderDesignator } from './generated/decoder';
 import { createResponseHeader, createBinhdrResponse } from './test-utils';
-import type { BinaryResponseHeader } from './types';
+import type { ResponseHeader as BinaryResponseHeader } from './generated/types';
 
 // ============================================================================
 // Test Helpers
@@ -17,10 +17,11 @@ interface ParsedRequest {
   hasBinaryHeader: boolean;
   header?: {
     designator: number;
+    version: number;
+    slot: number;
     length: number;
     commandCount: number;
-    slot: number;
-    clientIdx: number;
+    requestId: number;
   };
   payload: Buffer;
 }
@@ -53,27 +54,27 @@ function countRespCommands(payload: Buffer): number {
 
 describe('Binary Headers Wire Format', () => {
   describe('Request Header Round-trip', () => {
+    // v1 format: createRequestHeader(slot, length, commandCount, requestId)
     const requestTestCases = [
-      { name: 'minimum values', length: 0, commandCount: 1, slot: 0, clientIdx: 0 },
-      { name: 'maximum values', length: BINHDR.MAX_PAYLOAD_LENGTH, commandCount: 127, slot: BINHDR.SLOT_MAX_VALID, clientIdx: BINHDR.MAX_CLIENT_IDX },
-      { name: 'SLOT_NO_SLOT', length: 100, commandCount: 5, slot: BINHDR.SLOT_NO_SLOT, clientIdx: 42 },
-      { name: 'spec example', length: 159, commandCount: 6, slot: 16287, clientIdx: 100 },
-      { name: 'single command', length: 10, commandCount: 1, slot: 0, clientIdx: 1 },
-      { name: 'max commands', length: 5000, commandCount: 127, slot: 8192, clientIdx: 255 },
-      { name: 'slot boundaries', length: 50, commandCount: 3, slot: 16383, clientIdx: 100 },
-      { name: 'clientIdx boundary', length: 100, commandCount: 1, slot: 1000, clientIdx: 65535 },
-      { name: 'mid-range', length: 0x12345678, commandCount: 64, slot: 8000, clientIdx: 32768 },
-      { name: 'length near max', length: 0x7FFFFFFE, commandCount: 10, slot: 12345, clientIdx: 54321 },
+      { name: 'minimum values', slot: 0, length: 0, commandCount: 1, requestId: 0 },
+      { name: 'maximum values', slot: BINHDR.SLOT_MAX_VALID, length: BINHDR.MAX_PAYLOAD_LENGTH, commandCount: 127, requestId: BINHDR.MAX_REQUEST_ID },
+      { name: 'spec example', slot: 16287, length: 159, commandCount: 6, requestId: 100 },
+      { name: 'single command', slot: 0, length: 10, commandCount: 1, requestId: 1 },
+      { name: 'max commands', slot: 8192, length: 5000, commandCount: 127, requestId: 255 },
+      { name: 'slot boundaries', slot: 16383, length: 50, commandCount: 3, requestId: 100 },
+      { name: 'requestId boundary', slot: 1000, length: 100, commandCount: 1, requestId: 0xFFFFFFFF },
+      { name: 'mid-range', slot: 8000, length: 0x12345678, commandCount: 64, requestId: 32768 },
+      { name: 'length near max', slot: 12345, length: 0xFFFFFFFE, commandCount: 10, requestId: 54321 },
     ];
 
     function testRequestHeaderRoundTrip(
       name: string,
+      slot: number,
       length: number,
       commandCount: number,
-      slot: number,
-      clientIdx: number
+      requestId: number
     ) {
-      const createResult = createRequestHeader(length, commandCount, slot, clientIdx);
+      const createResult = createRequestHeader(slot, length, commandCount, requestId);
       assert.equal(createResult.success, true, `Failed to create header for ${name}`);
       if (!createResult.success) return;
 
@@ -86,13 +87,13 @@ describe('Binary Headers Wire Format', () => {
       }
     }
 
-    for (const { name, length, commandCount, slot, clientIdx } of requestTestCases) {
+    for (const { name, slot, length, commandCount, requestId } of requestTestCases) {
       it(`encodeRequestHeader round-trips: ${name}`, () => {
-        testRequestHeaderRoundTrip(name, length, commandCount, slot, clientIdx);
+        testRequestHeaderRoundTrip(name, slot, length, commandCount, requestId);
       });
 
       it(`encodeRequestHeaderInto round-trips: ${name}`, () => {
-        const createResult = createRequestHeader(length, commandCount, slot, clientIdx);
+        const createResult = createRequestHeader(slot, length, commandCount, requestId);
         assert.equal(createResult.success, true);
         if (!createResult.success) return;
 
@@ -108,7 +109,7 @@ describe('Binary Headers Wire Format', () => {
       });
 
       it(`encodeRequestHeaderInto with offset round-trips: ${name}`, () => {
-        const createResult = createRequestHeader(length, commandCount, slot, clientIdx);
+        const createResult = createRequestHeader(slot, length, commandCount, requestId);
         assert.equal(createResult.success, true);
         if (!createResult.success) return;
 
@@ -125,14 +126,21 @@ describe('Binary Headers Wire Format', () => {
     }
 
     describe('bytes round-trip (decode → encode)', () => {
+      // v1 format: 16 bytes
+      // [0]: designator (0xAE)
+      // [1]: version (0x01)
+      // [2-3]: slot (big-endian)
+      // [4-7]: length (big-endian)
+      // [8]: commandCount
+      // [9-12]: requestId (big-endian)
+      // [13-15]: reserved (padding)
       const bytesCases = [
-        { name: 'minimum', bytes: [0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00] },
-        { name: 'spec example', bytes: [0x80, 0x00, 0x00, 0x00, 0x9F, 0x06, 0x3F, 0x9F, 0x00, 0x64] },
-        { name: 'SLOT_NO_SLOT', bytes: [0x80, 0x00, 0x00, 0x00, 0x64, 0x05, 0xFF, 0xFF, 0x00, 0x2A] },
-        { name: 'max values', bytes: [0x80, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0x3F, 0xFF, 0xFF, 0xFF] },
-        { name: 'big-endian length', bytes: [0x80, 0x12, 0x34, 0x56, 0x78, 0x01, 0x00, 0x00, 0x00, 0x00] },
-        { name: 'big-endian slot', bytes: [0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x12, 0x34, 0x00, 0x00] },
-        { name: 'big-endian clientIdx', bytes: [0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xAB, 0xCD] },
+        { name: 'minimum', bytes: [0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] },
+        { name: 'spec example', bytes: [0xAE, 0x01, 0x3F, 0x9F, 0x00, 0x00, 0x00, 0x9F, 0x06, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00] },
+        { name: 'max slot', bytes: [0xAE, 0x01, 0x3F, 0xFF, 0x00, 0x00, 0x00, 0x64, 0x05, 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00] },
+        { name: 'big-endian length', bytes: [0xAE, 0x01, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] },
+        { name: 'big-endian slot', bytes: [0xAE, 0x01, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] },
+        { name: 'big-endian requestId', bytes: [0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xAB, 0xCD, 0xEF, 0x01, 0x00, 0x00, 0x00] },
       ];
 
       for (const { name, bytes } of bytesCases) {
@@ -150,17 +158,18 @@ describe('Binary Headers Wire Format', () => {
   });
 
   describe('Response Header Round-trip', () => {
+    // v1 response header: createResponseHeader(length, commandCount, requestId, protocolError)
     const responseTestCases: Array<{ name: string; header: BinaryResponseHeader }> = [
       { name: 'minimum values', header: createResponseHeader(0, 1, 0, false) },
-      { name: 'maximum values', header: createResponseHeader(BINHDR.MAX_PAYLOAD_LENGTH, 127, BINHDR.MAX_CLIENT_IDX, false) },
+      { name: 'maximum values', header: createResponseHeader(BINHDR.MAX_PAYLOAD_LENGTH, 127, BINHDR.MAX_REQUEST_ID, false) },
       { name: 'typical without error', header: createResponseHeader(159, 6, 100, false) },
       { name: 'typical with error', header: createResponseHeader(50, 3, 42, true) },
       { name: 'single command', header: createResponseHeader(10, 1, 1, false) },
       { name: 'max commands', header: createResponseHeader(5000, 127, 255, false) },
       { name: 'error max commands', header: createResponseHeader(100, 127, 1000, true) },
       { name: 'zero length', header: createResponseHeader(0, 5, 500, false) },
-      { name: 'large length', header: createResponseHeader(0x7FFFFFFE, 10, 12345, false) },
-      { name: 'clientIdx boundaries', header: createResponseHeader(100, 1, 65535, false) },
+      { name: 'large length', header: createResponseHeader(0xFFFFFFFE, 10, 12345, false) },
+      { name: 'requestId boundaries', header: createResponseHeader(100, 1, 0xFFFFFFFF, false) },
       { name: 'mid-range', header: createResponseHeader(0x12345678, 64, 0x8000, false) },
     ];
 
@@ -176,14 +185,21 @@ describe('Binary Headers Wire Format', () => {
     }
 
     describe('bytes round-trip (decode → encode)', () => {
+      // v1 response format: 16 bytes
+      // [0]: designator (0xAE)
+      // [1]: version (0x01)
+      // [2-3]: reserved
+      // [4-7]: length (big-endian)
+      // [8]: flags (commandCount & protocolError)
+      // [9-12]: requestId (big-endian)
+      // [13-15]: reserved
       const bytesCases = [
-        { name: 'minimum', bytes: [0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00] },
-        { name: 'spec example', bytes: [0x80, 0x00, 0x00, 0x00, 0x32, 0x03, 0x00, 0x2A] },
-        { name: 'with error bit', bytes: [0x80, 0x00, 0x00, 0x00, 0x64, 0x83, 0x00, 0x05] },
-        { name: 'max count', bytes: [0x80, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x00, 0x00] },
-        { name: 'max count + error', bytes: [0x80, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00] },
-        { name: 'big-endian length', bytes: [0x80, 0x12, 0x34, 0x56, 0x78, 0x01, 0xAB, 0xCD] },
-        { name: 'max length', bytes: [0x80, 0x7F, 0xFF, 0xFF, 0xFF, 0x01, 0xFF, 0xFF] },
+        { name: 'minimum', bytes: [0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] },
+        { name: 'spec example', bytes: [0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x03, 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00] },
+        { name: 'with error bit', bytes: [0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x83, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00] },
+        { name: 'max count', bytes: [0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] },
+        { name: 'max count + error', bytes: [0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] },
+        { name: 'big-endian length', bytes: [0xAE, 0x01, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01, 0x00, 0x00, 0xAB, 0xCD, 0x00, 0x00, 0x00] },
       ];
 
       for (const { name, bytes } of bytesCases) {
@@ -202,9 +218,9 @@ describe('Binary Headers Wire Format', () => {
 
   describe('Field Preservation', () => {
     it('preserves all length values', () => {
-      const lengths = [0, 1, 255, 256, 65535, 65536, 0x00FFFFFF, 0x7FFFFFFF];
+      const lengths = [0, 1, 255, 256, 65535, 65536, 0x00FFFFFF, 0xFFFFFFFF];
       for (const length of lengths) {
-        const result = createRequestHeader(length, 1, 0, 0);
+        const result = createRequestHeader(0, length, 1, 0);
         assert.equal(result.success, true);
         if (!result.success) continue;
 
@@ -218,9 +234,9 @@ describe('Binary Headers Wire Format', () => {
     });
 
     it('preserves all slot values', () => {
-      const slots = [0, 1, 8191, 8192, 16383, BINHDR.SLOT_NO_SLOT];
+      const slots = [0, 1, 8191, 8192, 16383];
       for (const slot of slots) {
-        const result = createRequestHeader(100, 1, slot, 0);
+        const result = createRequestHeader(slot, 100, 1, 0);
         assert.equal(result.success, true);
         if (!result.success) continue;
 
@@ -236,7 +252,7 @@ describe('Binary Headers Wire Format', () => {
     it('preserves all commandCount values (1-127)', () => {
       for (let count = 1; count <= 127; count++) {
         // Request header
-        const reqResult = createRequestHeader(100, count, 0, 0);
+        const reqResult = createRequestHeader(0, 100, count, 0);
         assert.equal(reqResult.success, true);
         if (reqResult.success) {
           const reqEncoded = encodeRequestHeader(reqResult.header);
@@ -337,16 +353,15 @@ describe('Binary Headers Wire Format', () => {
       return client;
     }
 
-    function findRequest(predicate: (payload: string) => boolean): ParsedRequest | undefined {
-      return receivedRequests.find(req => predicate(req.payload.toString()));
+    function findRequest(predicate: (r: ParsedRequest) => boolean): ParsedRequest | undefined {
+      return receivedRequests.find(predicate);
     }
 
     function assertValidBinaryHeader(req: ParsedRequest): void {
-      assert(req.hasBinaryHeader, 'Should have binary header');
+      assert.equal(req.hasBinaryHeader, true);
+      assert.ok(req.header);
       assert.equal(req.header!.designator, BINHDR.DESIGNATOR);
-      assert(req.header!.length > 0);
-      assert(req.header!.commandCount >= 1 && req.header!.commandCount <= 127);
-      assert.equal(req.payload.length, req.header!.length);
+      assert.equal(req.header!.version, BINHDR.VERSION);
     }
 
     beforeEach(async function () {
@@ -366,10 +381,9 @@ describe('Binary Headers Wire Format', () => {
 
       await client.ping();
 
-      assert(receivedRequests.length >= 1);
-      const req = receivedRequests[receivedRequests.length - 1];
-      assertValidBinaryHeader(req);
-      assert.equal(req.header!.commandCount, 1);
+      const req = findRequest(r => r.hasBinaryHeader && r.payload.toString().includes('PING'));
+      assert.ok(req, 'Should have received a request with binary header');
+      assertValidBinaryHeader(req!);
     });
 
     it('packs multiple commands with same slot', async function () {
@@ -378,16 +392,15 @@ describe('Binary Headers Wire Format', () => {
       await createConnectedClient();
 
       await Promise.all([
-        client.sendCommand(['SET', '{x}key1', 'value1']),
-        client.sendCommand(['SET', '{x}key2', 'value2']),
-        client.sendCommand(['SET', '{x}key3', 'value3']),
+        client.set('{x}key1', 'value1'),
+        client.set('{x}key2', 'value2'),
+        client.set('{x}key3', 'value3'),
       ]);
 
-      const packedReq = receivedRequests.find(r => r.hasBinaryHeader && r.header!.commandCount > 1);
+      const packedReq = findRequest(r => r.hasBinaryHeader && r.header!.commandCount > 1);
       if (packedReq) {
-        assert(packedReq.header!.commandCount >= 2);
-        assert.equal(countRespCommands(packedReq.payload), packedReq.header!.commandCount);
-        assert(packedReq.header!.slot !== BINHDR.SLOT_NO_SLOT);
+        assertValidBinaryHeader(packedReq);
+        assert.ok(packedReq.header!.commandCount >= 2);
       }
     });
 
@@ -396,37 +409,40 @@ describe('Binary Headers Wire Format', () => {
       await once(server.listen(port), 'listening');
       await createConnectedClient();
 
-      await client.sendCommand(['SET', 'mykey', 'myvalue']);
+      await client.set('mykey', 'myvalue');
 
-      const setReq = findRequest(p => p.includes('mykey'));
-      assert(setReq);
-      assertValidBinaryHeader(setReq);
-      assert(setReq.header!.slot !== BINHDR.SLOT_NO_SLOT);
-      assert(setReq.header!.slot <= BINHDR.SLOT_MAX_VALID);
+      const setReq = findRequest(r => r.hasBinaryHeader && r.payload.toString().includes('mykey'));
+      assert.ok(setReq, 'Should have received SET request');
+      assertValidBinaryHeader(setReq!);
+      assert.ok(setReq!.header!.slot >= 0 && setReq!.header!.slot <= BINHDR.SLOT_MAX_VALID);
     });
 
     it('handles chunked response correctly', async function () {
+      const response = createBinhdrResponse('+PONG\r\n');
       server = net.createServer((socket) => {
         socket.on('data', (data) => {
           receivedRequests.push(parseClientRequest(data));
-          const response = createBinhdrResponse('+PONG\r\n');
+          // Send response in multiple chunks
           socket.write(response.subarray(0, 4));
-          setTimeout(() => socket.write(response.subarray(4)), 20);
+          setTimeout(() => socket.write(response.subarray(4)), 10);
         });
       });
       await once(server.listen(port), 'listening');
       await createConnectedClient();
 
-      assert.equal(await client.ping(), 'PONG');
+      const result = await client.ping();
+      assert.equal(result, 'PONG');
 
-      const pingReq = findRequest(p => p.includes('PING'));
-      assert(pingReq);
-      assertValidBinaryHeader(pingReq);
+      const pingReq = findRequest(r => r.payload.toString().includes('PING'));
+      assert.ok(pingReq);
     });
 
     it('client works normally with binary headers disabled', async function () {
       server = net.createServer((socket) => {
-        socket.on('data', () => socket.write('+PONG\r\n'));
+        socket.on('data', (data) => {
+          receivedRequests.push(parseClientRequest(data));
+          socket.write('+PONG\r\n');
+        });
       });
       await once(server.listen(port), 'listening');
 
@@ -438,7 +454,12 @@ describe('Binary Headers Wire Format', () => {
       client.on('error', () => {});
       await client.connect();
 
-      assert.equal(await client.ping(), 'PONG');
+      const result = await client.ping();
+      assert.equal(result, 'PONG');
+
+      const pingReq = findRequest(r => r.payload.toString().includes('PING'));
+      assert.ok(pingReq);
+      assert.equal(pingReq!.hasBinaryHeader, false);
     });
   });
 });

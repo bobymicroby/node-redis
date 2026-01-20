@@ -8,6 +8,7 @@ import { EligibilityResolver } from './eligibility-resolver';
 import { createDefaultResolver } from './eligibility-static-data';
 import { createBinhdrInterceptor } from './interceptor';
 import { CommandPacker, createDefaultPackingStrategy, createBufferedCommand } from './packing';
+import type { ResponseHeader } from './generated/types';
 
 export interface OutboundCodecOptions {
   readonly resolver?: EligibilityResolver | null;
@@ -58,7 +59,7 @@ export function createBinhdrInboundInterceptor(options: InboundCodecOptions = {}
 
   return createBinhdrInterceptor({
     onProtocolError: onProtocolError
-      ? (header) => onProtocolError(header.requestId)
+      ? (header: ResponseHeader) => onProtocolError(header.requestId)
       : undefined,
   });
 }

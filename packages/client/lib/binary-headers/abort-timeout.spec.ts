@@ -4,8 +4,8 @@ import { once } from 'node:events';
 import net from 'node:net';
 import { createClient, RedisClientType } from '../..';
 import { createBinhdrResponse } from './test-utils';
-import { parseRequestHeader, isBinaryHeaderDesignator } from './decoder';
-import { BINHDR } from './constants';
+import { parseRequestHeader, isBinaryHeaderDesignator } from './generated/decoder';
+import { BINHDR } from './generated/constants';
 
 interface ParsedRequest {
   hasBinaryHeader: boolean;

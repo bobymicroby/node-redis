@@ -1,6 +1,6 @@
-import { BINHDR } from './constants';
-import type { BinaryResponseHeader } from './types';
-import { parseResponseHeader, isBinaryHeaderDesignator } from './decoder';
+import { BINHDR } from './generated/constants';
+import type { ResponseHeader as BinaryResponseHeader } from './generated/types';
+import { parseResponseHeader, isBinaryHeaderDesignator } from './generated/decoder';
 import type {
   InboundNext,
   InboundInterceptor,

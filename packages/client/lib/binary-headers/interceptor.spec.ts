@@ -8,10 +8,10 @@ import {
 } from './interceptor';
 import type { InboundInterceptor, OutboundCommand, CommandCodec } from '../client/commands-queue';
 import RedisCommandsQueue from '../client/commands-queue';
-import { encodeResponseHeader } from './encoder';
-import { BINHDR } from './constants';
+import { encodeResponseHeader } from './generated/encoder';
+import { BINHDR } from './generated/constants';
 import { createResponseHeader, createBinhdrFrame, parseRespCommands } from './test-utils';
-import type { BinaryResponseHeader } from './types';
+import type { ResponseHeader as BinaryResponseHeader } from './generated/types';
 
 describe('Binary Headers Interceptor', function () {
   describe('createBinhdrInterceptor', function () {
@@ -193,7 +193,7 @@ describe('Binary Headers Interceptor', function () {
 
         assert.equal(headers.length, 1);
         assert.equal(headers[0].commandCount, 3);
-        assert.equal(headers[0].clientIdx, 42);
+        assert.equal(headers[0].requestId, 42);
         assert.equal(headers[0].length, payload.length);
         assert.equal(headers[0].protocolError, false);
       });
@@ -210,7 +210,7 @@ describe('Binary Headers Interceptor', function () {
 
         assert.equal(errors.length, 1);
         assert.equal(errors[0].protocolError, true);
-        assert.equal(errors[0].clientIdx, 99);
+        assert.equal(errors[0].requestId, 99);
       });
 
       it('does not call onProtocolError when flag is not set', function () {

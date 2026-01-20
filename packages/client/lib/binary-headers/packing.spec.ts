@@ -9,8 +9,8 @@ import {
   type BufferedCommand,
   type PackingStrategy,
 } from './packing';
-import { BINHDR } from './constants';
-import { parseRequestHeader } from './decoder';
+import { BINHDR } from './generated/constants';
+import { parseRequestHeader } from './generated/decoder';
 import type { EligibilityResult } from './eligibility-types';
 
 // Shared test helper for creating buffered commands
@@ -137,8 +137,9 @@ describe('Packing', () => {
       assert.ok(header.success);
       if (header.success) {
         assert.equal(header.header.commandCount, 1);
-        assert.equal(header.header.slot, BINHDR.SLOT_NO_SLOT);
-        assert.equal(header.header.clientIdx, 123);
+        // SLOT_NO_SLOT is converted to 0 on the wire
+        assert.equal(header.header.slot, 0);
+        assert.equal(header.header.requestId, 123);
         assert.equal(header.header.length, totalPayload);
       }
     });

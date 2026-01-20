@@ -9,6 +9,9 @@
     "!dist/tsconfig.tsbuildinfo"
   ],
   "scripts": {
+    "generate:binhdr": "tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v1.ts",
+    "prebuild": "npm run generate:binhdr",
+    "pretest": "npm run generate:binhdr",
     "test": "nyc -r text-summary -r lcov mocha -r tsx './lib/**/*.spec.ts'",
     "release": "release-it"
   },

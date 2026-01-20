@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
+import { setTimeout } from 'node:timers/promises';
 import { createClient, RedisClientType } from '../..';
 
 const testCases = [
@@ -39,6 +40,11 @@ describe('Redis Enterprise Binary Headers Integration', function () {
       });
       client.on('error', () => {});
       await client.connect();
+
+      // Wait for binary headers resolver to load (it's async)
+      if (binaryHeaders) {
+        await setTimeout(100);
+      }
 
       assert.equal(await client.ping(), expectedPing);
     });

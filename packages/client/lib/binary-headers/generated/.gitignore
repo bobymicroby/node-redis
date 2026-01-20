@@ -1,0 +1,5 @@
+# Generated files - regenerate with: npm run generate:binhdr
+*.ts
+
+# Keep this .gitignore
+!.gitignore

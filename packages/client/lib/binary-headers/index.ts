@@ -1,28 +1,31 @@
-export { BINHDR } from './constants';
-export type { BINHDR as BINHDRType } from './constants';
+// Re-export from generated files
+export { BINHDR } from './generated/constants';
+export type { BINHDR as BINHDRType } from './generated/constants';
 
 export type {
-  BinaryRequestHeader,
-  BinaryResponseHeader,
+  RequestHeader as BinaryRequestHeader,
+  ResponseHeader as BinaryResponseHeader,
+} from './generated/types';
+
+export type {
   CreateRequestHeaderError,
   CreateRequestHeaderResult,
-  EncodeRequestHeaderIntoError,
   EncodeRequestHeaderIntoResult,
-} from './types';
+} from './generated/encoder';
 
 export {
   createRequestHeader,
   encodeRequestHeader,
   encodeRequestHeaderInto,
   encodeResponseHeader,
-} from './encoder';
+} from './generated/encoder';
 
 export type {
   ParseRequestHeaderError,
   ParseRequestHeaderResult,
   ParseResponseHeaderError,
   ParseResponseHeaderResult,
-} from './decoder';
+} from './generated/decoder';
 
 export {
   isBinaryHeaderDesignator,
@@ -31,39 +34,9 @@ export {
   parseRequestHeader,
   parseResponseHeader,
   startsWithBinaryHeader,
-} from './decoder';
+} from './generated/decoder';
 
-export type {
-  KeyPosition,
-  BlockingBehavior,
-  CommandAttrs,
-  CommandNode,
-  CommandRecord,
-  CommandRecordFetcher,
-  EligibilityResult,
-} from './eligibility';
-
-export {
-  EligibilityResolver,
-  createEligibilityResolver,
-  STATIC_COMMAND_RECORDS,
-  createMockRecordFetcher,
-  createDefaultResolver,
-} from './eligibility';
-
-export type {
-  BufferedCommand,
-  PackingStrategy,
-} from './packing';
-
-export {
-  CommandPacker,
-  createDefaultPackingStrategy,
-  createBufferedCommand,
-  calculatePayloadLength,
-  packCommands,
-} from './packing';
-
+// Interceptor exports
 export type {
   OnHeader,
   OnProtocolError,
@@ -72,19 +45,42 @@ export type {
 
 export {
   createBinhdrInterceptor,
-  chainInbound,
   passthroughInbound,
-  passthroughOutbound
+  passthroughOutbound,
+  chainInbound,
 } from './interceptor';
 
+// Packing exports
 export type {
-  CodecOptions,
+  BufferedCommand,
+  PackingStrategy,
+} from './packing';
+
+export {
+  createDefaultPackingStrategy,
+  calculatePayloadLength,
+  createBufferedCommand,
+  packCommands,
+  CommandPacker,
+} from './packing';
+
+// Eligibility exports
+export type {
+  EligibilityResult,
+  CommandRecord,
+} from './eligibility-types';
+
+export { EligibilityResolver } from './eligibility-resolver';
+
+// Client integration exports
+export type {
   OutboundCodecOptions,
   InboundCodecOptions,
+  CodecOptions,
 } from './client-integration';
 
 export {
-  createBinhdrCodec,
   createBinhdrOutboundInterceptor,
   createBinhdrInboundInterceptor,
+  createBinhdrCodec,
 } from './client-integration';
