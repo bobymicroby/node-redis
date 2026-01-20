@@ -8,10 +8,10 @@ import type {
   BlockingBehavior,
   EligibilityResult,
 } from './eligibility-types';
+import { BINHDR } from './generated/constants';
 import calculateSlot from 'cluster-key-slot';
 
 const DEFAULT_KEY_INDEX = 1;
-const SLOT_NO_SLOT = 0xFFFF;
 
 function argToString(arg: RedisArgument): string {
   return typeof arg === 'string' ? arg : arg.toString('utf8');
@@ -24,7 +24,7 @@ function keyPositionToIndex(keyPosition: KeyPosition | undefined): number | null
 }
 
 function calculateCommandSlot(args: ReadonlyArray<RedisArgument>, firstKeyIndex: number | null): number {
-  if (firstKeyIndex === null || firstKeyIndex >= args.length) return 0;
+  if (firstKeyIndex === null || firstKeyIndex >= args.length) return BINHDR.SLOT_NO_SLOT;
   const key = args[firstKeyIndex];
   const keyStr = typeof key === 'string' ? key : key.toString();
   return calculateSlot(keyStr);

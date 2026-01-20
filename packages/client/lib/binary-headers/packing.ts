@@ -1,7 +1,7 @@
 import type { RedisArgument } from '../RESP/types';
 import type { EligibilityResult } from './eligibility-types';
-import { BINHDR } from './constants';
-import { createRequestHeader, encodeRequestHeader } from './encoder';
+import { BINHDR } from './generated/constants';
+import { createRequestHeader, encodeRequestHeader } from './generated/encoder';
 
 export interface BufferedCommand {
   readonly command: ReadonlyArray<RedisArgument>;
@@ -62,6 +62,11 @@ export function createBufferedCommand(
   };
 }
 
+/** Converts SLOT_NO_SLOT sentinel to wire-valid slot value (0) */
+function toWireSlot(slot: number): number {
+  return slot === BINHDR.SLOT_NO_SLOT ? 0 : slot;
+}
+
 export function packCommands(
   buffer: ReadonlyArray<BufferedCommand>,
   slot: number,
@@ -70,7 +75,8 @@ export function packCommands(
 ): ReadonlyArray<RedisArgument> | null {
   if (buffer.length === 0) return null;
 
-  const headerResult = createRequestHeader(totalPayload, buffer.length, slot, requestId);
+  const wireSlot = toWireSlot(slot);
+  const headerResult = createRequestHeader(wireSlot, totalPayload, buffer.length, requestId);
 
   if (!headerResult.success) return null;
 
