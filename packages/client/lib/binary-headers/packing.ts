@@ -10,6 +10,11 @@ export interface BufferedCommand {
   readonly payloadLength: number;
 }
 
+/**
+ * Decides whether a command can be added to the current pack.
+ * Called only when the buffer is non-empty (first command always buffers).
+ * Returning false triggers a flush before adding the incoming command.
+ */
 export interface PackingStrategy {
   canAdd(
     count: number,
@@ -90,6 +95,12 @@ export function packCommands(
   return result;
 }
 
+/**
+ * Buffers commands and packs them into binary header frames.
+ *
+ * Slot resolution: the pack's slot is the first non-NO_SLOT value seen.
+ * Commands with incompatible slots trigger a flush before buffering.
+ */
 export class CommandPacker {
   readonly #strategy: PackingStrategy;
   readonly #buffer: BufferedCommand[] = [];
@@ -113,6 +124,7 @@ export class CommandPacker {
     return null;
   }
 
+  /** Updates buffer and running state. First keyed command determines the pack's slot. */
   #push(command: BufferedCommand): void {
     this.#buffer.push(command);
     this.#payloadLength += command.payloadLength;

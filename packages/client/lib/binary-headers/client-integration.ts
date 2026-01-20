@@ -63,6 +63,12 @@ export function createBinhdrInboundInterceptor(options: InboundCodecOptions = {}
   });
 }
 
+/**
+ * Creates a codec for binary headers wire format.
+ *
+ * Resolver loads asynchronously - commands pass through unpacked until ready.
+ * If resolver fails to load, all commands pass through as regular RESP.
+ */
 export function createBinhdrCodec(options: CodecOptions = {}): CommandCodec {
   const { onProtocolError } = options;
 
