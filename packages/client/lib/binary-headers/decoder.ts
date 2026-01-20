@@ -31,11 +31,14 @@ export function hasProtocolError(flagsByte: number): boolean {
 }
 
 /**
- * Wire format (8 bytes):
- * - Byte 0: DESIG (0x80)
- * - Bytes 1-4: LENGTH (32-bit big-endian)
- * - Byte 5: NCMD/FLAGS (bits 0-6 = command count, bit 7 = protocol error)
- * - Bytes 6-7: CLIENT_IDX (16-bit big-endian)
+ * Wire format (16 bytes):
+ * - Byte 0: Magic byte (0xAE)
+ * - Byte 1: Version (0x01)
+ * - Bytes 2-3: Reserved
+ * - Bytes 4-7: Payload size (32-bit big-endian)
+ * - Byte 8: Batch count / flags (bits 0-6 = count, bit 7 = protocol error)
+ * - Bytes 9-12: Request ID (32-bit big-endian)
+ * - Bytes 13-15: Reserved
  */
 export function parseResponseHeader(
   buffer: Buffer,
@@ -50,9 +53,9 @@ export function parseResponseHeader(
     return { success: false, error: 'invalid_designator' };
   }
 
-  const length = buffer.readUInt32BE(offset + 1);
-  const flagsByte = buffer[offset + 5];
-  const clientIdx = buffer.readUInt16BE(offset + 6);
+  const length = buffer.readUInt32BE(offset + 4);
+  const flagsByte = buffer[offset + 8];
+  const requestId = buffer.readUInt32BE(offset + 9);
 
   const commandCount = extractCommandCount(flagsByte);
   const protocolError = hasProtocolError(flagsByte);
@@ -63,10 +66,11 @@ export function parseResponseHeader(
 
   const header: BinaryResponseHeader = {
     designator: BINHDR.DESIGNATOR,
+    version: BINHDR.VERSION,
     length,
     commandCount,
     protocolError,
-    clientIdx,
+    requestId,
   };
 
   return {
@@ -77,12 +81,14 @@ export function parseResponseHeader(
 }
 
 /**
- * Wire format (10 bytes):
- * - Byte 0: DESIG (0x80)
- * - Bytes 1-4: LENGTH (32-bit big-endian)
- * - Byte 5: NCMD (1-127)
- * - Bytes 6-7: SLOT (16-bit big-endian)
- * - Bytes 8-9: CLIENT_IDX (16-bit big-endian)
+ * Wire format (16 bytes):
+ * - Byte 0: Magic byte (0xAE)
+ * - Byte 1: Version (0x01)
+ * - Bytes 2-3: Slot (16-bit big-endian)
+ * - Bytes 4-7: Payload size (32-bit big-endian)
+ * - Byte 8: Batch count
+ * - Bytes 9-12: Request ID (32-bit big-endian)
+ * - Bytes 13-15: Reserved
  */
 export function parseRequestHeader(
   buffer: Buffer,
@@ -99,10 +105,11 @@ export function parseRequestHeader(
 
   const header: BinaryRequestHeader = {
     designator: BINHDR.DESIGNATOR,
-    length: buffer.readUInt32BE(offset + 1),
-    commandCount: buffer[offset + 5],
-    slot: buffer.readUInt16BE(offset + 6),
-    clientIdx: buffer.readUInt16BE(offset + 8),
+    version: BINHDR.VERSION,
+    slot: buffer.readUInt16BE(offset + 2),
+    length: buffer.readUInt32BE(offset + 4),
+    commandCount: buffer[offset + 8],
+    requestId: buffer.readUInt32BE(offset + 9),
   };
 
   return {

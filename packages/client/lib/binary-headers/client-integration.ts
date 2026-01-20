@@ -14,7 +14,7 @@ export interface OutboundCodecOptions {
 }
 
 export interface InboundCodecOptions {
-  readonly onProtocolError?: (clientIdx: number) => void;
+  readonly onProtocolError?: (requestId: number) => void;
 }
 
 export interface CodecOptions extends OutboundCodecOptions, InboundCodecOptions {}
@@ -58,7 +58,7 @@ export function createBinhdrInboundInterceptor(options: InboundCodecOptions = {}
 
   return createBinhdrInterceptor({
     onProtocolError: onProtocolError
-      ? (header) => onProtocolError(header.clientIdx)
+      ? (header) => onProtocolError(header.requestId)
       : undefined,
   });
 }

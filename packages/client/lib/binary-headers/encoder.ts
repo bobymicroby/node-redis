@@ -10,7 +10,7 @@ export function createRequestHeader(
   length: number,
   commandCount: number,
   slot: number,
-  clientIdx: number
+  requestId: number
 ): CreateRequestHeaderResult {
   if (
     !Number.isInteger(length) ||
@@ -37,40 +37,47 @@ export function createRequestHeader(
   }
 
   if (
-    !Number.isInteger(clientIdx) ||
-    clientIdx < 0 ||
-    clientIdx > BINHDR.MAX_CLIENT_IDX
+    !Number.isInteger(requestId) ||
+    requestId < 0 ||
+    requestId > BINHDR.MAX_REQUEST_ID
   ) {
-    return { success: false, error: 'invalid_client_idx' };
+    return { success: false, error: 'invalid_request_id' };
   }
 
   const header: BinaryRequestHeader = {
     designator: BINHDR.DESIGNATOR,
+    version: BINHDR.VERSION,
+    slot,
     length,
     commandCount,
-    slot,
-    clientIdx,
+    requestId,
   };
 
   return { success: true, header };
 }
 
 /**
- * Wire format (10 bytes):
- * - Byte 0: DESIG (0x80)
- * - Bytes 1-4: LENGTH (32-bit big-endian)
- * - Byte 5: NCMD (1-127)
- * - Bytes 6-7: SLOT (16-bit big-endian)
- * - Bytes 8-9: CLIENT_IDX (16-bit big-endian)
+ * Wire format (16 bytes):
+ * - Byte 0: Magic byte (0xAE)
+ * - Byte 1: Version (0x01)
+ * - Bytes 2-3: Slot (16-bit big-endian)
+ * - Bytes 4-7: Payload size (32-bit big-endian)
+ * - Byte 8: Batch count
+ * - Bytes 9-12: Request ID (32-bit big-endian)
+ * - Bytes 13-15: Reserved
  */
 export function encodeRequestHeader(header: BinaryRequestHeader): Buffer {
   const buffer = Buffer.allocUnsafe(BINHDR.REQUEST_HEADER_SIZE);
 
   buffer[0] = header.designator;
-  buffer.writeUInt32BE(header.length, 1);
-  buffer.writeUInt8(header.commandCount, 5);
-  buffer.writeUInt16BE(header.slot, 6);
-  buffer.writeUInt16BE(header.clientIdx, 8);
+  buffer[1] = header.version;
+  buffer.writeUInt16BE(header.slot, 2);
+  buffer.writeUInt32BE(header.length, 4);
+  buffer[8] = header.commandCount;
+  buffer.writeUInt32BE(header.requestId, 9);
+  buffer[13] = 0;
+  buffer[14] = 0;
+  buffer[15] = 0;
 
   return buffer;
 }
@@ -85,30 +92,43 @@ export function encodeRequestHeaderInto(
   }
 
   buffer[offset] = header.designator;
-  buffer.writeUInt32BE(header.length, offset + 1);
-  buffer.writeUInt8(header.commandCount, offset + 5);
-  buffer.writeUInt16BE(header.slot, offset + 6);
-  buffer.writeUInt16BE(header.clientIdx, offset + 8);
+  buffer[offset + 1] = header.version;
+  buffer.writeUInt16BE(header.slot, offset + 2);
+  buffer.writeUInt32BE(header.length, offset + 4);
+  buffer[offset + 8] = header.commandCount;
+  buffer.writeUInt32BE(header.requestId, offset + 9);
+  buffer[offset + 13] = 0;
+  buffer[offset + 14] = 0;
+  buffer[offset + 15] = 0;
 
   return { success: true, bytesWritten: BINHDR.REQUEST_HEADER_SIZE };
 }
 
 /**
- * Wire format (8 bytes):
- * - Byte 0: DESIG (0x80)
- * - Bytes 1-4: LENGTH (32-bit big-endian)
- * - Byte 5: NCMD/FLAGS (bits 0-6 = command count, bit 7 = protocol error)
- * - Bytes 6-7: CLIENT_IDX (16-bit big-endian)
+ * Wire format (16 bytes):
+ * - Byte 0: Magic byte (0xAE)
+ * - Byte 1: Version (0x01)
+ * - Bytes 2-3: Reserved
+ * - Bytes 4-7: Payload size (32-bit big-endian)
+ * - Byte 8: Batch count / flags (bits 0-6 = count, bit 7 = protocol error)
+ * - Bytes 9-12: Request ID (32-bit big-endian)
+ * - Bytes 13-15: Reserved
  */
 export function encodeResponseHeader(header: BinaryResponseHeader): Buffer {
   const buffer = Buffer.allocUnsafe(BINHDR.RESPONSE_HEADER_SIZE);
 
   buffer[0] = header.designator;
-  buffer.writeUInt32BE(header.length, 1);
-  buffer[5] = header.protocolError
+  buffer[1] = header.version;
+  buffer[2] = 0;
+  buffer[3] = 0;
+  buffer.writeUInt32BE(header.length, 4);
+  buffer[8] = header.protocolError
     ? header.commandCount | BINHDR.PROTOCOL_ERROR_BIT
     : header.commandCount;
-  buffer.writeUInt16BE(header.clientIdx, 6);
+  buffer.writeUInt32BE(header.requestId, 9);
+  buffer[13] = 0;
+  buffer[14] = 0;
+  buffer[15] = 0;
 
   return buffer;
 }
