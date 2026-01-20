@@ -54,6 +54,12 @@ function calculateEligibility(args: ReadonlyArray<RedisArgument>, attrs: Command
   return { eligible: true, slot };
 }
 
+/**
+ * Determines if a command can be packed with binary headers.
+ *
+ * Ineligible: unknown commands, blocking commands (BLPOP, XREAD with BLOCK).
+ * Eligible commands return their slot for pack grouping.
+ */
 export class EligibilityResolver {
   readonly #map: Map<string, CommandNode>;
 
