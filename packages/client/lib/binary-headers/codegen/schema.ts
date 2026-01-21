@@ -73,8 +73,16 @@ export function field(name: string, type: PrimitiveType, offset: number, options
   max?: number;
 }): VariableField {
   const { endian, min, max } = options ?? {};
-  const validation = (min !== undefined || max !== undefined) ? { min, max } : undefined;
+  const validation = buildValidation(min, max);
   return { kind: 'variable', name, type, offset, endian, validation };
+}
+
+function buildValidation(min: number | undefined, max: number | undefined): { min?: number; max?: number } | undefined {
+  if (min === undefined && max === undefined) return undefined;
+  const result: { min?: number; max?: number } = {};
+  if (min !== undefined) result.min = min;
+  if (max !== undefined) result.max = max;
+  return result;
 }
 
 export function fixed(name: string, type: PrimitiveType, offset: number, value: number, options?: {

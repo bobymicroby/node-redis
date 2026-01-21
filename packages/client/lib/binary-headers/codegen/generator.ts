@@ -10,7 +10,6 @@ import type {
   Endianness,
 } from './schema';
 
-// Type size lookup table (stack-allocated, no heap)
 const TYPE_SIZES: Readonly<Record<PrimitiveType, number>> = {
   uint8: 1, int8: 1,
   uint16: 2, int16: 2,
@@ -426,9 +425,10 @@ export function generateFromSchema(schema: ProtocolSchema): GeneratorOutput {
   const header = `// Generated from ${schema.name} protocol v${schema.version}`;
 
   // Types
+  const descriptionComment = schema.description ? `// ${schema.description}` : '//';
   const typesLines = [
     header,
-    `// ${schema.description || ''}`,
+    descriptionComment,
     '',
   ];
   for (const msg of schema.messages) {

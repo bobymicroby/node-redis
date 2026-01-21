@@ -8,6 +8,7 @@ import {
   packCommands,
   type BufferedCommand,
   type PackingStrategy,
+  type PackState,
 } from './packing';
 import { BINHDR } from './generated/constants';
 import { parseRequestHeader } from './generated/decoder';
@@ -79,41 +80,45 @@ describe('Packing', () => {
   describe('createDefaultPackingStrategy', () => {
     const strategy = createDefaultPackingStrategy();
 
+    function makePackState(commandCount: number, resolvedSlot: number, totalPayloadLength: number): PackState {
+      return { commandCount, resolvedSlot, totalPayloadLength };
+    }
+
     it('can add when slots are compatible (same slot)', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.canAdd(1, 1000, 14, incoming), true);
+      assert.equal(strategy.canAdd(makePackState(1, 1000, 14), incoming), true);
     });
 
     it('can add when incoming is SLOT_NO_SLOT', () => {
       const incoming = makeBuffered(BINHDR.SLOT_NO_SLOT);
-      assert.equal(strategy.canAdd(1, 1000, 14, incoming), true);
+      assert.equal(strategy.canAdd(makePackState(1, 1000, 14), incoming), true);
     });
 
     it('can add when current slot is SLOT_NO_SLOT and incoming has known slot', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.canAdd(1, BINHDR.SLOT_NO_SLOT, 14, incoming), true);
+      assert.equal(strategy.canAdd(makePackState(1, BINHDR.SLOT_NO_SLOT, 14), incoming), true);
     });
 
     it('cannot add when slots are incompatible', () => {
       const incoming = makeBuffered(2000);
-      assert.equal(strategy.canAdd(1, 1000, 14, incoming), false);
+      assert.equal(strategy.canAdd(makePackState(1, 1000, 14), incoming), false);
     });
 
     it('cannot add when count reaches max commands', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.canAdd(BINHDR.MAX_COMMANDS_PER_PACK, 1000, 14, incoming), false);
+      assert.equal(strategy.canAdd(makePackState(BINHDR.MAX_COMMANDS_PER_PACK, 1000, 14), incoming), false);
     });
 
     it('can add at max commands - 1', () => {
       const incoming = makeBuffered(1000);
-      assert.equal(strategy.canAdd(BINHDR.MAX_COMMANDS_PER_PACK - 1, 1000, 14, incoming), true);
+      assert.equal(strategy.canAdd(makePackState(BINHDR.MAX_COMMANDS_PER_PACK - 1, 1000, 14), incoming), true);
     });
 
     it('cannot add when payload would exceed max length', () => {
       const largePayload = 1000000; // 1MB
       const incomingPayload = BINHDR.MAX_PAYLOAD_LENGTH - largePayload + 1;
       const incoming = { ...makeBuffered(1000), payloadLength: incomingPayload };
-      assert.equal(strategy.canAdd(1, 1000, largePayload, incoming), false);
+      assert.equal(strategy.canAdd(makePackState(1, 1000, largePayload), incoming), false);
     });
   });
 
@@ -249,8 +254,8 @@ describe('Packing', () => {
     it('uses custom strategy', () => {
       // Strategy that allows max 2 commands (cannot add when count >= 2)
       const customStrategy: PackingStrategy = {
-        canAdd(count) {
-          return count < 2;
+        canAdd(currentPack) {
+          return currentPack.commandCount < 2;
         },
       };
 
