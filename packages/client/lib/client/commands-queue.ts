@@ -121,8 +121,6 @@ export default class RedisCommandsQueue {
   readonly decoder;
   readonly #pubSub = new PubSub();
   readonly #codec: CommandCodec | undefined;
-  readonly commandsToWrite: () => Generator<ReadonlyArray<RedisArgument>>;
-  readonly processIncomingData: (chunk: Buffer) => void;
 
   #pushHandlers: PushHandler[] = [this.#onPush.bind(this)];
 
@@ -186,14 +184,6 @@ export default class RedisCommandsQueue {
     this.#onShardedChannelMoved = onShardedChannelMoved;
     this.#codec = codec;
     this.decoder = this.#initiateDecoder();
-
-    if (codec) {
-      this.commandsToWrite = this.#commandsToWriteWithCodec.bind(this);
-      this.processIncomingData = this.#processIncomingDataWithCodec.bind(this);
-    } else {
-      this.commandsToWrite = this.#commandsToWriteNoCodec.bind(this);
-      this.processIncomingData = (chunk: Buffer) => this.decoder.write(chunk);
-    }
   }
 
   #onReply(reply: ReplyUnion) {
@@ -515,40 +505,10 @@ export default class RedisCommandsQueue {
     return this.#toWrite.length > 0;
   }
 
-  *#commandsToWriteNoCodec(): Generator<ReadonlyArray<RedisArgument>> {
+  *commandsToWrite(): Generator<ReadonlyArray<RedisArgument>> {
+    const codec = this.#codec;
     let toSend = this.#toWrite.shift();
-    while (toSend) {
-      let encoded: ReadonlyArray<RedisArgument>;
-      try {
-        encoded = encodeCommand(toSend.args);
-      } catch (err) {
-        toSend.reject(err);
-        toSend = this.#toWrite.shift();
-        continue;
-      }
 
-      (toSend as any).args = undefined;
-      if (toSend.abort) {
-        RedisCommandsQueue.#removeAbortListener(toSend);
-        toSend.abort = undefined;
-      }
-      if (toSend.timeout) {
-        RedisCommandsQueue.#removeTimeoutListener(toSend);
-        toSend.timeout = undefined;
-      }
-      this.#chainInExecution = toSend.chainId;
-      toSend.chainId = undefined;
-      this.#waitingForReply.push(toSend);
-
-      yield encoded;
-
-      toSend = this.#toWrite.shift();
-    }
-  }
-
-  *#commandsToWriteWithCodec(): Generator<ReadonlyArray<RedisArgument>> {
-    const codec = this.#codec!;
-    let toSend = this.#toWrite.shift();
     while (toSend) {
       const args = toSend.args;
       let encoded: ReadonlyArray<RedisArgument>;
@@ -573,22 +533,33 @@ export default class RedisCommandsQueue {
       toSend.chainId = undefined;
       this.#waitingForReply.push(toSend);
 
-      const result = codec.outbound.process({ args, encoded });
-      if (result !== null) {
-        yield result.encoded;
+      if (codec === undefined) {
+        yield encoded;
+      } else {
+        const result = codec.outbound.process({ args, encoded });
+        if (result !== null) {
+          yield result.encoded;
+        }
       }
 
       toSend = this.#toWrite.shift();
     }
 
-    const drained = codec.outbound.drain();
-    if (drained !== null) {
-      yield drained.encoded;
+    if (codec !== undefined) {
+      const drained = codec.outbound.drain();
+      if (drained !== null) {
+        yield drained.encoded;
+      }
     }
   }
 
-  #processIncomingDataWithCodec(chunk: Buffer) {
-    this.#codec!.inbound(chunk, data => this.decoder.write(data));
+  processIncomingData(chunk: Buffer): void {
+    const codec = this.#codec;
+    if (codec === undefined) {
+      this.decoder.write(chunk);
+    } else {
+      codec.inbound(chunk, data => this.decoder.write(data));
+    }
   }
 
   #flushWaitingForReply(err: Error): void {

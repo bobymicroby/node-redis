@@ -4,8 +4,7 @@ import { once } from 'node:events';
 import net from 'node:net';
 import { createClient, RedisClientType } from '../..';
 import { createBinhdrResponse } from './test-utils';
-import { parseRequestHeader, isBinaryHeaderDesignator } from './generated/decoder';
-import { BINHDR } from './generated/constants';
+import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
 
 interface ParsedRequest {
   hasBinaryHeader: boolean;
@@ -14,13 +13,14 @@ interface ParsedRequest {
 }
 
 function parseClientRequest(data: Buffer): ParsedRequest {
-  if (data.length >= BINHDR.REQUEST_HEADER_SIZE && isBinaryHeaderDesignator(data[0])) {
-    const result = parseRequestHeader(data, 0);
-    if (result.success) {
+  if (data.length >= RequestHeaderDecoder.ENCODED_LENGTH && data[0] === RequestHeaderDecoder.designatorConstantValue()) {
+    const decoder = new RequestHeaderDecoder();
+    decoder.wrap(data, 0);
+    if (decoder.isValid()) {
       return {
         hasBinaryHeader: true,
-        header: result.header,
-        payload: data.subarray(BINHDR.REQUEST_HEADER_SIZE),
+        header: { commandCount: decoder.commandCount(), length: decoder.length() },
+        payload: data.subarray(RequestHeaderDecoder.ENCODED_LENGTH),
       };
     }
   }
@@ -164,7 +164,7 @@ describe('Binary Headers Abort and Timeout', function () {
             receivedRequests.push(parsed);
 
             if (parsed.hasBinaryHeader) {
-              offset += BINHDR.REQUEST_HEADER_SIZE + parsed.header!.length;
+              offset += RequestHeaderDecoder.ENCODED_LENGTH + parsed.header!.length;
               for (let i = 0; i < parsed.header!.commandCount; i++) {
                 socket.write(createBinhdrResponse('+OK\r\n'));
               }

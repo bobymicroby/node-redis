@@ -8,8 +8,11 @@ import type {
   BlockingBehavior,
   EligibilityResult,
 } from './eligibility-types';
-import { BINHDR } from './generated/constants';
+import { RequestHeaderEncoder } from './generated/request-header-codec';
 import calculateSlot from 'cluster-key-slot';
+
+/** Sentinel value indicating command is not eligible for binary headers */
+export const SLOT_INELIGIBLE = -1;
 
 const DEFAULT_KEY_INDEX = 1;
 
@@ -24,7 +27,7 @@ function keyPositionToIndex(keyPosition: KeyPosition | undefined): number | null
 }
 
 function calculateCommandSlot(args: ReadonlyArray<RedisArgument>, firstKeyIndex: number | null): number {
-  if (firstKeyIndex === null || firstKeyIndex >= args.length) return BINHDR.SLOT_NO_SLOT;
+  if (firstKeyIndex === null || firstKeyIndex >= args.length) return RequestHeaderEncoder.slotNullValue();
   const key = args[firstKeyIndex];
   const keyStr = typeof key === 'string' ? key : key.toString();
   return calculateSlot(keyStr);
@@ -55,15 +58,27 @@ function calculateEligibility(args: ReadonlyArray<RedisArgument>, attrs: Command
 }
 
 /**
+ * Calculate slot directly without object allocation.
+ * Returns SLOT_INELIGIBLE (-1) if command is not eligible.
+ */
+function calculateSlotDirect(args: ReadonlyArray<RedisArgument>, attrs: CommandAttrs): number {
+  if (isBlocking(args, attrs.blocking)) {
+    return SLOT_INELIGIBLE;
+  }
+  const firstKeyIndex = keyPositionToIndex(attrs.keyPosition);
+  return calculateCommandSlot(args, firstKeyIndex);
+}
+
+/**
  * Determines if a command can be packed with binary headers.
  *
  * Ineligible: unknown commands, blocking commands (BLPOP, XREAD with BLOCK).
  * Eligible commands return their slot for pack grouping.
  */
 export class EligibilityResolver {
-  readonly #map: Map<string, CommandNode>;
+  readonly #map: ReadonlyMap<string, CommandNode>;
 
-  constructor(map: Map<string, CommandNode>) {
+  constructor(map: ReadonlyMap<string, CommandNode>) {
     this.#map = map;
   }
 
@@ -81,6 +96,27 @@ export class EligibilityResolver {
     }
 
     return calculateEligibility(args, node);
+  }
+
+  /**
+   * Get slot directly without object allocation.
+   * Returns SLOT_INELIGIBLE (-1) if command is not eligible.
+   * Returns slot number (>= 0) if eligible.
+   */
+  getSlot(args: ReadonlyArray<RedisArgument>): number {
+    if (args.length === 0) return SLOT_INELIGIBLE;
+
+    const cmd = argToString(args[0]);
+    const node = this.#map.get(cmd);
+    if (!node) return SLOT_INELIGIBLE;
+
+    if (node.subs && args.length >= 2) {
+      const subcmd = argToString(args[1]);
+      const subAttrs = node.subs.get(subcmd);
+      if (subAttrs) return calculateSlotDirect(args, subAttrs);
+    }
+
+    return calculateSlotDirect(args, node);
   }
 }
 

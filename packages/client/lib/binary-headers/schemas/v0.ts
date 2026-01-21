@@ -1,7 +1,6 @@
 import {
   protocol,
   message,
-  constant,
   fixed,
   field,
   bitfield,
@@ -10,18 +9,6 @@ import {
 export const BinaryHeadersProtocolV0 = protocol(
   'BinaryHeaders',
   0,
-  [
-    constant('DESIGNATOR', 0x80, 'Magic byte identifying binary header frames'),
-    constant('REQUEST_HEADER_SIZE', 10, 'Size of request header in bytes'),
-    constant('RESPONSE_HEADER_SIZE', 8, 'Size of response header in bytes'),
-    constant('MAX_COMMANDS_PER_PACK', 127, 'Maximum commands in a single pack'),
-    constant('MAX_PAYLOAD_LENGTH', 0x7FFFFFFF, 'Maximum payload length'),
-    constant('SLOT_NO_SLOT', 0xFFFF, 'Special value for no slot'),
-    constant('SLOT_MAX_VALID', 0x3FFF, 'Maximum valid slot number (16383)'),
-    constant('MAX_CLIENT_IDX', 0xFFFF, 'Maximum client index'),
-    constant('PROTOCOL_ERROR_BIT', 0x80, 'Bit flag for protocol error in response'),
-    constant('COMMAND_COUNT_MASK', 0x7F, 'Mask for extracting command count from flags'),
-  ],
   [
     message('RequestHeader', 10, [
       fixed('designator', 'uint8', 0, 0x80),

@@ -1,7 +1,7 @@
 import { writeFileSync } from 'node:fs';
 import { join, dirname, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { generateFromSchema } from './generator';
+import { generateFlyweightCodecs } from './flyweight-generator';
 import type { ProtocolSchema } from './schema';
 
 function printUsage(): void {
@@ -52,24 +52,20 @@ async function main(): Promise<void> {
 
   const schemaPath = args[0];
   const schema = await loadSchema(schemaPath);
-  const output = generateFromSchema(schema);
 
   // Output to ../generated/ folder (sibling to codegen/)
   const outputDir = join(dirname(__dirname), 'generated');
 
-  const files = [
-    ['constants.ts', output.constants],
-    ['types.ts', output.types],
-    ['encoder.ts', output.encoder],
-    ['decoder.ts', output.decoder],
-  ] as const;
-
-  for (const [filename, content] of files) {
+  // Generate SBE-style flyweight codecs (includes embedded interfaces)
+  const flyweightOutput = generateFlyweightCodecs(schema);
+  for (const { filename, content } of flyweightOutput.files) {
     writeFileSync(join(outputDir, filename), content);
   }
 
   console.log(`Generated from ${schema.name} protocol v${schema.version} (${basename(schemaPath)}):`);
-  files.forEach(([f]) => console.log(`  - generated/${f}`));
+  console.log('');
+  console.log('  Flyweight Codecs (SBE-style):');
+  flyweightOutput.files.forEach(({ filename }) => console.log(`    - generated/${filename}`));
 }
 
 main().catch((err) => {

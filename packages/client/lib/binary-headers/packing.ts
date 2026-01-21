@@ -1,7 +1,6 @@
 import type { RedisArgument } from '../RESP/types';
 import type { EligibilityResult } from './eligibility-types';
-import { BINHDR } from './generated/constants';
-import { createRequestHeader, encodeRequestHeader } from './generated/encoder';
+import { RequestHeaderEncoder } from './generated/request-header-codec';
 
 export interface BufferedCommand {
   readonly command: ReadonlyArray<RedisArgument>;
@@ -29,6 +28,11 @@ export interface Scheduler {
   schedule(delayMs: number, task: () => void): Cancellable;
 }
 
+export interface CommandPackerOptions {
+  readonly strategy?: PackingStrategy;
+  readonly maxWaitMs?: number;
+}
+
 export function createTimeoutScheduler(): Scheduler {
   return {
     schedule(delayMs: number, task: () => void): Cancellable {
@@ -47,31 +51,14 @@ export function createImmediateScheduler(): Scheduler {
   };
 }
 
-export function createDefaultPackingStrategy(): PackingStrategy {
-  return {
-    canAdd(currentPack: PackState, incoming: BufferedCommand): boolean {
-      if (currentPack.commandCount >= BINHDR.MAX_COMMANDS_PER_PACK) return false;
-      if (!areSlotsCompatible(currentPack.resolvedSlot, incoming.slot)) return false;
-      if (currentPack.totalPayloadLength + incoming.payloadLength > BINHDR.MAX_PAYLOAD_LENGTH) return false;
-      return true;
-    }
-  };
+function areSlotsCompatible(slotA: number, slotB: number): boolean {
+  const nullSlot = RequestHeaderEncoder.slotNullValue();
+  if (slotA === nullSlot || slotB === nullSlot) return true;
+  return slotA === slotB;
 }
 
-export function createTimeBoundedPackingStrategy(maxWaitMs: number): PackingStrategy {
-  return {
-    canAdd(currentPack: PackState, incoming: BufferedCommand): boolean {
-      if (currentPack.bufferStartTime !== null) {
-        const elapsed = performance.now() - currentPack.bufferStartTime;
-        if (elapsed >= maxWaitMs) return false;
-      }
-
-      if (currentPack.commandCount >= BINHDR.MAX_COMMANDS_PER_PACK) return false;
-      if (!areSlotsCompatible(currentPack.resolvedSlot, incoming.slot)) return false;
-      if (currentPack.totalPayloadLength + incoming.payloadLength > BINHDR.MAX_PAYLOAD_LENGTH) return false;
-      return true;
-    }
-  };
+function toWireSlot(slot: number): number {
+  return slot === RequestHeaderEncoder.slotNullValue() ? 0 : slot;
 }
 
 export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): number {
@@ -81,11 +68,6 @@ export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): numb
     length += typeof part === 'string' ? Buffer.byteLength(part) : part.length;
   }
   return length;
-}
-
-function areSlotsCompatible(slotA: number, slotB: number): boolean {
-  if (slotA === BINHDR.SLOT_NO_SLOT || slotB === BINHDR.SLOT_NO_SLOT) return true;
-  return slotA === slotB;
 }
 
 export function createBufferedCommand(
@@ -101,8 +83,88 @@ export function createBufferedCommand(
   };
 }
 
-function toWireSlot(slot: number): number {
-  return slot === BINHDR.SLOT_NO_SLOT ? 0 : slot;
+export function createDefaultPackingStrategy(): PackingStrategy {
+  return {
+    canAdd(currentPack: PackState, incoming: BufferedCommand): boolean {
+      if (currentPack.commandCount >= RequestHeaderEncoder.commandCountMaxValue()) return false;
+      if (!areSlotsCompatible(currentPack.resolvedSlot, incoming.slot)) return false;
+      if (currentPack.totalPayloadLength + incoming.payloadLength > RequestHeaderEncoder.lengthMaxValue()) return false;
+      return true;
+    }
+  };
+}
+
+export function createTimeBoundedPackingStrategy(maxWaitMs: number): PackingStrategy {
+  return {
+    canAdd(currentPack: PackState, incoming: BufferedCommand): boolean {
+      if (currentPack.bufferStartTime !== null) {
+        const elapsed = performance.now() - currentPack.bufferStartTime;
+        if (elapsed >= maxWaitMs) return false;
+      }
+
+      if (currentPack.commandCount >= RequestHeaderEncoder.commandCountMaxValue()) return false;
+      if (!areSlotsCompatible(currentPack.resolvedSlot, incoming.slot)) return false;
+      if (currentPack.totalPayloadLength + incoming.payloadLength > RequestHeaderEncoder.lengthMaxValue()) return false;
+      return true;
+    }
+  };
+}
+
+function canAddInline(
+  commandCount: number,
+  resolvedSlot: number,
+  totalPayloadLength: number,
+  incomingSlot: number,
+  incomingPayloadLength: number
+): boolean {
+  if (commandCount >= RequestHeaderEncoder.commandCountMaxValue()) return false;
+  if (!areSlotsCompatible(resolvedSlot, incomingSlot)) return false;
+  if (totalPayloadLength + incomingPayloadLength > RequestHeaderEncoder.lengthMaxValue()) return false;
+  return true;
+}
+
+export class PackBufferPool {
+  readonly #headerBuffer: Buffer;
+
+  constructor() {
+    this.#headerBuffer = Buffer.allocUnsafe(RequestHeaderEncoder.ENCODED_LENGTH);
+  }
+
+  pack(
+    commands: ReadonlyArray<BufferedCommand>,
+    slot: number,
+    totalPayload: number,
+    requestId: number
+  ): ReadonlyArray<RedisArgument> | null {
+    if (commands.length === 0) return null;
+
+    RequestHeaderEncoder.encodeInto(
+      this.#headerBuffer,
+      0,
+      toWireSlot(slot),
+      totalPayload,
+      commands.length,
+      requestId
+    );
+
+    let totalParts = 1;
+    for (let i = 0; i < commands.length; i++) {
+      totalParts += commands[i].resp.length;
+    }
+
+    const result = new Array<RedisArgument>(totalParts);
+    result[0] = this.#headerBuffer;
+
+    let idx = 1;
+    for (let i = 0; i < commands.length; i++) {
+      const resp = commands[i].resp;
+      for (let j = 0; j < resp.length; j++) {
+        result[idx++] = resp[j];
+      }
+    }
+
+    return result;
+  }
 }
 
 export function packCommands(
@@ -113,10 +175,12 @@ export function packCommands(
 ): ReadonlyArray<RedisArgument> | null {
   if (buffer.length === 0) return null;
 
-  const headerResult = createRequestHeader(toWireSlot(slot), totalPayload, buffer.length, requestId);
-  if (!headerResult.success) return null;
-
-  const headerBuffer = encodeRequestHeader(headerResult.header);
+  const headerBuffer = RequestHeaderEncoder.allocateAndEncode(
+    toWireSlot(slot),
+    totalPayload,
+    buffer.length,
+    requestId
+  );
 
   let totalParts = 1;
   for (let i = 0; i < buffer.length; i++) {
@@ -137,38 +201,47 @@ export function packCommands(
   return result;
 }
 
-export interface CommandPackerOptions {
-  readonly strategy?: PackingStrategy;
-  readonly maxWaitMs?: number;
-}
-
 export class CommandPacker {
-  readonly #strategy: PackingStrategy;
+  readonly #strategy: PackingStrategy | null;
   readonly #maxWaitMs: number | null;
+  readonly #pool: PackBufferPool;
   readonly #buffer: BufferedCommand[] = [];
-  #resolvedSlot: number = BINHDR.SLOT_NO_SLOT;
+  #resolvedSlot: number = RequestHeaderEncoder.slotNullValue();
   #totalPayloadLength: number = 0;
   #bufferStartTime: number | null = null;
 
   constructor(options: CommandPackerOptions = {}) {
-    this.#strategy = options.strategy ?? createDefaultPackingStrategy();
+    this.#strategy = options.strategy ?? null;
     this.#maxWaitMs = options.maxWaitMs ?? null;
+    this.#pool = new PackBufferPool();
   }
 
   add(command: BufferedCommand): ReadonlyArray<RedisArgument> | null {
-    const now = performance.now();
+    const bufferLength = this.#buffer.length;
 
-    if (this.#buffer.length > 0) {
-      if (this.#isStale(now) || !this.#strategy.canAdd(this.#packState, command)) {
+    if (bufferLength > 0) {
+      const isStale = this.#maxWaitMs !== null && this.#isStale(performance.now());
+
+      const canAdd = !isStale && (this.#strategy !== null
+        ? this.#strategy.canAdd(this.#packState, command)
+        : canAddInline(
+            bufferLength,
+            this.#resolvedSlot,
+            this.#totalPayloadLength,
+            command.slot,
+            command.payloadLength
+          ));
+
+      if (!canAdd) {
         const packed = this.#flush();
-        this.#pushFirst(command, now);
+        this.#pushFirst(command);
         return packed;
       }
       this.#push(command);
       return null;
     }
 
-    this.#pushFirst(command, now);
+    this.#pushFirst(command);
     return null;
   }
 
@@ -209,11 +282,13 @@ export class CommandPacker {
     return (now - this.#bufferStartTime) >= this.#maxWaitMs;
   }
 
-  #pushFirst(command: BufferedCommand, now: number): void {
+  #pushFirst(command: BufferedCommand): void {
     this.#buffer.push(command);
     this.#totalPayloadLength = command.payloadLength;
-    this.#bufferStartTime = now;
-    if (command.slot !== BINHDR.SLOT_NO_SLOT) {
+    if (this.#maxWaitMs !== null) {
+      this.#bufferStartTime = performance.now();
+    }
+    if (command.slot !== RequestHeaderEncoder.slotNullValue()) {
       this.#resolvedSlot = command.slot;
     }
   }
@@ -221,20 +296,25 @@ export class CommandPacker {
   #push(command: BufferedCommand): void {
     this.#buffer.push(command);
     this.#totalPayloadLength += command.payloadLength;
-    if (command.slot !== BINHDR.SLOT_NO_SLOT) {
+    if (command.slot !== RequestHeaderEncoder.slotNullValue()) {
       this.#resolvedSlot = command.slot;
     }
   }
 
   #flush(): ReadonlyArray<RedisArgument> | null {
-    const packed = packCommands(this.#buffer, this.#resolvedSlot, this.#totalPayloadLength);
+    const packed = this.#pool.pack(
+      this.#buffer,
+      this.#resolvedSlot,
+      this.#totalPayloadLength,
+      0
+    );
     this.#reset();
     return packed;
   }
 
   #reset(): void {
     this.#buffer.length = 0;
-    this.#resolvedSlot = BINHDR.SLOT_NO_SLOT;
+    this.#resolvedSlot = RequestHeaderEncoder.slotNullValue();
     this.#totalPayloadLength = 0;
     this.#bufferStartTime = null;
   }

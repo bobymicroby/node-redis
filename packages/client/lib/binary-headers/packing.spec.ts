@@ -13,25 +13,14 @@ import {
   type PackingStrategy,
   type PackState,
 } from './packing';
-import { BINHDR } from './generated/constants';
-import { parseRequestHeader } from './generated/decoder';
-import type { EligibilityResult } from './eligibility-types';
-
-// =============================================================================
-// Test Helpers
-// =============================================================================
+import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
 
 function makeBuffered(
   slot: number,
   resp: string[] = ['*1\r\n$4\r\nPING\r\n'],
   command: string[] = ['PING']
 ): BufferedCommand {
-  return {
-    command,
-    resp,
-    slot,
-    payloadLength: calculatePayloadLength(resp),
-  };
+  return { command, resp, slot, payloadLength: calculatePayloadLength(resp) };
 }
 
 function makePackState(
@@ -50,53 +39,34 @@ function assertPackedHeader(
   assert.ok(packed !== null, 'Expected packed data to be non-null');
   assert.ok(packed[0] instanceof Buffer, 'Expected first element to be a Buffer');
 
-  const header = parseRequestHeader(packed[0] as Buffer);
-  assert.ok(header.success, 'Expected header parsing to succeed');
+  const decoder = new RequestHeaderDecoder().wrap(packed[0] as Buffer, 0);
+  assert.ok(decoder.isValid(), 'Expected valid header');
 
-  if (header.success) {
-    if (expected.commandCount !== undefined) {
-      assert.equal(header.header.commandCount, expected.commandCount);
-    }
-    if (expected.slot !== undefined) {
-      assert.equal(header.header.slot, expected.slot);
-    }
-    if (expected.requestId !== undefined) {
-      assert.equal(header.header.requestId, expected.requestId);
-    }
-  }
+  if (expected.commandCount !== undefined) assert.equal(decoder.commandCount(), expected.commandCount);
+  if (expected.slot !== undefined) assert.equal(decoder.slot(), expected.slot);
+  if (expected.requestId !== undefined) assert.equal(decoder.requestId(), expected.requestId);
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 describe('Packing', () => {
   describe('calculatePayloadLength', () => {
-    const tests = [
+    const cases = [
       { name: 'string parts', resp: ['*1\r\n$4\r\nPING\r\n'], expected: 14 },
       { name: 'buffer parts', resp: [Buffer.from('*1\r\n$4\r\nPING\r\n')], expected: 14 },
       { name: 'empty array', resp: [] as string[], expected: 0 },
+      { name: 'mixed string and buffer', resp: ['abc', Buffer.from('def')], expected: 6 },
     ];
 
-    for (const tt of tests) {
-      it(tt.name, () => {
-        assert.equal(calculatePayloadLength(tt.resp), tt.expected);
-      });
+    for (const { name, resp, expected } of cases) {
+      it(name, () => assert.equal(calculatePayloadLength(resp), expected));
     }
-
-    it('mixed string and buffer parts', () => {
-      const resp = ['*3\r\n$3\r\nSET\r\n$3\r\n', Buffer.from('key'), '\r\n$5\r\nvalue\r\n'];
-      const expected = Buffer.byteLength('*3\r\n$3\r\nSET\r\n$3\r\n') + 3 + Buffer.byteLength('\r\n$5\r\nvalue\r\n');
-      assert.equal(calculatePayloadLength(resp), expected);
-    });
   });
 
   describe('createBufferedCommand', () => {
-    const tests = [
+    const cases = [
       {
         name: 'with slot for eligible command',
         command: ['SET', 'key', 'value'],
@@ -108,73 +78,43 @@ describe('Packing', () => {
         name: 'with SLOT_NO_SLOT for keyless command',
         command: ['PING'],
         resp: ['*1\r\n$4\r\nPING\r\n'],
-        eligibility: { eligible: true as const, slot: BINHDR.SLOT_NO_SLOT },
-        expectedSlot: BINHDR.SLOT_NO_SLOT,
+        eligibility: { eligible: true as const, slot: RequestHeaderEncoder.slotNullValue() },
+        expectedSlot: RequestHeaderEncoder.slotNullValue(),
       },
     ];
 
-    for (const tt of tests) {
-      it(tt.name, () => {
-        const buffered = createBufferedCommand(tt.command, tt.resp, tt.eligibility);
-        assert.deepEqual(buffered.command, tt.command);
-        assert.deepEqual(buffered.resp, tt.resp);
-        assert.equal(buffered.slot, tt.expectedSlot);
-        assert.equal(buffered.payloadLength, calculatePayloadLength(tt.resp));
+    for (const { name, command, resp, eligibility, expectedSlot } of cases) {
+      it(name, () => {
+        const buffered = createBufferedCommand(command, resp, eligibility);
+        assert.deepEqual(buffered.command, command);
+        assert.deepEqual(buffered.resp, resp);
+        assert.equal(buffered.slot, expectedSlot);
+        assert.equal(buffered.payloadLength, calculatePayloadLength(resp));
       });
     }
   });
 
   describe('createDefaultPackingStrategy', () => {
     const strategy = createDefaultPackingStrategy();
+    const SLOT_NO_SLOT = RequestHeaderEncoder.slotNullValue();
+    const MAX_COMMANDS = RequestHeaderEncoder.commandCountMaxValue();
 
-    const tests = [
-      {
-        name: 'can add when slots are compatible (same slot)',
-        packState: makePackState(1, 1000, 14),
-        incoming: makeBuffered(1000),
-        expected: true,
-      },
-      {
-        name: 'can add when incoming is SLOT_NO_SLOT',
-        packState: makePackState(1, 1000, 14),
-        incoming: makeBuffered(BINHDR.SLOT_NO_SLOT),
-        expected: true,
-      },
-      {
-        name: 'can add when current slot is SLOT_NO_SLOT',
-        packState: makePackState(1, BINHDR.SLOT_NO_SLOT, 14),
-        incoming: makeBuffered(1000),
-        expected: true,
-      },
-      {
-        name: 'cannot add when slots are incompatible',
-        packState: makePackState(1, 1000, 14),
-        incoming: makeBuffered(2000),
-        expected: false,
-      },
-      {
-        name: 'cannot add when count reaches max commands',
-        packState: makePackState(BINHDR.MAX_COMMANDS_PER_PACK, 1000, 14),
-        incoming: makeBuffered(1000),
-        expected: false,
-      },
-      {
-        name: 'can add at max commands - 1',
-        packState: makePackState(BINHDR.MAX_COMMANDS_PER_PACK - 1, 1000, 14),
-        incoming: makeBuffered(1000),
-        expected: true,
-      },
+    const canAddCases = [
+      { name: 'same slot', packState: makePackState(1, 1000, 14), incoming: makeBuffered(1000), expected: true },
+      { name: 'incoming is SLOT_NO_SLOT', packState: makePackState(1, 1000, 14), incoming: makeBuffered(SLOT_NO_SLOT), expected: true },
+      { name: 'current slot is SLOT_NO_SLOT', packState: makePackState(1, SLOT_NO_SLOT, 14), incoming: makeBuffered(1000), expected: true },
+      { name: 'incompatible slots', packState: makePackState(1, 1000, 14), incoming: makeBuffered(2000), expected: false },
+      { name: 'at max commands', packState: makePackState(MAX_COMMANDS, 1000, 14), incoming: makeBuffered(1000), expected: false },
+      { name: 'at max commands - 1', packState: makePackState(MAX_COMMANDS - 1, 1000, 14), incoming: makeBuffered(1000), expected: true },
     ];
 
-    for (const tt of tests) {
-      it(tt.name, () => {
-        assert.equal(strategy.canAdd(tt.packState, tt.incoming), tt.expected);
-      });
+    for (const { name, packState, incoming, expected } of canAddCases) {
+      it(name, () => assert.equal(strategy.canAdd(packState, incoming), expected));
     }
 
-    it('cannot add when payload would exceed max length', () => {
+    it('rejects when payload exceeds max length', () => {
       const largePayload = 1000000;
-      const incomingPayload = BINHDR.MAX_PAYLOAD_LENGTH - largePayload + 1;
+      const incomingPayload = RequestHeaderEncoder.lengthMaxValue() - largePayload + 1;
       const incoming = { ...makeBuffered(1000), payloadLength: incomingPayload };
       assert.equal(strategy.canAdd(makePackState(1, 1000, largePayload), incoming), false);
     });
@@ -183,78 +123,62 @@ describe('Packing', () => {
   describe('createTimeBoundedPackingStrategy', () => {
     const strategy = createTimeBoundedPackingStrategy(100);
 
-    it('allows add when buffer is not stale', () => {
-      const now = performance.now();
-      const packState = makePackState(1, 1000, 14, now - 50); // 50ms ago
-      assert.equal(strategy.canAdd(packState, makeBuffered(1000)), true);
-    });
+    const cases = [
+      { name: 'not stale', ageMs: 50, expected: true },
+      { name: 'stale', ageMs: 150, expected: false },
+      { name: 'null bufferStartTime', bufferStartTime: null as number | null, expected: true },
+    ];
 
-    it('denies add when buffer is stale', () => {
-      const now = performance.now();
-      const packState = makePackState(1, 1000, 14, now - 150); // 150ms ago
-      assert.equal(strategy.canAdd(packState, makeBuffered(1000)), false);
-    });
+    for (const { name, ageMs, bufferStartTime, expected } of cases) {
+      it(name, () => {
+        const startTime = bufferStartTime === null ? null : performance.now() - (ageMs ?? 0);
+        const packState = makePackState(1, 1000, 14, startTime);
+        assert.equal(strategy.canAdd(packState, makeBuffered(1000)), expected);
+      });
+    }
 
-    it('allows add when bufferStartTime is null', () => {
-      const packState = makePackState(1, 1000, 14, null);
-      assert.equal(strategy.canAdd(packState, makeBuffered(1000)), true);
-    });
-
-    it('still enforces protocol limits (incompatible slot)', () => {
+    it('still enforces protocol limits', () => {
       const now = performance.now();
-      const packState = makePackState(1, 1000, 14, now);
-      assert.equal(strategy.canAdd(packState, makeBuffered(2000)), false);
-    });
-
-    it('still enforces protocol limits (max commands)', () => {
-      const now = performance.now();
-      const packState = makePackState(BINHDR.MAX_COMMANDS_PER_PACK, 1000, 14, now);
-      assert.equal(strategy.canAdd(packState, makeBuffered(1000)), false);
+      assert.equal(strategy.canAdd(makePackState(1, 1000, 14, now), makeBuffered(2000)), false);
+      assert.equal(strategy.canAdd(makePackState(RequestHeaderEncoder.commandCountMaxValue(), 1000, 14, now), makeBuffered(1000)), false);
     });
   });
 
   describe('packCommands', () => {
     it('returns null for empty buffer', () => {
-      assert.equal(packCommands([], BINHDR.SLOT_NO_SLOT, 0), null);
+      assert.equal(packCommands([], RequestHeaderEncoder.slotNullValue(), 0), null);
     });
 
     it('packs single command', () => {
       const pingResp = ['*1\r\n$4\r\nPING\r\n'];
-      const buffer = [makeBuffered(BINHDR.SLOT_NO_SLOT, pingResp)];
-      const totalPayload = calculatePayloadLength(pingResp);
-
-      const packed = packCommands(buffer, BINHDR.SLOT_NO_SLOT, totalPayload, 123);
+      const buffer = [makeBuffered(RequestHeaderEncoder.slotNullValue(), pingResp)];
+      const packed = packCommands(buffer, RequestHeaderEncoder.slotNullValue(), calculatePayloadLength(pingResp), 123);
 
       assert.ok(packed !== null);
-      assert.equal(packed.length, 2); // header + resp
+      assert.equal(packed.length, 2);
       assertPackedHeader(packed, { commandCount: 1, slot: 0, requestId: 123 });
     });
 
     it('packs multiple commands', () => {
-      const pingResp = ['*1\r\n$4\r\nPING\r\n'];
-      const timeResp = ['*1\r\n$4\r\nTIME\r\n'];
       const buffer = [
-        makeBuffered(BINHDR.SLOT_NO_SLOT, pingResp),
-        makeBuffered(BINHDR.SLOT_NO_SLOT, timeResp),
+        makeBuffered(RequestHeaderEncoder.slotNullValue(), ['*1\r\n$4\r\nPING\r\n']),
+        makeBuffered(RequestHeaderEncoder.slotNullValue(), ['*1\r\n$4\r\nTIME\r\n']),
       ];
-      const totalPayload = calculatePayloadLength(pingResp) + calculatePayloadLength(timeResp);
-
-      const packed = packCommands(buffer, BINHDR.SLOT_NO_SLOT, totalPayload, 0);
+      const totalPayload = buffer.reduce((sum, b) => sum + b.payloadLength, 0);
+      const packed = packCommands(buffer, RequestHeaderEncoder.slotNullValue(), totalPayload, 0);
 
       assert.ok(packed !== null);
-      assert.equal(packed.length, 3); // header + 2 payloads
+      assert.equal(packed.length, 3);
       assertPackedHeader(packed, { commandCount: 2 });
     });
 
     it('uses provided slot', () => {
       const buffer = [
-        makeBuffered(BINHDR.SLOT_NO_SLOT, ['*1\r\n$4\r\nPING\r\n']),
+        makeBuffered(RequestHeaderEncoder.slotNullValue(), ['*1\r\n$4\r\nPING\r\n']),
         makeBuffered(5000, ['*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n'], ['GET', 'key']),
       ];
       const totalPayload = buffer.reduce((sum, b) => sum + b.payloadLength, 0);
-
-      const packed = packCommands(buffer, 5000, totalPayload, 0);
-      assertPackedHeader(packed, { slot: 5000 });
+      assertPackedHeader(packCommands(buffer, 5000, totalPayload, 0), { slot: 5000 });
     });
   });
 
@@ -262,16 +186,15 @@ describe('Packing', () => {
     describe('basic operations', () => {
       it('buffers first command and returns null', () => {
         const packer = new CommandPacker();
-        const result = packer.add(makeBuffered(1000));
-        assert.equal(result, null);
+        assert.equal(packer.add(makeBuffered(1000)), null);
         assert.equal(packer.bufferSize, 1);
       });
 
       it('buffers compatible commands', () => {
         const packer = new CommandPacker();
-        assert.equal(packer.add(makeBuffered(1000)), null);
-        assert.equal(packer.add(makeBuffered(1000)), null);
-        assert.equal(packer.add(makeBuffered(BINHDR.SLOT_NO_SLOT)), null);
+        packer.add(makeBuffered(1000));
+        packer.add(makeBuffered(1000));
+        packer.add(makeBuffered(RequestHeaderEncoder.slotNullValue()));
         assert.equal(packer.bufferSize, 3);
       });
 
@@ -290,42 +213,38 @@ describe('Packing', () => {
         packer.add(makeBuffered(1000));
         packer.add(makeBuffered(1000));
 
-        const drained = packer.drain();
-        assertPackedHeader(drained, { commandCount: 2 });
+        assertPackedHeader(packer.drain(), { commandCount: 2 });
         assert.equal(packer.bufferSize, 0);
       });
 
       it('drain returns null when buffer is empty', () => {
-        const packer = new CommandPacker();
-        assert.equal(packer.drain(), null);
+        assert.equal(new CommandPacker().drain(), null);
       });
 
-      it('handles max commands flush', () => {
+      it('flushes at max commands', () => {
         const packer = new CommandPacker();
+        const maxCommands = RequestHeaderEncoder.commandCountMaxValue();
 
-        for (let i = 0; i < BINHDR.MAX_COMMANDS_PER_PACK; i++) {
+        for (let i = 0; i < maxCommands; i++) {
           packer.add(makeBuffered(1000));
         }
-        assert.equal(packer.bufferSize, BINHDR.MAX_COMMANDS_PER_PACK);
+        assert.equal(packer.bufferSize, maxCommands);
 
         const flushed = packer.add(makeBuffered(1000));
-        assertPackedHeader(flushed, { commandCount: BINHDR.MAX_COMMANDS_PER_PACK });
+        assertPackedHeader(flushed, { commandCount: maxCommands });
         assert.equal(packer.bufferSize, 1);
       });
     });
 
     describe('custom strategy', () => {
-      it('uses custom strategy', () => {
+      it('uses custom canAdd logic', () => {
         const customStrategy: PackingStrategy = {
-          canAdd(currentPack) {
-            return currentPack.commandCount < 2;
-          },
+          canAdd: (currentPack) => currentPack.commandCount < 2,
         };
-
         const packer = new CommandPacker({ strategy: customStrategy });
 
-        assert.equal(packer.add(makeBuffered(1000)), null);
-        assert.equal(packer.add(makeBuffered(1000)), null);
+        packer.add(makeBuffered(1000));
+        packer.add(makeBuffered(1000));
 
         const flushed = packer.add(makeBuffered(1000));
         assert.ok(flushed !== null);
@@ -334,11 +253,10 @@ describe('Packing', () => {
     });
 
     describe('buffer timing', () => {
-      it('tracks bufferStartTime', () => {
-        const packer = new CommandPacker();
+      it('tracks bufferStartTime when time-bounded', () => {
+        const packer = new CommandPacker({ maxWaitMs: 100 });
 
         assert.equal(packer.bufferStartTime, null);
-
         packer.add(makeBuffered(1000));
         const startTime = packer.bufferStartTime;
         assert.ok(startTime !== null && startTime > 0);
@@ -350,20 +268,26 @@ describe('Packing', () => {
         assert.equal(packer.bufferStartTime, null);
       });
 
-      it('getStaleTime returns correct time', () => {
+      it('bufferStartTime is null without maxWaitMs (optimization)', () => {
+        const packer = new CommandPacker();
+        packer.add(makeBuffered(1000));
+        packer.add(makeBuffered(1000));
+        assert.equal(packer.bufferStartTime, null);
+      });
+
+      it('getStaleTime returns correct time when configured', () => {
         const packer = new CommandPacker({ maxWaitMs: 100 });
 
         assert.equal(packer.getStaleTime(), null);
-
         packer.add(makeBuffered(1000));
+
         const staleTime = packer.getStaleTime();
         const bufferStart = packer.bufferStartTime;
-
         assert.ok(staleTime !== null && bufferStart !== null);
         assert.equal(staleTime, bufferStart + 100);
       });
 
-      it('getStaleTime returns null when maxWaitMs not configured', () => {
+      it('getStaleTime returns null without maxWaitMs', () => {
         const packer = new CommandPacker();
         packer.add(makeBuffered(1000));
         assert.equal(packer.getStaleTime(), null);
@@ -372,8 +296,7 @@ describe('Packing', () => {
 
     describe('time-bounded flushing', () => {
       it('flushIfStale returns null when buffer is empty', () => {
-        const packer = new CommandPacker({ maxWaitMs: 10 });
-        assert.equal(packer.flushIfStale(), null);
+        assert.equal(new CommandPacker({ maxWaitMs: 10 }).flushIfStale(), null);
       });
 
       it('flushIfStale returns null when buffer is not stale', () => {
@@ -389,16 +312,13 @@ describe('Packing', () => {
 
         await delay(10);
 
-        const packed = packer.flushIfStale();
-        assert.ok(packed !== null);
+        assert.ok(packer.flushIfStale() !== null);
         assert.equal(packer.bufferSize, 0);
       });
 
       it('inline staleness check triggers flush on add', async () => {
         const packer = new CommandPacker({ maxWaitMs: 5 });
-
         packer.add(makeBuffered(1000));
-        assert.equal(packer.bufferSize, 1);
 
         await delay(10);
 
@@ -412,10 +332,8 @@ describe('Packing', () => {
   describe('Scheduler implementations', () => {
     describe('createTimeoutScheduler', () => {
       it('schedules and executes', async () => {
-        const scheduler = createTimeoutScheduler();
         let executed = false;
-
-        scheduler.schedule(5, () => { executed = true; });
+        createTimeoutScheduler().schedule(5, () => { executed = true; });
 
         assert.equal(executed, false);
         await delay(10);
@@ -423,10 +341,8 @@ describe('Packing', () => {
       });
 
       it('cancel prevents execution', async () => {
-        const scheduler = createTimeoutScheduler();
         let executed = false;
-
-        const handle = scheduler.schedule(5, () => { executed = true; });
+        const handle = createTimeoutScheduler().schedule(5, () => { executed = true; });
         handle.cancel();
 
         await delay(10);
@@ -436,10 +352,8 @@ describe('Packing', () => {
 
     describe('createImmediateScheduler', () => {
       it('schedules for next tick (ignores delay)', async () => {
-        const scheduler = createImmediateScheduler();
         let executed = false;
-
-        scheduler.schedule(1000, () => { executed = true; });
+        createImmediateScheduler().schedule(1000, () => { executed = true; });
 
         assert.equal(executed, false);
         await new Promise(resolve => setImmediate(resolve));
@@ -447,10 +361,8 @@ describe('Packing', () => {
       });
 
       it('cancel prevents execution', async () => {
-        const scheduler = createImmediateScheduler();
         let executed = false;
-
-        const handle = scheduler.schedule(0, () => { executed = true; });
+        const handle = createImmediateScheduler().schedule(0, () => { executed = true; });
         handle.cancel();
 
         await new Promise(resolve => setImmediate(resolve));
