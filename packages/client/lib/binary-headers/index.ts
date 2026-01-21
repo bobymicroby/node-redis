@@ -55,10 +55,16 @@ export type {
   BufferedCommand,
   PackingStrategy,
   PackState,
+  Scheduler,
+  Cancellable,
+  CommandPackerOptions,
 } from './packing';
 
 export {
   createDefaultPackingStrategy,
+  createTimeBoundedPackingStrategy,
+  createTimeoutScheduler,
+  createImmediateScheduler,
   calculatePayloadLength,
   createBufferedCommand,
   packCommands,
@@ -78,6 +84,9 @@ export type {
   OutboundCodecOptions,
   InboundCodecOptions,
   CodecOptions,
+  TimeBoundedOptions,
+  FlushSink,
+  BinhdrCodec,
 } from './client-integration';
 
 export {
