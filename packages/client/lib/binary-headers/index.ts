@@ -1,42 +1,26 @@
-// Re-export from generated files
-export { BINHDR } from './generated/constants';
-export type { BINHDR as BINHDRType } from './generated/constants';
-
 export type {
   RequestHeader as BinaryRequestHeader,
+} from './generated/request-header-codec';
+export type {
   ResponseHeader as BinaryResponseHeader,
-} from './generated/types';
+} from './generated/response-header-codec';
 
-export type {
-  CreateRequestHeaderError,
-  CreateRequestHeaderResult,
-  EncodeRequestHeaderIntoResult,
-} from './generated/encoder';
+// ═══════════════════════════════════════════════════════════════════════════════
+// Flyweight Encoder/Decoder API (SBE-style, zero-allocation)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export {
-  createRequestHeader,
-  encodeRequestHeader,
-  encodeRequestHeaderInto,
-  encodeResponseHeader,
-} from './generated/encoder';
-
-export type {
-  ParseRequestHeaderError,
-  ParseRequestHeaderResult,
-  ParseResponseHeaderError,
-  ParseResponseHeaderResult,
-} from './generated/decoder';
+  RequestHeaderEncoder,
+  RequestHeaderDecoder,
+} from './generated/request-header-codec';
 
 export {
-  isBinaryHeaderDesignator,
+  ResponseHeaderEncoder,
+  ResponseHeaderDecoder,
   extractCommandCount,
   hasProtocolError,
-  parseRequestHeader,
-  parseResponseHeader,
-  startsWithBinaryHeader,
-} from './generated/decoder';
+} from './generated/response-header-codec';
 
-// Interceptor exports
 export type {
   OnHeader,
   OnProtocolError,
@@ -50,7 +34,6 @@ export {
   chainInbound,
 } from './interceptor';
 
-// Packing exports
 export type {
   BufferedCommand,
   PackingStrategy,
@@ -68,18 +51,30 @@ export {
   calculatePayloadLength,
   createBufferedCommand,
   packCommands,
+  PackBufferPool,
   CommandPacker,
 } from './packing';
 
-// Eligibility exports
 export type {
   EligibilityResult,
   CommandRecord,
+  CommandRecordFetcher,
+  KeyPosition,
+  BlockingBehavior,
+  CommandAttrs,
+  CommandNode,
 } from './eligibility-types';
 
 export { EligibilityResolver } from './eligibility-resolver';
 
-// Client integration exports
+export {
+  STATIC_COMMAND_RECORDS,
+  STATIC_RESOLVER,
+  createMockRecordFetcher,
+  createDefaultResolver,
+  createDynamicResolver,
+} from './eligibility-static-data';
+
 export type {
   OutboundCodecOptions,
   InboundCodecOptions,

@@ -6,6 +6,7 @@ export interface Bitfield {
   readonly name: string;
   readonly bits: number;
   readonly mask: number;
+  readonly sinceVersion?: number;
 }
 
 export interface Validation {
@@ -20,6 +21,7 @@ export interface FixedField {
   readonly offset: number;
   readonly endian?: Endianness;
   readonly value: number;
+  readonly sinceVersion?: number;
 }
 
 export interface VariableField {
@@ -29,6 +31,8 @@ export interface VariableField {
   readonly offset: number;
   readonly endian?: Endianness;
   readonly validation?: Validation;
+  readonly nullValue?: number;
+  readonly sinceVersion?: number;
 }
 
 export interface BitfieldGroup {
@@ -36,21 +40,12 @@ export interface BitfieldGroup {
   readonly name: string;
   readonly offset: number;
   readonly fields: ReadonlyArray<Bitfield>;
+  readonly sinceVersion?: number;
 }
 
-export interface Padding {
-  readonly kind: 'padding';
-  readonly offset: number;
-  readonly size: number;
-}
+export type Field = FixedField | VariableField | BitfieldGroup;
 
-export type Field = FixedField | VariableField | BitfieldGroup | Padding;
 
-export interface Constant {
-  readonly name: string;
-  readonly value: number;
-  readonly description?: string;
-}
 
 export interface MessageSchema {
   readonly name: string;
@@ -63,21 +58,24 @@ export interface ProtocolSchema {
   readonly name: string;
   readonly version: number;
   readonly description?: string;
-  readonly constants: ReadonlyArray<Constant>;
   readonly messages: ReadonlyArray<MessageSchema>;
 }
 
-export function field(name: string, type: PrimitiveType, offset: number, options?: {
-  endian?: Endianness;
-  min?: number;
-  max?: number;
-}): VariableField {
-  const { endian, min, max } = options ?? {};
-  const validation = buildValidation(min, max);
-  return { kind: 'variable', name, type, offset, endian, validation };
+export interface FieldOptions {
+  readonly endian?: Endianness;
+  readonly min?: number;
+  readonly max?: number;
+  readonly nullValue?: number;
+  readonly sinceVersion?: number;
 }
 
-function buildValidation(min: number | undefined, max: number | undefined): { min?: number; max?: number } | undefined {
+export function field(name: string, type: PrimitiveType, offset: number, options?: FieldOptions): VariableField {
+  const { endian, min, max, nullValue, sinceVersion } = options ?? {};
+  const validation = buildValidation(min, max);
+  return { kind: 'variable', name, type, offset, endian, validation, nullValue, sinceVersion };
+}
+
+function buildValidation(min: number | undefined, max: number | undefined): Validation | undefined {
   if (min === undefined && max === undefined) return undefined;
   const result: { min?: number; max?: number } = {};
   if (min !== undefined) result.min = min;
@@ -85,23 +83,39 @@ function buildValidation(min: number | undefined, max: number | undefined): { mi
   return result;
 }
 
-export function fixed(name: string, type: PrimitiveType, offset: number, value: number, options?: {
-  endian?: Endianness;
-}): FixedField {
-  return { kind: 'fixed', name, type, offset, value, ...options };
+export interface FixedFieldOptions {
+  readonly endian?: Endianness;
+  readonly sinceVersion?: number;
 }
 
-export function bitfield(name: string, offset: number, fields: ReadonlyArray<Bitfield>): BitfieldGroup {
-  return { kind: 'bitfield', name, offset, fields };
+export function fixed(
+  name: string,
+  type: PrimitiveType,
+  offset: number,
+  value: number,
+  options?: FixedFieldOptions
+): FixedField {
+  const { endian, sinceVersion } = options ?? {};
+  return { kind: 'fixed', name, type, offset, value, endian, sinceVersion };
 }
 
-export function padding(offset: number, size: number): Padding {
-  return { kind: 'padding', offset, size };
+export interface BitfieldEntry {
+  readonly name: string;
+  readonly bits: number;
+  readonly mask: number;
+  readonly sinceVersion?: number;
 }
 
-export function constant(name: string, value: number, description?: string): Constant {
-  return { name, value, description };
+export function bitfield(
+  name: string,
+  offset: number,
+  fields: ReadonlyArray<BitfieldEntry>,
+  sinceVersion?: number
+): BitfieldGroup {
+  return { kind: 'bitfield', name, offset, fields, sinceVersion };
 }
+
+
 
 export function message(name: string, size: number, fields: ReadonlyArray<Field>, description?: string): MessageSchema {
   return { name, size, fields, description };
@@ -110,9 +124,8 @@ export function message(name: string, size: number, fields: ReadonlyArray<Field>
 export function protocol(
   name: string,
   version: number,
-  constants: ReadonlyArray<Constant>,
   messages: ReadonlyArray<MessageSchema>,
   description?: string
 ): ProtocolSchema {
-  return { name, version, constants, messages, description };
+  return { name, version, messages, description };
 }

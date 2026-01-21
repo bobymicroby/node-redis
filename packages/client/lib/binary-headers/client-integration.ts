@@ -5,16 +5,17 @@ import type {
   InboundInterceptor,
 } from '../client/commands-queue';
 import type { RedisArgument } from '../RESP/types';
-import { EligibilityResolver } from './eligibility-resolver';
-import { createDefaultResolver } from './eligibility-static-data';
+import { STATIC_RESOLVER } from './eligibility-static-data';
+import type { EligibilityResolver } from './eligibility-resolver';
+import { SLOT_INELIGIBLE } from './eligibility-resolver';
 import { createBinhdrInterceptor } from './interceptor';
 import {
   CommandPacker,
-  createBufferedCommand,
+  calculatePayloadLength,
   type Scheduler,
   type Cancellable,
 } from './packing';
-import type { ResponseHeader } from './generated/types';
+import type { ResponseHeader } from './generated/response-header-codec';
 
 export interface OutboundCodecOptions {
   readonly resolver?: EligibilityResolver | null;
@@ -76,27 +77,31 @@ export function createBinhdrOutboundInterceptor(
   return {
     process(command: OutboundCommand): OutboundCommand | null {
       const resolver = getResolver();
-      if (!resolver) {
+      if (resolver === null) {
         return command;
       }
 
-      const eligibility = resolver.getEligibility(command.args);
-      if (!eligibility.eligible) {
+      const slot = resolver.getSlot(command.args);
+      if (slot === SLOT_INELIGIBLE) {
         return command;
       }
 
-      const buffered = createBufferedCommand(command.args, command.encoded, eligibility);
       const wasEmpty = packer.bufferSize === 0;
-      const packed = packer.add(buffered);
+      const packed = packer.add({
+        command: command.args,
+        resp: command.encoded,
+        slot,
+        payloadLength: calculatePayloadLength(command.encoded),
+      });
 
       if (packed !== null) {
-        if (schedulerState) {
+        if (schedulerState !== undefined) {
           cancelPendingFlush(schedulerState);
         }
         return { args: command.args, encoded: packed };
       }
 
-      if (schedulerState && wasEmpty && packer.bufferSize > 0) {
+      if (schedulerState !== undefined && wasEmpty && packer.bufferSize > 0) {
         scheduleFlush(schedulerState, packer);
       }
 
@@ -104,7 +109,7 @@ export function createBinhdrOutboundInterceptor(
     },
 
     drain(): OutboundCommand | null {
-      if (schedulerState) {
+      if (schedulerState !== undefined) {
         cancelPendingFlush(schedulerState);
       }
 
@@ -121,22 +126,20 @@ export function createBinhdrInboundInterceptor(options: InboundCodecOptions = {}
   const { onProtocolError } = options;
 
   return createBinhdrInterceptor({
-    onProtocolError: onProtocolError
+    onProtocolError: onProtocolError !== undefined
       ? (header: ResponseHeader) => onProtocolError(header.requestId)
       : undefined,
   });
 }
 
 export function createBinhdrCodec(options: CodecOptions = {}): BinhdrCodec {
-  const { onProtocolError, timeBounded } = options;
+  const { onProtocolError, timeBounded, resolver: customResolver } = options;
 
-  let resolver: EligibilityResolver | null = null;
+  const resolver: EligibilityResolver | null = customResolver !== undefined
+    ? customResolver
+    : STATIC_RESOLVER;
 
-  createDefaultResolver()
-    .then((r) => { resolver = r; })
-    .catch(() => { /* resolver stays null, commands pass through */ });
-
-  const schedulerState: SchedulerState | undefined = timeBounded
+  const schedulerState: SchedulerState | undefined = timeBounded !== undefined
     ? {
         scheduler: timeBounded.scheduler,
         maxWaitMs: timeBounded.maxWaitMs,
@@ -145,7 +148,7 @@ export function createBinhdrCodec(options: CodecOptions = {}): BinhdrCodec {
       }
     : undefined;
 
-  const packer = new CommandPacker(timeBounded ? { maxWaitMs: timeBounded.maxWaitMs } : {});
+  const packer = new CommandPacker(timeBounded !== undefined ? { maxWaitMs: timeBounded.maxWaitMs } : {});
   const outbound = createBinhdrOutboundInterceptor(() => resolver, packer, schedulerState);
   const inbound = createBinhdrInboundInterceptor({ onProtocolError });
 
@@ -154,13 +157,13 @@ export function createBinhdrCodec(options: CodecOptions = {}): BinhdrCodec {
     inbound,
 
     setFlushSink(sink: FlushSink): void {
-      if (schedulerState) {
+      if (schedulerState !== undefined) {
         schedulerState.flushSink = sink;
       }
     },
 
     destroy(): void {
-      if (schedulerState) {
+      if (schedulerState !== undefined) {
         cancelPendingFlush(schedulerState);
         schedulerState.flushSink = null;
       }

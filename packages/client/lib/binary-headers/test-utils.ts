@@ -1,34 +1,15 @@
-import { BINHDR } from './generated/constants';
-import type { ResponseHeader as BinaryResponseHeader } from './generated/types';
-import { encodeResponseHeader } from './generated/encoder';
+import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import { Decoder } from '../RESP/decoder';
-
-/**
- * Creates a valid response header object for testing.
- */
-export function createResponseHeader(
-  length: number,
-  commandCount: number,
-  requestId: number,
-  protocolError: boolean = false
-): BinaryResponseHeader {
-  return {
-    designator: BINHDR.DESIGNATOR,
-    version: BINHDR.VERSION,
-    length,
-    commandCount,
-    protocolError,
-    requestId,
-  };
-}
 
 /**
  * Creates a complete binary header response buffer with RESP payload.
  */
 export function createBinhdrResponse(respPayload: string): Buffer {
   const payload = Buffer.from(respPayload);
-  const header = createResponseHeader(payload.length, 1, 0, false);
-  return Buffer.concat([encodeResponseHeader(header), payload]);
+  return Buffer.concat([
+    ResponseHeaderEncoder.allocateAndEncode(payload.length, 1, false, 0),
+    payload
+  ]);
 }
 
 /**
@@ -41,8 +22,10 @@ export function createBinhdrFrame(
   requestId: number = 0,
   protocolError: boolean = false
 ): Buffer {
-  const header = createResponseHeader(payload.length, commandCount, requestId, protocolError);
-  return Buffer.concat([encodeResponseHeader(header), payload]);
+  return Buffer.concat([
+    ResponseHeaderEncoder.allocateAndEncode(payload.length, commandCount, protocolError, requestId),
+    payload
+  ]);
 }
 
 /**

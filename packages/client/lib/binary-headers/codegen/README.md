@@ -1,25 +1,23 @@
 # Binary Headers Code Generator
 
-Schema-driven code generation for the binary headers wire protocol.
+Schema-driven code generation for the binary headers wire protocol, following SBE (Simple Binary Encoding) principles.
 
 ## Directory Structure
 
 ```
 binary-headers/
-├── schemas/              # Protocol definitions (like .proto files)
-│   ├── index.ts          # Re-exports all schemas
-│   ├── v0.ts             # v0 protocol schema
-│   └── v1.ts             # v1 protocol schema (current)
+├── schemas/              # Protocol definitions
+│   ├── v0.ts             # v0 protocol schema (0x80 format)
+│   └── v1.ts             # v1 protocol schema (0xAE format, current)
 ├── codegen/              # Generator code
 │   ├── generate.ts       # CLI entry point
-│   ├── generator.ts      # Code generation logic
+│   ├── flyweight-generator.ts  # SBE-style codec generation
 │   └── schema.ts         # Schema type definitions & DSL
 ├── generated/            # Generated output (.gitignore'd)
-│   ├── constants.ts
-│   ├── types.ts
-│   ├── encoder.ts
-│   └── decoder.ts
-└── ...                   # Application code
+│   ├── types.ts          # TypeScript interfaces
+│   ├── request-header-codec.ts   # Flyweight encoder/decoder
+│   └── response-header-codec.ts  # Flyweight encoder/decoder
+└── ...
 ```
 
 ## Quick Start
@@ -30,24 +28,15 @@ npm run generate:binhdr --workspace=@redis/client
 
 # Generate from a specific schema file
 npx tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v1.ts
-npx tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v0.ts
-
-# Generate from a custom schema
-npx tsx lib/binary-headers/codegen/generate.ts /path/to/my-schema.ts
 ```
 
 ## Generated Files
 
-The generator produces four files in `binary-headers/generated/`:
-
 | File | Description |
 |------|-------------|
-| `constants.ts` | Protocol constants (designator, sizes, limits) |
 | `types.ts` | TypeScript interfaces for headers |
-| `encoder.ts` | `createXxxHeader()` and `encodeXxxHeader()` functions |
-| `decoder.ts` | `parseXxxHeader()` functions |
-
-**Note:** Generated files are `.gitignore`'d and regenerated automatically via `prebuild` and `pretest` npm scripts.
+| `request-header-codec.ts` | `RequestHeaderEncoder` and `RequestHeaderDecoder` classes |
+| `response-header-codec.ts` | `ResponseHeaderEncoder` and `ResponseHeaderDecoder` classes |
 
 ## Protocol Versions
 
@@ -87,110 +76,80 @@ Response (16 bytes):
 └──────────┴─────────┴──────────┴────────┴───────┴───────────┴──────────┘
 ```
 
-## Defining a New Protocol Version
-
-1. Create a new schema file `schemas/v2.ts`:
+## Defining a Schema
 
 ```typescript
-import {
-  protocol,
-  message,
-  constant,
-  fixed,
-  field,
-  bitfield,
-  padding,
-} from '../codegen/schema';
+import { protocol, message, fixed, field, bitfield } from '../codegen/schema';
 
-export const BinaryHeadersProtocolV2 = protocol(
+export const BinaryHeadersProtocolV1 = protocol(
   'BinaryHeaders',
-  2,  // version number
+  1,
+  [], // constants array (typically empty - derived from fields)
   [
-    // Constants
-    constant('DESIGNATOR', 0xAE, 'Magic byte'),
-    constant('VERSION', 0x02, 'Protocol version'),
-    constant('REQUEST_HEADER_SIZE', 20, 'Request header size'),
-    // ... more constants
-  ],
-  [
-    // Messages
-    message('RequestHeader', 20, [
+    message('RequestHeader', 16, [
       fixed('designator', 'uint8', 0, 0xAE),
-      fixed('version', 'uint8', 1, 0x02),
-      field('slot', 'uint16', 2, { endian: 'big', min: 0, max: 0x3FFF }),
-      // ... more fields
+      fixed('version', 'uint8', 1, 0x01),
+      field('slot', 'uint16', 2, { endian: 'big', min: 0, max: 0x3FFF, nullValue: 0xFFFF }),
+      field('length', 'uint32', 4, { endian: 'big' }),
+      field('commandCount', 'uint8', 8, { min: 1, max: 0x7F }),
+      field('requestId', 'uint32', 9, { endian: 'big' }),
     ], 'Request header description'),
 
-    message('ResponseHeader', 20, [
-      // ... fields
+    message('ResponseHeader', 16, [
+      fixed('designator', 'uint8', 0, 0xAE),
+      fixed('version', 'uint8', 1, 0x01),
+      field('length', 'uint32', 4, { endian: 'big' }),
+      bitfield('flags', 8, [
+        { name: 'commandCount', bits: 7, mask: 0x7F },
+        { name: 'protocolError', bits: 1, mask: 0x80 },
+      ]),
+      field('requestId', 'uint32', 9, { endian: 'big' }),
     ], 'Response header description'),
   ],
   'Protocol description'
 );
 ```
 
-2. Generate:
-
-```bash
-npx tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v2.ts
-```
-
-3. Optionally, export it from `schemas/index.ts` for programmatic access:
-
-```typescript
-export { BinaryHeadersProtocolV0 } from './v0';
-export { BinaryHeadersProtocolV1 } from './v1';
-export { BinaryHeadersProtocolV2 } from './v2';
-
-// Update default to latest
-export { BinaryHeadersProtocolV2 as BinaryHeadersProtocol } from './v2';
-```
-
-4. Update the npm script in `package.json` if this becomes the default:
-
-```json
-{
-  "scripts": {
-    "generate:binhdr": "tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v2.ts"
-  }
-}
-```
-
 ## Schema DSL Reference
 
 ### Field Types
 
-| Type | Size | Description |
-|------|------|-------------|
-| `uint8` | 1 byte | Unsigned 8-bit integer |
-| `uint16` | 2 bytes | Unsigned 16-bit integer |
-| `uint32` | 4 bytes | Unsigned 32-bit integer |
-| `int8` | 1 byte | Signed 8-bit integer |
-| `int16` | 2 bytes | Signed 16-bit integer |
-| `int32` | 4 bytes | Signed 32-bit integer |
+| Type | Size |
+|------|------|
+| `uint8` | 1 byte |
+| `uint16` | 2 bytes |
+| `uint32` | 4 bytes |
+| `int8` | 1 byte |
+| `int16` | 2 bytes |
+| `int32` | 4 bytes |
 
 ### Field Kinds
 
 #### `fixed(name, type, offset, value, options?)`
+
 A field with a constant value (e.g., magic byte, version).
 
 ```typescript
 fixed('designator', 'uint8', 0, 0xAE)
+fixed('version', 'uint8', 1, 0x01, { sinceVersion: 0 })
 ```
 
 #### `field(name, type, offset, options?)`
-A variable field with optional validation.
+
+A variable field with optional constraints.
 
 ```typescript
-field('slot', 'uint16', 2, { endian: 'big', min: 0, max: 0x3FFF })
+field('slot', 'uint16', 2, { endian: 'big', min: 0, max: 0x3FFF, nullValue: 0xFFFF })
 ```
 
 Options:
-- `endian`: `'big'` or `'little'` (default: `'big'`)
-- `min`: Minimum value (generates validation)
-- `max`: Maximum value (generates validation)
+- `endian`: `'big'` or `'little'`
+- `min`, `max`: Value constraints (exposed as static methods)
+- `nullValue`: Sentinel value for "no value"
+- `sinceVersion`: Schema version when field was added
 
-#### `bitfield(name, offset, fields)`
+#### `bitfield(name, offset, fields, sinceVersion?)`
+
 Multiple values packed into a single byte.
 
 ```typescript
@@ -200,48 +159,57 @@ bitfield('flags', 8, [
 ])
 ```
 
-#### `padding(offset, size)`
-Reserved bytes filled with zeros.
-
-```typescript
-padding(13, 3)  // 3 bytes of padding at offset 13
-```
-
-### Constants
-
-```typescript
-constant('MAX_PAYLOAD_LENGTH', 0xFFFFFFFF, 'Maximum payload size')
-```
-
-## Generated API
+## Generated API (SBE-style Flyweight)
 
 ### Encoder
 
 ```typescript
-// Create with validation
-const result = createRequestHeader(slot, length, commandCount, requestId);
-if (result.success) {
-  const header = result.header;
-}
+// Static one-shot encoding
+const buffer = RequestHeaderEncoder.allocateAndEncode(slot, length, commandCount, requestId);
 
-// Encode to new buffer
-const buffer = encodeRequestHeader(header);
+// Encode into existing buffer
+RequestHeaderEncoder.encodeInto(buffer, offset, slot, length, commandCount, requestId);
 
-// Encode into existing buffer at offset
-const result = encodeRequestHeaderInto(header, buffer, offset);
+// Flyweight instance (reusable, zero-allocation per encode)
+const encoder = new RequestHeaderEncoder();
+encoder.wrapAndWrite(buffer, 0)
+  .slot(1234)
+  .length(100)
+  .commandCount(5)
+  .requestId(42);
+
+// Static metadata
+RequestHeaderEncoder.ENCODED_LENGTH;        // 16
+RequestHeaderEncoder.slotEncodingOffset();  // 2
+RequestHeaderEncoder.slotMaxValue();        // 0x3FFF
+RequestHeaderEncoder.slotNullValue();       // 0xFFFF
 ```
 
 ### Decoder
 
 ```typescript
-// Parse from buffer
-const result = parseRequestHeader(buffer, offset);
-if (result.success) {
-  const { header, bytesConsumed } = result;
+// Flyweight instance (reusable)
+const decoder = new RequestHeaderDecoder();
+decoder.wrap(buffer, 0);
+
+if (decoder.isValid()) {
+  const slot = decoder.slot();
+  const length = decoder.length();
+  const commandCount = decoder.commandCount();
+  const requestId = decoder.requestId();
 }
 
-// Check designator
-if (isBinaryHeaderDesignator(buffer[0])) {
+// Static helpers
+RequestHeaderDecoder.startsWithBinaryHeader(buffer);
+RequestHeaderDecoder.peekDesignator(buffer);
+```
+
+### Utility Functions
+
+```typescript
+import { isRequestHeaderDesignator, isResponseHeaderDesignator } from './generated/...';
+
+if (isRequestHeaderDesignator(buffer[0])) {
   // Has binary header
 }
 ```
