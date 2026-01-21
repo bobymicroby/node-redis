@@ -3,6 +3,10 @@ import type { EligibilityResult } from './eligibility-types';
 import { BINHDR } from './generated/constants';
 import { createRequestHeader, encodeRequestHeader } from './generated/encoder';
 
+/**
+ * Represents a single command ready for packing.
+ * Contains both the original command and its RESP-encoded form.
+ */
 export interface BufferedCommand {
   readonly command: ReadonlyArray<RedisArgument>;
   readonly resp: ReadonlyArray<RedisArgument>;
@@ -11,30 +15,55 @@ export interface BufferedCommand {
 }
 
 /**
- * Decides whether a command can be added to the current pack.
- * Called only when the buffer is non-empty (first command always buffers).
- * Returning false triggers a flush before adding the incoming command.
+ * Represents the accumulated state of commands currently buffered in a pack.
+ * This is separate from individual commands - it tracks totals across all buffered commands.
  */
-export interface PackingStrategy {
-  canAdd(
-    count: number,
-    slot: number,
-    payloadLength: number,
-    incoming: BufferedCommand
-  ): boolean;
+export interface PackState {
+  /** Number of commands currently in the pack */
+  readonly commandCount: number;
+  /** The resolved slot for the pack (first non-NO_SLOT seen, or NO_SLOT if all commands are slotless) */
+  readonly resolvedSlot: number;
+  /** Total payload length in bytes of all commands in the pack */
+  readonly totalPayloadLength: number;
 }
 
+/**
+ * Strategy interface for deciding when to flush a pack and start a new one.
+ *
+ * Called only when the buffer already contains at least one command.
+ * The first command always goes into an empty buffer without consulting the strategy.
+ */
+export interface PackingStrategy {
+  /**
+   * Determines whether an incoming command can be added to the current pack.
+   *
+   * @param currentPack - The accumulated state of commands already in the pack
+   * @param incoming - The command being considered for addition
+   * @returns true if the command fits in the current pack, false to trigger a flush first
+   */
+  canAdd(currentPack: PackState, incoming: BufferedCommand): boolean;
+}
+
+/**
+ * Creates the default packing strategy that enforces binary header protocol limits:
+ * - Maximum commands per pack (127)
+ * - Slot compatibility (all keyed commands must target the same slot)
+ * - Maximum payload length
+ */
 export function createDefaultPackingStrategy(): PackingStrategy {
   return {
-    canAdd(count, slot, payloadLength, incoming) {
-      if (count >= BINHDR.MAX_COMMANDS_PER_PACK) return false;
-      if (!areSlotsCompatible(slot, incoming.slot)) return false;
-      if (payloadLength + incoming.payloadLength > BINHDR.MAX_PAYLOAD_LENGTH) return false;
+    canAdd(currentPack: PackState, incoming: BufferedCommand): boolean {
+      if (currentPack.commandCount >= BINHDR.MAX_COMMANDS_PER_PACK) return false;
+      if (!areSlotsCompatible(currentPack.resolvedSlot, incoming.slot)) return false;
+      if (currentPack.totalPayloadLength + incoming.payloadLength > BINHDR.MAX_PAYLOAD_LENGTH) return false;
       return true;
     }
   };
 }
 
+/**
+ * Calculates the byte length of a RESP-encoded command.
+ */
 export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): number {
   let length = 0;
   for (let i = 0; i < resp.length; i++) {
@@ -44,11 +73,18 @@ export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): numb
   return length;
 }
 
+/**
+ * Checks if two slots can coexist in the same pack.
+ * NO_SLOT is compatible with any slot (slotless commands can be packed with keyed commands).
+ */
 function areSlotsCompatible(slotA: number, slotB: number): boolean {
   if (slotA === BINHDR.SLOT_NO_SLOT || slotB === BINHDR.SLOT_NO_SLOT) return true;
   return slotA === slotB;
 }
 
+/**
+ * Creates a BufferedCommand from raw command data and eligibility result.
+ */
 export function createBufferedCommand(
   command: ReadonlyArray<RedisArgument>,
   resp: ReadonlyArray<RedisArgument>,
@@ -62,11 +98,22 @@ export function createBufferedCommand(
   };
 }
 
-/** Converts SLOT_NO_SLOT sentinel to wire-valid slot value (0) */
+/**
+ * Converts SLOT_NO_SLOT sentinel to wire-valid slot value (0).
+ */
 function toWireSlot(slot: number): number {
   return slot === BINHDR.SLOT_NO_SLOT ? 0 : slot;
 }
 
+/**
+ * Packs multiple buffered commands into a single binary header frame.
+ *
+ * @param buffer - Commands to pack
+ * @param slot - Resolved slot for the pack
+ * @param totalPayload - Pre-calculated total payload length
+ * @param requestId - Correlation ID for request-response tracking
+ * @returns Packed frame as array of arguments, or null if buffer is empty or header creation fails
+ */
 export function packCommands(
   buffer: ReadonlyArray<BufferedCommand>,
   slot: number,
@@ -110,17 +157,22 @@ export function packCommands(
 export class CommandPacker {
   readonly #strategy: PackingStrategy;
   readonly #buffer: BufferedCommand[] = [];
-  #slot: number = BINHDR.SLOT_NO_SLOT;
-  #payloadLength: number = 0;
+  #resolvedSlot: number = BINHDR.SLOT_NO_SLOT;
+  #totalPayloadLength: number = 0;
 
   constructor(strategy: PackingStrategy = createDefaultPackingStrategy()) {
     this.#strategy = strategy;
   }
 
+  /**
+   * Attempts to add a command to the current pack.
+   *
+   * @returns Packed frame if the command triggered a flush, null otherwise
+   */
   add(command: BufferedCommand): ReadonlyArray<RedisArgument> | null {
-    const count = this.#buffer.length;
+    const currentPack = this.#getCurrentPackState();
 
-    if (count > 0 && !this.#strategy.canAdd(count, this.#slot, this.#payloadLength, command)) {
+    if (currentPack.commandCount > 0 && !this.#strategy.canAdd(currentPack, command)) {
       const packed = this.#flush();
       this.#push(command);
       return packed;
@@ -130,23 +182,42 @@ export class CommandPacker {
     return null;
   }
 
-  /** Updates buffer and running state. First keyed command determines the pack's slot. */
+  /**
+   * Returns a snapshot of the current pack's accumulated state.
+   */
+  #getCurrentPackState(): PackState {
+    return {
+      commandCount: this.#buffer.length,
+      resolvedSlot: this.#resolvedSlot,
+      totalPayloadLength: this.#totalPayloadLength,
+    };
+  }
+
+  /**
+   * Adds a command to the buffer and updates accumulated state.
+   * First keyed command determines the pack's slot.
+   */
   #push(command: BufferedCommand): void {
     this.#buffer.push(command);
-    this.#payloadLength += command.payloadLength;
+    this.#totalPayloadLength += command.payloadLength;
     if (command.slot !== BINHDR.SLOT_NO_SLOT) {
-      this.#slot = command.slot;
+      this.#resolvedSlot = command.slot;
     }
   }
 
   #flush(): ReadonlyArray<RedisArgument> | null {
-    const packed = packCommands(this.#buffer, this.#slot, this.#payloadLength);
+    const packed = packCommands(this.#buffer, this.#resolvedSlot, this.#totalPayloadLength);
     this.#buffer.length = 0;
-    this.#slot = BINHDR.SLOT_NO_SLOT;
-    this.#payloadLength = 0;
+    this.#resolvedSlot = BINHDR.SLOT_NO_SLOT;
+    this.#totalPayloadLength = 0;
     return packed;
   }
 
+  /**
+   * Flushes any remaining buffered commands.
+   *
+   * @returns Packed frame if there were buffered commands, null otherwise
+   */
   drain(): ReadonlyArray<RedisArgument> | null {
     if (this.#buffer.length === 0) return null;
     return this.#flush();

@@ -54,6 +54,7 @@ export {
 export type {
   BufferedCommand,
   PackingStrategy,
+  PackState,
 } from './packing';
 
 export {
