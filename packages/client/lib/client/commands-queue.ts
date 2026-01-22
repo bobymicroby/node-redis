@@ -59,51 +59,19 @@ const RESP2_PUSH_TYPE_MAPPING = {
 // succeed.
 type PushHandler = (pushItems: Array<any>) => boolean;
 
-/**
- * Represents a command flowing through the outbound pipeline.
- */
 export interface OutboundCommand {
-  /** Original command arguments (for inspection/eligibility checks) */
   readonly args: ReadonlyArray<RedisArgument>;
-  /** RESP-encoded payload ready for wire transmission */
   readonly encoded: ReadonlyArray<RedisArgument>;
 }
 
-/**
- * Intercepts outbound commands before they are sent to the server.
- *
- * Interceptors can transform commands or buffer them for batching.
- * For non-buffering interceptors, `process` should always return a command
- * and `drain` should always return `null`.
- */
 export interface OutboundInterceptor {
-  /**
-   * Process a command before sending.
-   * @param command - The command to process
-   * @returns The transformed command, or `null` if buffered for later batching
-   */
   readonly process: (command: OutboundCommand) => OutboundCommand | null;
-
-  /**
-   * Drain any buffered commands.
-   * Called at the end of a write batch to flush remaining buffered commands.
-   * @returns Buffered command(s) packed together, or `null` if nothing buffered
-   */
   readonly drain: () => OutboundCommand | null;
 }
 
 export type InboundNext = (chunk: Buffer) => void;
-
-/**
- * Intercepts inbound data from the server before it reaches the decoder.
- * Uses callback-based `next` for streaming support (can emit multiple chunks).
- */
 export type InboundInterceptor = (chunk: Buffer, next: InboundNext) => void;
 
-/**
- * Codec for transforming commands and data on the wire.
- * Allows plugging in binary headers or other wire-level transformations.
- */
 export interface CommandCodec {
   readonly outbound: OutboundInterceptor;
   readonly inbound: InboundInterceptor;
@@ -114,13 +82,12 @@ export interface CommandCodec {
 export default class RedisCommandsQueue {
   readonly #respVersion;
   readonly #maxLength;
-  readonly #toWrite = new DoublyLinkedList<CommandToWrite>();
-  readonly #waitingForReply = new EmptyAwareSinglyLinkedList<CommandWaitingForReply>();
+  protected readonly toWrite = new DoublyLinkedList<CommandToWrite>();
+  protected readonly waitingForReply = new EmptyAwareSinglyLinkedList<CommandWaitingForReply>();
   readonly #onShardedChannelMoved;
-  #chainInExecution: symbol | undefined;
+  protected chainInExecution: symbol | undefined;
   readonly decoder;
   readonly #pubSub = new PubSub();
-  readonly #codec: CommandCodec | undefined;
 
   #pushHandlers: PushHandler[] = [this.#onPush.bind(this)];
 
@@ -142,10 +109,10 @@ export default class RedisCommandsQueue {
     }
 
     let counter = 0;
-    const total = this.#toWrite.length;
+    const total = this.toWrite.length;
 
     // Overwrite timeouts of all eligible toWrite commands
-    for(const node of this.#toWrite.nodes()) {
+    for(const node of this.toWrite.nodes()) {
       const command = node.value;
 
       // Remove timeout listener if it exists
@@ -159,7 +126,7 @@ export default class RedisCommandsQueue {
       command.timeout = {
         signal,
         listener: () => {
-          this.#toWrite.remove(node);
+          this.toWrite.remove(node);
           command.reject(new CommandTimeoutDuringMaintenanceError(newTimeout));
         },
         originalTimeout: command.timeout?.originalTimeout
@@ -176,22 +143,20 @@ export default class RedisCommandsQueue {
   constructor(
     respVersion: RespVersions,
     maxLength: number | null | undefined,
-    onShardedChannelMoved: OnShardedChannelMoved,
-    codec?: CommandCodec
+    onShardedChannelMoved: OnShardedChannelMoved
   ) {
     this.#respVersion = respVersion;
     this.#maxLength = maxLength;
     this.#onShardedChannelMoved = onShardedChannelMoved;
-    this.#codec = codec;
     this.decoder = this.#initiateDecoder();
   }
 
   #onReply(reply: ReplyUnion) {
-    this.#waitingForReply.shift()!.resolve(reply);
+    this.waitingForReply.shift()!.resolve(reply);
   }
 
   #onErrorReply(err: ErrorReply) {
-    this.#waitingForReply.shift()!.reject(err);
+    this.waitingForReply.shift()!.reject(err);
   }
 
   #onPush(push: Array<any>) {
@@ -199,7 +164,7 @@ export default class RedisCommandsQueue {
     if (this.#pubSub.handleMessageReply(push)) return true;
 
     const isShardedUnsubscribe = PubSub.isShardedUnsubscribe(push);
-    if (isShardedUnsubscribe && !this.#waitingForReply.length) {
+    if (isShardedUnsubscribe && !this.waitingForReply.length) {
       const channel = push[1].toString();
       this.#onShardedChannelMoved(
         channel,
@@ -207,12 +172,12 @@ export default class RedisCommandsQueue {
       );
       return true;
     } else if (isShardedUnsubscribe || PubSub.isStatusReply(push)) {
-      const head = this.#waitingForReply.head!.value;
+      const head = this.waitingForReply.head!.value;
       if (
         (Number.isNaN(head.channelsCounter!) && push[2] === 0) ||
         --head.channelsCounter! === 0
       ) {
-        this.#waitingForReply.shift()!.resolve();
+        this.waitingForReply.shift()!.resolve();
       }
       return true;
     }
@@ -220,7 +185,7 @@ export default class RedisCommandsQueue {
   }
 
   #getTypeMapping() {
-    return this.#waitingForReply.head!.value.typeMapping ?? {};
+    return this.waitingForReply.head!.value.typeMapping ?? {};
   }
 
   #initiateDecoder() {
@@ -243,20 +208,20 @@ export default class RedisCommandsQueue {
 
   async waitForInflightCommandsToComplete(): Promise<void> {
     // In-flight commands already completed
-    if(this.#waitingForReply.length === 0) {
+    if(this.waitingForReply.length === 0) {
       return
     };
     // Otherwise wait for in-flight commands to fire `empty` event
     return new Promise(resolve => {
-      this.#waitingForReply.events.on('empty', resolve)
+      this.waitingForReply.events.once('empty', resolve);
     });
   }
 
   addCommand<T>(
     args: ReadonlyArray<RedisArgument>,
-    options?: CommandOptions
+    options?: CommandOptions,
   ): Promise<T> {
-    if (this.#maxLength && this.#toWrite.length + this.#waitingForReply.length >= this.#maxLength) {
+    if (this.#maxLength && this.toWrite.length + this.waitingForReply.length >= this.#maxLength) {
       return Promise.reject(new Error('The queue is full'));
     } else if (options?.abortSignal?.aborted) {
       return Promise.reject(new AbortError());
@@ -285,7 +250,7 @@ export default class RedisCommandsQueue {
         value.timeout = {
           signal,
           listener: () => {
-            this.#toWrite.remove(node);
+            this.toWrite.remove(node);
             value.reject(wasInMaintenance ? new CommandTimeoutDuringMaintenanceError(timeout) : new TimeoutError());
           },
           originalTimeout: options?.timeout
@@ -298,20 +263,20 @@ export default class RedisCommandsQueue {
         value.abort = {
           signal,
           listener: () => {
-            this.#toWrite.remove(node);
+            this.toWrite.remove(node);
             value.reject(new AbortError());
           }
         };
         signal.addEventListener('abort', value.abort.listener, { once: true });
       }
 
-      node = this.#toWrite.add(value, options?.asap);
+      node = this.toWrite.add(value, options?.asap);
     });
   }
 
   #addPubSubCommand(command: PubSubCommand, asap = false, chainId?: symbol) {
     return new Promise<void>((resolve, reject) => {
-      this.#toWrite.add({
+      this.toWrite.add({
         args: command.args,
         chainId,
         abort: undefined,
@@ -339,7 +304,7 @@ export default class RedisCommandsQueue {
         if (this.#onPush(reply)) return;
 
         if (PONG.equals(reply[0] as Buffer)) {
-          const { resolve, typeMapping } = this.#waitingForReply.shift()!,
+          const { resolve, typeMapping } = this.waitingForReply.shift()!,
             buffer = ((reply[1] as Buffer).length === 0 ? reply[0] : reply[1]) as Buffer;
           resolve(typeMapping?.[RESP_TYPES.SIMPLE_STRING] === Buffer ? buffer : buffer.toString());
           return;
@@ -434,7 +399,7 @@ export default class RedisCommandsQueue {
   monitor(callback: MonitorCallback, options?: CommandOptions) {
     return new Promise<void>((resolve, reject) => {
       const typeMapping = options?.typeMapping ?? {};
-      this.#toWrite.add({
+      this.toWrite.add({
         args: ['MONITOR'],
         chainId: options?.chainId,
         abort: undefined,
@@ -481,14 +446,14 @@ export default class RedisCommandsQueue {
           this.#resetFallbackOnReply = undefined;
           this.#pubSub.reset();
 
-          this.#waitingForReply.shift()!.resolve(reply);
+          this.waitingForReply.shift()!.resolve(reply);
           return;
         }
 
         this.#resetFallbackOnReply!(reply);
       }) as Decoder['onReply'];
 
-      this.#toWrite.push({
+      this.toWrite.push({
         args: ['RESET'],
         chainId,
         abort: undefined,
@@ -502,12 +467,11 @@ export default class RedisCommandsQueue {
   }
 
   isWaitingToWrite() {
-    return this.#toWrite.length > 0;
+    return this.toWrite.length > 0;
   }
 
   *commandsToWrite(): Generator<ReadonlyArray<RedisArgument>> {
-    const codec = this.#codec;
-    let toSend = this.#toWrite.shift();
+    let toSend = this.toWrite.shift();
 
     while (toSend) {
       const args = toSend.args;
@@ -516,7 +480,7 @@ export default class RedisCommandsQueue {
         encoded = encodeCommand(args);
       } catch (err) {
         toSend.reject(err);
-        toSend = this.#toWrite.shift();
+        toSend = this.toWrite.shift();
         continue;
       }
 
@@ -529,44 +493,44 @@ export default class RedisCommandsQueue {
         RedisCommandsQueue.#removeTimeoutListener(toSend);
         toSend.timeout = undefined;
       }
-      this.#chainInExecution = toSend.chainId;
+      this.chainInExecution = toSend.chainId;
       toSend.chainId = undefined;
-      this.#waitingForReply.push(toSend);
+      this.waitingForReply.push(toSend);
 
-      if (codec === undefined) {
-        yield encoded;
-      } else {
-        const result = codec.outbound.process({ args, encoded });
-        if (result !== null) {
-          yield result.encoded;
-        }
+      const result = this.transformOutbound(encoded, args);
+      if (result !== null) {
+        yield result;
       }
 
-      toSend = this.#toWrite.shift();
+      toSend = this.toWrite.shift();
     }
 
-    if (codec !== undefined) {
-      const drained = codec.outbound.drain();
-      if (drained !== null) {
-        yield drained.encoded;
-      }
+    const drained = this.drainOutbound();
+    if (drained !== null) {
+      yield drained;
     }
+  }
+
+  protected transformOutbound(
+    encoded: ReadonlyArray<RedisArgument>,
+    _args: ReadonlyArray<RedisArgument>
+  ): ReadonlyArray<RedisArgument> | null {
+    return encoded;
+  }
+
+  protected drainOutbound(): ReadonlyArray<RedisArgument> | null {
+    return null;
   }
 
   processIncomingData(chunk: Buffer): void {
-    const codec = this.#codec;
-    if (codec === undefined) {
-      this.decoder.write(chunk);
-    } else {
-      codec.inbound(chunk, data => this.decoder.write(data));
-    }
+    this.decoder.write(chunk);
   }
 
   #flushWaitingForReply(err: Error): void {
-    for (const node of this.#waitingForReply) {
+    for (const node of this.waitingForReply) {
       node.reject(err);
     }
-    this.#waitingForReply.reset();
+    this.waitingForReply.reset();
   }
 
   static #removeAbortListener(command: CommandToWrite) {
@@ -594,32 +558,32 @@ export default class RedisCommandsQueue {
 
     this.#flushWaitingForReply(err);
 
-    if (!this.#chainInExecution) return;
+    if (!this.chainInExecution) return;
 
-    while (this.#toWrite.head?.value.chainId === this.#chainInExecution) {
+    while (this.toWrite.head?.value.chainId === this.chainInExecution) {
       RedisCommandsQueue.#flushToWrite(
-        this.#toWrite.shift()!,
+        this.toWrite.shift()!,
         err
       );
     }
 
-    this.#chainInExecution = undefined;
+    this.chainInExecution = undefined;
   }
 
   flushAll(err: Error): void {
     this.resetDecoder();
     this.#pubSub.reset();
     this.#flushWaitingForReply(err);
-    for (const node of this.#toWrite) {
+    for (const node of this.toWrite) {
       RedisCommandsQueue.#flushToWrite(node, err);
     }
-    this.#toWrite.reset();
+    this.toWrite.reset();
   }
 
   isEmpty() {
     return (
-      this.#toWrite.length === 0 &&
-      this.#waitingForReply.length === 0
+      this.toWrite.length === 0 &&
+      this.waitingForReply.length === 0
     );
   }
 }

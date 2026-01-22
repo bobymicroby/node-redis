@@ -6,10 +6,13 @@ import {
   passthroughOutbound,
   chainInbound,
 } from './interceptor';
-import type { InboundInterceptor, OutboundCommand, CommandCodec } from '../client/commands-queue';
+import type { InboundInterceptor, OutboundCommand } from '../client/commands-queue';
 import RedisCommandsQueue from '../client/commands-queue';
+import BinhdrCommandsQueue from './binhdr-commands-queue';
 import { ResponseHeaderEncoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
+import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { createBinhdrFrame, parseRespCommands } from './test-utils';
+import { STATIC_RESOLVER } from './eligibility-static-data';
 
 function collect(interceptor: InboundInterceptor, data: Buffer): Buffer[] {
   const received: Buffer[] = [];
@@ -265,8 +268,12 @@ describe('Binary Headers Interceptor', function () {
   });
 
   describe('Queue + Codec Integration', function () {
-    function createQueue(codec?: CommandCodec): RedisCommandsQueue {
-      return new RedisCommandsQueue(2, null, () => {}, codec);
+    function createQueue(): RedisCommandsQueue {
+      return new RedisCommandsQueue(2, null, () => {});
+    }
+
+    function createQueueWithBinhdr(useStaticResolver: boolean): BinhdrCommandsQueue {
+      return new BinhdrCommandsQueue(2, null, () => {}, useStaticResolver ? { resolver: STATIC_RESOLVER } : {});
     }
 
     function collectYielded(queue: RedisCommandsQueue): unknown[][] {
@@ -293,53 +300,41 @@ describe('Binary Headers Interceptor', function () {
       }
     });
 
-    describe('queue with passthrough codec', function () {
-      it('yields encoded command unchanged', function () {
-        const codec: CommandCodec = { outbound: passthroughOutbound(), inbound: passthroughInbound() };
-        const queue = createQueue(codec);
-        queue.addCommand(['PING']);
-        assert.deepEqual(collectYielded(queue), [[['PING']]]);
-      });
-    });
-
-    describe('queue with buffering codec', function () {
-      function createBufferingCodec(maxBuffer: number): CommandCodec {
-        const buffer: OutboundCommand[] = [];
-        return {
-          outbound: {
-            process(command) {
-              buffer.push(command);
-              if (buffer.length >= maxBuffer) {
-                const result = { args: buffer.flatMap((c) => c.args), encoded: buffer.flatMap((c) => c.encoded) };
-                buffer.length = 0;
-                return result;
-              }
-              return null;
-            },
-            drain() {
-              if (buffer.length === 0) return null;
-              const result = { args: buffer.flatMap((c) => c.args), encoded: buffer.flatMap((c) => c.encoded) };
-              buffer.length = 0;
-              return result;
-            },
-          },
-          inbound: passthroughInbound(),
-        };
-      }
-
-      const bufferingCases = [
-        { name: 'buffers and drains at end', maxBuffer: 10, commands: [['A'], ['B']], expected: [[['A'], ['B']]] },
-        { name: 'flushes when full', maxBuffer: 2, commands: [['A'], ['B'], ['C']], expected: [[['A'], ['B']], [['C']]] },
-        { name: 'empty buffer', maxBuffer: 10, commands: [], expected: [] },
-        { name: 'exact boundary', maxBuffer: 3, commands: [['A'], ['B'], ['C']], expected: [[['A'], ['B'], ['C']]] },
-        { name: 'multiple batches', maxBuffer: 2, commands: [['A'], ['B'], ['C'], ['D'], ['E']], expected: [[['A'], ['B']], [['C'], ['D']], [['E']]] },
+    describe('queue with binhdr codec (passthrough resolver)', function () {
+      const passthroughCases = [
+        { name: 'single command', commands: [['PING']], expected: [[['PING']]] },
+        { name: 'multiple commands', commands: [['SET', 'a', '1'], ['GET', 'a']], expected: [[['SET', 'a', '1']], [['GET', 'a']]] },
       ];
 
-      for (const { name, maxBuffer, commands, expected } of bufferingCases) {
+      for (const { name, commands, expected } of passthroughCases) {
         it(name, function () {
-          const queue = createQueue(createBufferingCodec(maxBuffer));
+          const queue = createQueueWithBinhdr(false);
           commands.forEach((cmd) => queue.addCommand(cmd));
           assert.deepEqual(collectYielded(queue), expected);
+        });
+      }
+    });
+
+    describe('queue with binhdr codec (default resolver)', function () {
+      const binhdrCases = [
+        { name: 'single command', commands: [['PING']], expectedYields: 1, expectedCommandCount: 1 },
+        { name: 'multiple commands batched', commands: [['PING'], ['PING'], ['PING']], expectedYields: 1, expectedCommandCount: 3 },
+      ];
+
+      for (const { name, commands, expectedYields, expectedCommandCount } of binhdrCases) {
+        it(name, function () {
+          const queue = createQueueWithBinhdr(true);
+          commands.forEach((cmd) => queue.addCommand(cmd));
+
+          const results: ReadonlyArray<unknown>[] = [];
+          for (const encoded of queue.commandsToWrite()) {
+            results.push(encoded);
+          }
+
+          assert.equal(results.length, expectedYields);
+          const decoder = new RequestHeaderDecoder().wrap(results[0][0] as Buffer, 0);
+          assert.ok(decoder.isValid());
+          assert.equal(decoder.commandCount(), expectedCommandCount);
         });
       }
     });

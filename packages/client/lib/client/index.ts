@@ -2,7 +2,8 @@ import COMMANDS from '../commands';
 import RedisSocket, { RedisSocketOptions } from './socket';
 import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
 import RedisCommandsQueue, { CommandOptions } from './commands-queue';
-import { createBinhdrCodec } from '../binary-headers/client-integration';
+import BinhdrCommandsQueue from '../binary-headers/binhdr-commands-queue';
+import { STATIC_RESOLVER } from '../binary-headers/eligibility-static-data';
 import { EventEmitter } from 'node:events';
 import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';
 import { ClientClosedError, ClientOfflineError, DisconnectsClientError, WatchError } from '../errors';
@@ -516,6 +517,7 @@ export default class RedisClient<
     this.#options = this.#initiateOptions(options);
     this.#queue = this.#initiateQueue();
     this.#socket = this.#initiateSocket();
+    this.#setupBinhdrFlushCallback();
 
 
     if(this.#options.maintNotifications !== 'disabled') {
@@ -611,18 +613,31 @@ export default class RedisClient<
   }
 
   #initiateQueue(): RedisCommandsQueue {
-    const codec = this.#options.binaryHeaders
-      ? createBinhdrCodec({
+    if (this.#options.binaryHeaders) {
+      return new BinhdrCommandsQueue(
+        this.#options.RESP ?? 2,
+        this.#options.commandsQueueMaxLength,
+        (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
+        {
+          resolver: STATIC_RESOLVER,
           onProtocolError: (clientIdx: number) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${clientIdx}`))
-        })
-      : undefined;
+        }
+      );
+    }
 
     return new RedisCommandsQueue(
       this.#options.RESP ?? 2,
       this.#options.commandsQueueMaxLength,
-      (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
-      codec
+      (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners)
     );
+  }
+
+  #setupBinhdrFlushCallback(): void {
+    if (this.#queue instanceof BinhdrCommandsQueue) {
+      this.#queue.setTimerFlushCallback(encoded => {
+        this.#socket.write([encoded]);
+      });
+    }
   }
 
   /**
@@ -1568,6 +1583,9 @@ export default class RedisClient<
   destroy() {
     clearTimeout(this._self.#pingTimer);
     this._self.#queue.flushAll(new DisconnectsClientError());
+    if (this._self.#queue instanceof BinhdrCommandsQueue) {
+      this._self.#queue.destroy();
+    }
     this._self.#socket.destroy();
     this._self.#clientSideCache?.onClose();
     this._self.#credentialsSubscription?.dispose();

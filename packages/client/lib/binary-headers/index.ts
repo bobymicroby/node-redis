@@ -5,10 +5,6 @@ export type {
   ResponseHeader as BinaryResponseHeader,
 } from './generated/response-header-codec';
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Flyweight Encoder/Decoder API (SBE-style, zero-allocation)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 export {
   RequestHeaderEncoder,
   RequestHeaderDecoder,
@@ -25,9 +21,11 @@ export type {
   OnHeader,
   OnProtocolError,
   InterceptorOptions,
+  PayloadSink,
 } from './interceptor';
 
 export {
+  BinhdrInboundDecoder,
   createBinhdrInterceptor,
   passthroughInbound,
   passthroughOutbound,
@@ -35,24 +33,15 @@ export {
 } from './interceptor';
 
 export type {
-  BufferedCommand,
-  PackingStrategy,
-  PackState,
   Scheduler,
   Cancellable,
-  CommandPackerOptions,
 } from './packing';
 
 export {
-  createDefaultPackingStrategy,
-  createTimeBoundedPackingStrategy,
+  CommandPacker,
   createTimeoutScheduler,
   createImmediateScheduler,
   calculatePayloadLength,
-  createBufferedCommand,
-  packCommands,
-  PackBufferPool,
-  CommandPacker,
 } from './packing';
 
 export type {
@@ -65,7 +54,11 @@ export type {
   CommandNode,
 } from './eligibility-types';
 
-export { EligibilityResolver } from './eligibility-resolver';
+export {
+  EligibilityResolver,
+  NOOP_RESOLVER,
+  SLOT_INELIGIBLE,
+} from './eligibility-resolver';
 
 export {
   STATIC_COMMAND_RECORDS,
@@ -76,16 +69,8 @@ export {
 } from './eligibility-static-data';
 
 export type {
-  OutboundCodecOptions,
-  InboundCodecOptions,
-  CodecOptions,
-  TimeBoundedOptions,
-  FlushSink,
-  BinhdrCodec,
-} from './client-integration';
+  BinhdrQueueOptions,
+  TimerFlushCallback,
+} from './binhdr-commands-queue';
 
-export {
-  createBinhdrOutboundInterceptor,
-  createBinhdrInboundInterceptor,
-  createBinhdrCodec,
-} from './client-integration';
+export { default as BinhdrCommandsQueue } from './binhdr-commands-queue';
