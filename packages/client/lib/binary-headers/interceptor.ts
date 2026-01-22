@@ -5,6 +5,7 @@ import type {
   OutboundInterceptor,
   OutboundCommand
 } from '../client/commands-queue';
+import type { Decoder } from '../RESP/decoder';
 
 export type OnHeader = (header: BinaryResponseHeader) => void;
 export type OnProtocolError = (header: BinaryResponseHeader) => void;
@@ -14,97 +15,107 @@ export interface InterceptorOptions {
   readonly onProtocolError?: OnProtocolError;
 }
 
-type ProcessAction =
-  | { readonly type: 'passthrough'; readonly from: number }
-  | { readonly type: 'buffer_partial'; readonly from: number }
-  | { readonly type: 'forward_payload'; readonly from: number; readonly length: number; readonly newRemaining: number }
-  | { readonly type: 'header_parsed'; readonly from: number };
+export type PayloadSink = (data: Buffer) => void;
 
-function computeNextAction(
-  data: Buffer,
-  offset: number,
-  payloadRemaining: number,
-  decoder: ResponseHeaderDecoder
-): ProcessAction {
-  if (payloadRemaining > 0) {
-    const available = data.length - offset;
-    const toForward = Math.min(payloadRemaining, available);
-    return {
-      type: 'forward_payload',
-      from: offset,
-      length: toForward,
-      newRemaining: payloadRemaining - toForward
-    };
-  }
+const HEADER_LENGTH = ResponseHeaderDecoder.ENCODED_LENGTH;
+const DESIGNATOR = ResponseHeaderDecoder.designatorConstantValue();
 
-  if (data[offset] !== ResponseHeaderDecoder.designatorConstantValue()) {
-    return { type: 'passthrough', from: offset };
-  }
-
-  const remaining = data.length - offset;
-  if (remaining < ResponseHeaderDecoder.ENCODED_LENGTH) {
-    return { type: 'buffer_partial', from: offset };
-  }
-
-  decoder.wrap(data, offset);
-
-  if (!decoder.isValid()) {
-    return { type: 'passthrough', from: offset };
-  }
-
-  return { type: 'header_parsed', from: offset };
+const enum ParseResult {
+  CONTINUE,
+  PASSTHROUGH,
+  BUFFER_PARTIAL,
 }
 
+export class BinhdrInboundDecoder {
+  readonly #headerDecoder = new ResponseHeaderDecoder();
+  readonly #onHeader: OnHeader | undefined;
+  readonly #onProtocolError: OnProtocolError | undefined;
+  #partial: Buffer | null = null;
+  #payloadRemaining = 0;
 
+  constructor(options: InterceptorOptions = {}) {
+    this.#onHeader = options.onHeader;
+    this.#onProtocolError = options.onProtocolError;
+  }
 
-export function createBinhdrInterceptor(options: InterceptorOptions = {}): InboundInterceptor {
-  let partial: Buffer | null = null;
-  let payloadRemaining = 0;
-  const decoder = new ResponseHeaderDecoder();
+  process(chunk: Buffer, sink: PayloadSink): void {
+    this.#decode(chunk, sink);
+  }
 
-  return (chunk: Buffer, next: InboundNext): void => {
-    const data = partial !== null ? Buffer.concat([partial, chunk]) : chunk;
-    partial = null;
+  writeToDecoder(chunk: Buffer, decoder: Decoder): void {
+    this.#decode(chunk, data => decoder.write(data));
+  }
+
+  reset(): void {
+    this.#partial = null;
+    this.#payloadRemaining = 0;
+  }
+
+  #decode(chunk: Buffer, emit: PayloadSink): void {
+    const data = this.#partial !== null ? Buffer.concat([this.#partial, chunk]) : chunk;
+    this.#partial = null;
     let offset = 0;
 
     while (offset < data.length) {
-      const action = computeNextAction(data, offset, payloadRemaining, decoder);
+      if (this.#payloadRemaining > 0) {
+        offset = this.#forwardPayload(data, offset, emit);
+        continue;
+      }
 
-      switch (action.type) {
-        case 'passthrough':
-          next(data.subarray(action.from));
-          return;
+      const result = this.#parseHeader(data, offset, emit);
+      if (result === ParseResult.PASSTHROUGH || result === ParseResult.BUFFER_PARTIAL) {
+        return;
+      }
+      offset += HEADER_LENGTH;
+    }
+  }
 
-        case 'buffer_partial':
-          partial = data.subarray(action.from);
-          return;
+  #forwardPayload(data: Buffer, offset: number, emit: PayloadSink): number {
+    const available = data.length - offset;
+    const toForward = available < this.#payloadRemaining ? available : this.#payloadRemaining;
+    emit(data.subarray(offset, offset + toForward));
+    this.#payloadRemaining -= toForward;
+    return offset + toForward;
+  }
 
-        case 'forward_payload':
-          next(data.subarray(action.from, action.from + action.length));
-          payloadRemaining = action.newRemaining;
-          offset = action.from + action.length;
-          break;
+  #parseHeader(data: Buffer, offset: number, emit: PayloadSink): ParseResult {
+    if (data[offset] !== DESIGNATOR) {
+      emit(data.subarray(offset));
+      return ParseResult.PASSTHROUGH;
+    }
 
-        case 'header_parsed': {
-          const length = decoder.length();
-          const protocolError = decoder.protocolError();
+    if (data.length - offset < HEADER_LENGTH) {
+      this.#partial = data.subarray(offset);
+      return ParseResult.BUFFER_PARTIAL;
+    }
 
-          payloadRemaining = length;
-          offset = action.from + ResponseHeaderDecoder.ENCODED_LENGTH;
+    this.#headerDecoder.wrap(data, offset);
 
-          if (options.onHeader !== undefined || (protocolError && options.onProtocolError !== undefined)) {
-            const header = decoder.toObject();
-            if (options.onHeader !== undefined) {
-              options.onHeader(header);
-            }
-            if (protocolError && options.onProtocolError !== undefined) {
-              options.onProtocolError(header);
-            }
-          }
-          break;
-        }
+    if (!this.#headerDecoder.isValid()) {
+      emit(data.subarray(offset));
+      return ParseResult.PASSTHROUGH;
+    }
+
+    this.#payloadRemaining = this.#headerDecoder.length();
+
+    if (this.#onHeader !== undefined || (this.#onProtocolError !== undefined && this.#headerDecoder.protocolError())) {
+      const header = this.#headerDecoder.toObject();
+      if (this.#onHeader !== undefined) {
+        this.#onHeader(header);
+      }
+      if (this.#onProtocolError !== undefined && header.protocolError) {
+        this.#onProtocolError(header);
       }
     }
+
+    return ParseResult.CONTINUE;
+  }
+}
+
+export function createBinhdrInterceptor(options: InterceptorOptions = {}): InboundInterceptor {
+  const decoder = new BinhdrInboundDecoder(options);
+  return (chunk: Buffer, next: InboundNext): void => {
+    decoder.process(chunk, next);
   };
 }
 

@@ -5,9 +5,9 @@
  * Usage: npx ts-node lib/binary-headers/queue-codec-bench.ts
  */
 
-import RedisCommandsQueue, { CommandCodec } from '../client/commands-queue';
+import RedisCommandsQueue from '../client/commands-queue';
 import MasterQueue from './master-queue';
-import { createBinhdrCodec } from './client-integration';
+import BinhdrCommandsQueue from './binhdr-commands-queue';
 import { createBinhdrResponse } from './test-utils';
 
 // ============================================================================
@@ -22,12 +22,20 @@ const ROUNDS = 5;
 // Queue Factory
 // ============================================================================
 
-function createQueue(codec?: CommandCodec): RedisCommandsQueue {
+function createQueue(): RedisCommandsQueue {
   return new RedisCommandsQueue(
     2,
     null,
+    () => {}
+  );
+}
+
+function createBinhdrQueue(): BinhdrCommandsQueue {
+  return new BinhdrCommandsQueue(
+    2,
+    null,
     () => {},
-    codec
+    {}
   );
 }
 
@@ -49,8 +57,17 @@ interface BenchQueue {
   decode(chunk: Buffer): void;
 }
 
-function wrapCurrentQueue(codec?: CommandCodec): BenchQueue {
-  const queue = createQueue(codec);
+function wrapCurrentQueue(): BenchQueue {
+  const queue = createQueue();
+  return {
+    addCommand: (args) => { queue.addCommand(args); },
+    commandsToWrite: () => queue.commandsToWrite(),
+    decode: (chunk) => queue.processIncomingData(chunk),
+  };
+}
+
+function wrapBinhdrQueue(): BenchQueue {
+  const queue = createBinhdrQueue();
   return {
     addCommand: (args) => { queue.addCommand(args); },
     commandsToWrite: () => queue.commandsToWrite(),
@@ -245,7 +262,7 @@ function runDecodeBatchBenchmark(
 function verifyEncoding(): void {
   console.log('Verifying encoding works correctly...\n');
 
-  const queue = wrapCurrentQueue(undefined);
+  const queue = wrapCurrentQueue();
 
   // Before addCommand - should yield nothing
   let countBefore = 0;
@@ -305,17 +322,13 @@ async function main(): Promise<void> {
   const plainResp = Buffer.from('+OK\r\n');
   const binhdrResp = createBinhdrResponse('+OK\r\n');
 
-  // Wait for binhdr codec to initialize
-  const binhdrCodec = createBinhdrCodec();
-  await new Promise(resolve => setTimeout(resolve, 100));
-
   // Encode benchmarks
   console.log('ENCODE (single SET command)');
   console.log('-'.repeat(60));
 
   const encodeMaster = runEncodeBenchmark('Master (no codec)', wrapMasterQueue, testCommand);
-  const encodeDefault = runEncodeBenchmark('No codec', () => wrapCurrentQueue(undefined), testCommand);
-  const encodeBinhdr = runEncodeBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), testCommand);
+  const encodeDefault = runEncodeBenchmark('No codec', () => wrapCurrentQueue(), testCommand);
+  const encodeBinhdr = runEncodeBenchmark('Binhdr codec', () => wrapBinhdrQueue(), testCommand);
 
   printResult(encodeMaster);
   printResult(encodeDefault);
@@ -332,8 +345,8 @@ async function main(): Promise<void> {
   console.log('-'.repeat(60));
 
   const decodeMaster = runDecodeBenchmark('Master (no codec)', wrapMasterQueue, plainResp);
-  const decodeDefault = runDecodeBenchmark('No codec', () => wrapCurrentQueue(undefined), plainResp);
-  const decodeBinhdr = runDecodeBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), binhdrResp);
+  const decodeDefault = runDecodeBenchmark('No codec', () => wrapCurrentQueue(), plainResp);
+  const decodeBinhdr = runDecodeBenchmark('Binhdr codec', () => wrapBinhdrQueue(), binhdrResp);
 
   printResult(decodeMaster);
   printResult(decodeDefault);
@@ -363,8 +376,8 @@ async function main(): Promise<void> {
   console.log('-'.repeat(60));
 
   const encodeBatchMaster = runEncodeBatchBenchmark('Master (no codec)', wrapMasterQueue, batchCommands);
-  const encodeBatchDefault = runEncodeBatchBenchmark('No codec', () => wrapCurrentQueue(undefined), batchCommands);
-  const encodeBatchBinhdr = runEncodeBatchBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), batchCommands);
+  const encodeBatchDefault = runEncodeBatchBenchmark('No codec', () => wrapCurrentQueue(), batchCommands);
+  const encodeBatchBinhdr = runEncodeBatchBenchmark('Binhdr codec', () => wrapBinhdrQueue(), batchCommands);
 
   printResult(encodeBatchMaster);
   printResult(encodeBatchDefault);
@@ -380,8 +393,8 @@ async function main(): Promise<void> {
   console.log('-'.repeat(60));
 
   const decodeBatchMaster = runDecodeBatchBenchmark('Master (no codec)', wrapMasterQueue, batchCommands, plainBatchResp);
-  const decodeBatchDefault = runDecodeBatchBenchmark('No codec', () => wrapCurrentQueue(undefined), batchCommands, plainBatchResp);
-  const decodeBatchBinhdr = runDecodeBatchBenchmark('Binhdr codec', () => wrapCurrentQueue(binhdrCodec), batchCommands, binhdrBatchResp);
+  const decodeBatchDefault = runDecodeBatchBenchmark('No codec', () => wrapCurrentQueue(), batchCommands, plainBatchResp);
+  const decodeBatchBinhdr = runDecodeBatchBenchmark('Binhdr codec', () => wrapBinhdrQueue(), batchCommands, binhdrBatchResp);
 
   printResult(decodeBatchMaster);
   printResult(decodeBatchDefault);

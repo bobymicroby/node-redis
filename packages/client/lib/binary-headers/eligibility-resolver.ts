@@ -148,3 +148,6 @@ export async function createEligibilityResolver(fetcher: CommandRecordFetcher): 
 
   return new EligibilityResolver(map);
 }
+
+/** No-op resolver that marks all commands as ineligible (empty command map) */
+export const NOOP_RESOLVER = new EligibilityResolver(new Map());
