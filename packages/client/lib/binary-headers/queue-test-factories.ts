@@ -232,15 +232,7 @@ export function forQueues(
   }
 }
 
-/**
- * Shorthand for running a test against both master and no-codec queues.
- */
-export function forBothQueues(
-  name: string,
-  fn: (queue: TestableQueue) => void | Promise<void>
-): void {
-  forQueues(['master', 'no-codec'], name, fn);
-}
+
 
 /**
  * Creates a queue with binary headers support.

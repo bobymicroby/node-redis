@@ -12,7 +12,7 @@ import {
   createBinhdrQueueWithTimer,
   createPassthroughQueue,
   collectYielded,
-  forBothQueues,
+  forQueues,
   STATIC_RESOLVER,
   type TestableQueue,
   type TestableQueueWithTimer,
@@ -104,54 +104,54 @@ describe('Codec Queue [codec-queue]', function () {
   }
 
   describe('without codec (master vs no-codec verification)', function () {
-    forBothQueues('single command', (queue) => {
+    forQueues(['master', 'no-codec'], 'single command', (queue) => {
       queue.addCommand(['PING']);
       assert.deepEqual(collectYieldedParsed(queue), [[['PING']]]);
     });
 
-    forBothQueues('multiple commands yield separately', (queue) => {
+    forQueues(['master', 'no-codec'], 'multiple commands yield separately', (queue) => {
       queue.addCommand(['SET', 'a', '1']);
       queue.addCommand(['GET', 'a']);
       assert.deepEqual(collectYieldedParsed(queue), [[['SET', 'a', '1']], [['GET', 'a']]]);
     });
 
-    forBothQueues('empty queue yields nothing', (queue) => {
+    forQueues(['master', 'no-codec'], 'empty queue yields nothing', (queue) => {
       assert.deepEqual(collectYieldedParsed(queue), []);
     });
 
-    forBothQueues('commands with arguments', (queue) => {
+    forQueues(['master', 'no-codec'], 'commands with arguments', (queue) => {
       queue.addCommand(['SET', 'foo', 'bar']);
       queue.addCommand(['HSET', 'h', 'f', 'v']);
       assert.deepEqual(collectYieldedParsed(queue), [[['SET', 'foo', 'bar']], [['HSET', 'h', 'f', 'v']]]);
     });
 
-    forBothQueues('many commands yield in order', (queue) => {
+    forQueues(['master', 'no-codec'], 'many commands yield in order', (queue) => {
       ['A', 'B', 'C', 'D'].forEach(c => queue.addCommand([c]));
       assert.deepEqual(collectYieldedParsed(queue), [[['A']], [['B']], [['C']], [['D']]]);
     });
 
-    forBothQueues('processIncomingData writes to decoder', async (queue) => {
+    forQueues(['master', 'no-codec'], 'processIncomingData writes to decoder', async (queue) => {
       const promise = queue.addCommand<string>(['PING']);
       for (const _ of queue.commandsToWrite()) {}
       queue.processIncomingData(Buffer.from('+PONG\r\n'));
       assert.equal(await promise, 'PONG');
     });
 
-    forBothQueues('multiple responses resolve in order', async (queue) => {
+    forQueues(['master', 'no-codec'], 'multiple responses resolve in order', async (queue) => {
       const promises = ['a', 'b', 'c'].map(k => queue.addCommand<string>(['GET', k]));
       for (const _ of queue.commandsToWrite()) {}
       queue.processIncomingData(Buffer.from('+val1\r\n+val2\r\n+val3\r\n'));
       assert.deepEqual(await Promise.all(promises), ['val1', 'val2', 'val3']);
     });
 
-    forBothQueues('generator exhausts after consuming', (queue) => {
+    forQueues(['master', 'no-codec'], 'generator exhausts after consuming', (queue) => {
       queue.addCommand(['PING']);
       queue.addCommand(['PING']);
       assert.equal(collectYieldedParsed(queue).length, 2);
       assert.equal(collectYieldedParsed(queue).length, 0);
     });
 
-    forBothQueues('commands added while iterating are yielded', (queue) => {
+    forQueues(['master', 'no-codec'], 'commands added while iterating are yielded', (queue) => {
       queue.addCommand(['A']);
       const gen = queue.commandsToWrite();
       assert.equal(gen.next().done, false);
@@ -831,7 +831,7 @@ describe('Auto-pipelining behavior', function () {
   // The queue must yield all commands from the same tick when generator is consumed.
 
   describe('no codec (master vs no-codec verification)', function () {
-    forBothQueues('yields each command separately for same-tick commands', (queue) => {
+    forQueues(['master', 'no-codec'], 'yields each command separately for same-tick commands', (queue) => {
       queue.addCommand(['SET', 'key1', 'value1']);
       queue.addCommand(['GET', 'key1']);
       queue.addCommand(['DEL', 'key1']);
@@ -847,7 +847,7 @@ describe('Auto-pipelining behavior', function () {
       ]);
     });
 
-    forBothQueues('generator exhausts after processing all commands', (queue) => {
+    forQueues(['master', 'no-codec'], 'generator exhausts after processing all commands', (queue) => {
       queue.addCommand(['PING']);
       queue.addCommand(['PING']);
       assert.equal(collectYielded(queue).length, 2);
@@ -972,7 +972,7 @@ describe('Auto-pipelining behavior', function () {
     // This is the key auto-pipelining guarantee: all commands from the same tick
     // must be yielded (or made available) when the generator is consumed.
 
-    forBothQueues('all commands yielded individually', (queue) => {
+    forQueues(['master', 'no-codec'], 'all commands yielded individually', (queue) => {
       queue.addCommand(['SET', 'a', '1']);
       queue.addCommand(['SET', 'b', '2']);
       queue.addCommand(['SET', 'c', '3']);
