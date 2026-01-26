@@ -55,6 +55,10 @@ export default class BinhdrCommandsQueue extends RedisCommandsQueue {
     this.#timerFlushCallback = callback;
   }
 
+  get maxWaitMs(): number {
+    return this.#maxWaitMs;
+  }
+
   destroy(): void {
     this.#cancelPendingFlush();
     this.#timerFlushCallback = NOOP_FLUSH_CALLBACK;

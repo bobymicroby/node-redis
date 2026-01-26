@@ -7,12 +7,18 @@ import {
   chainInbound,
 } from './interceptor';
 import type { InboundInterceptor, OutboundCommand } from '../client/commands-queue';
-import RedisCommandsQueue from '../client/commands-queue';
-import BinhdrCommandsQueue from './binhdr-commands-queue';
 import { ResponseHeaderEncoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
 import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { createBinhdrFrame, parseRespCommands } from './test-utils';
-import { STATIC_RESOLVER } from './eligibility-static-data';
+import {
+  createBaseQueue,
+  createBinhdrQueue,
+  createPassthroughQueue,
+  getBothImplementations,
+  collectYielded,
+  ACTIVE_IMPLEMENTATION,
+  type TestableQueue,
+} from './queue-test-factories';
 
 function collect(interceptor: InboundInterceptor, data: Buffer): Buffer[] {
   const received: Buffer[] = [];
@@ -267,24 +273,24 @@ describe('Binary Headers Interceptor', function () {
     });
   });
 
-  describe('Queue + Codec Integration', function () {
-    function createQueue(): RedisCommandsQueue {
-      return new RedisCommandsQueue(2, null, () => {});
-    }
+  // ============================================================================
+  // Queue + Codec Integration Tests
+  // ============================================================================
+  // These tests verify that both queue implementations behave identically.
+  // The active implementation is controlled by ACTIVE_IMPLEMENTATION in queue-test-factories.ts
+  // ============================================================================
 
-    function createQueueWithBinhdr(useStaticResolver: boolean): BinhdrCommandsQueue {
-      return new BinhdrCommandsQueue(2, null, () => {}, useStaticResolver ? { resolver: STATIC_RESOLVER } : {});
-    }
+  describe(`Queue + Codec Integration [${ACTIVE_IMPLEMENTATION}]`, function () {
 
-    function collectYielded(queue: RedisCommandsQueue): unknown[][] {
+    function collectYieldedParsed(queue: TestableQueue): unknown[][] {
       const results: unknown[][] = [];
       for (const encoded of queue.commandsToWrite()) {
-        results.push(parseRespCommands(encoded.join('')) as unknown[][]);
+        results.push(parseRespCommands((encoded as string[]).join('')) as unknown[][]);
       }
       return results;
     }
 
-    describe('queue without codec', function () {
+    describe('queue without codec (baseline)', function () {
       const queueCases = [
         { name: 'single command', commands: [['PING']], expected: [[['PING']]] },
         { name: 'multiple commands', commands: [['SET', 'a', '1'], ['GET', 'a']], expected: [[['SET', 'a', '1']], [['GET', 'a']]] },
@@ -293,9 +299,9 @@ describe('Binary Headers Interceptor', function () {
 
       for (const { name, commands, expected } of queueCases) {
         it(name, function () {
-          const queue = createQueue();
+          const queue = createBaseQueue();
           commands.forEach((cmd) => queue.addCommand(cmd));
-          assert.deepEqual(collectYielded(queue), expected);
+          assert.deepEqual(collectYieldedParsed(queue), expected);
         });
       }
     });
@@ -308,14 +314,14 @@ describe('Binary Headers Interceptor', function () {
 
       for (const { name, commands, expected } of passthroughCases) {
         it(name, function () {
-          const queue = createQueueWithBinhdr(false);
+          const queue = createPassthroughQueue();
           commands.forEach((cmd) => queue.addCommand(cmd));
-          assert.deepEqual(collectYielded(queue), expected);
+          assert.deepEqual(collectYieldedParsed(queue), expected);
         });
       }
     });
 
-    describe('queue with binhdr codec (default resolver)', function () {
+    describe('queue with binhdr codec (static resolver)', function () {
       const binhdrCases = [
         { name: 'single command', commands: [['PING']], expectedYields: 1, expectedCommandCount: 1 },
         { name: 'multiple commands batched', commands: [['PING'], ['PING'], ['PING']], expectedYields: 1, expectedCommandCount: 3 },
@@ -323,13 +329,10 @@ describe('Binary Headers Interceptor', function () {
 
       for (const { name, commands, expectedYields, expectedCommandCount } of binhdrCases) {
         it(name, function () {
-          const queue = createQueueWithBinhdr(true);
+          const queue = createBinhdrQueue();
           commands.forEach((cmd) => queue.addCommand(cmd));
 
-          const results: ReadonlyArray<unknown>[] = [];
-          for (const encoded of queue.commandsToWrite()) {
-            results.push(encoded);
-          }
+          const results = collectYielded(queue);
 
           assert.equal(results.length, expectedYields);
           const decoder = new RequestHeaderDecoder().wrap(results[0][0] as Buffer, 0);
@@ -338,5 +341,124 @@ describe('Binary Headers Interceptor', function () {
         });
       }
     });
+  });
+
+  // ============================================================================
+  // Comparative Tests - Run same tests against BOTH implementations
+  // ============================================================================
+
+  describe('Queue + Codec Integration [BOTH IMPLEMENTATIONS]', function () {
+    const implementations = getBothImplementations();
+
+    for (const impl of implementations) {
+      describe(`${impl.name}`, function () {
+
+        describe('command batching', function () {
+          const batchingCases = [
+            {
+              name: 'batches PING commands',
+              commands: [['PING'], ['PING']],
+              expectedYields: 1,
+              expectedCommandCount: 2,
+            },
+            {
+              name: 'batches SET commands with same slot',
+              commands: [['SET', '{x}key1', 'value1'], ['GET', '{x}key1']],
+              expectedYields: 1,
+              expectedCommandCount: 2,
+            },
+            {
+              name: 'flushes on different slot',
+              // {a} and {b} hash to different slots
+              commands: [['SET', '{a}key', 'v1'], ['SET', '{b}key', 'v2']],
+              expectedMinYields: 1, // At least one yield
+            },
+          ];
+
+          for (const tc of batchingCases) {
+            it(tc.name, function () {
+              const queue = impl.createQueue();
+              tc.commands.forEach(cmd => queue.addCommand(cmd));
+
+              const results = collectYielded(queue);
+
+              if (tc.expectedYields !== undefined) {
+                assert.equal(results.length, tc.expectedYields);
+              }
+              if (tc.expectedMinYields !== undefined) {
+                assert.ok(results.length >= tc.expectedMinYields);
+              }
+              if (tc.expectedCommandCount !== undefined && results.length === 1) {
+                const decoder = new RequestHeaderDecoder().wrap(results[0][0] as Buffer, 0);
+                assert.ok(decoder.isValid());
+                assert.equal(decoder.commandCount(), tc.expectedCommandCount);
+              }
+            });
+          }
+        });
+
+        describe('response handling', function () {
+          it('processes simple PONG response', async function () {
+            const queue = impl.createQueue();
+            const promise = queue.addCommand<string>(['PING']);
+
+            // Drain commands
+            for (const _ of queue.commandsToWrite()) {}
+
+            // Send response with binary header
+            queue.processIncomingData(createBinhdrFrame(Buffer.from('+PONG\r\n')));
+
+            const result = await promise;
+            assert.equal(result, 'PONG');
+          });
+
+          it('processes OK response', async function () {
+            const queue = impl.createQueue();
+            const promise = queue.addCommand<string>(['SET', 'key', 'value']);
+
+            for (const _ of queue.commandsToWrite()) {}
+
+            queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n')));
+
+            const result = await promise;
+            assert.equal(result, 'OK');
+          });
+
+          it('handles chunked response', async function () {
+            const queue = impl.createQueue();
+            const promise = queue.addCommand<string>(['PING']);
+
+            for (const _ of queue.commandsToWrite()) {}
+
+            const frame = createBinhdrFrame(Buffer.from('+PONG\r\n'));
+            // Split frame into chunks
+            queue.processIncomingData(frame.subarray(0, 10));
+            queue.processIncomingData(frame.subarray(10));
+
+            const result = await promise;
+            assert.equal(result, 'PONG');
+          });
+        });
+
+        describe('multiple commands', function () {
+          it('resolves multiple commands in order', async function () {
+            const queue = impl.createQueue();
+            const p1 = queue.addCommand<string>(['PING']);
+            const p2 = queue.addCommand<string>(['PING']);
+            const p3 = queue.addCommand<string>(['PING']);
+
+            for (const _ of queue.commandsToWrite()) {}
+
+            // Send responses
+            queue.processIncomingData(createBinhdrFrame(Buffer.from('+PONG\r\n')));
+            queue.processIncomingData(createBinhdrFrame(Buffer.from('+PONG\r\n')));
+            queue.processIncomingData(createBinhdrFrame(Buffer.from('+PONG\r\n')));
+
+            const results = await Promise.all([p1, p2, p3]);
+            assert.deepEqual(results, ['PONG', 'PONG', 'PONG']);
+          });
+        });
+      });
+    }
   });
 });

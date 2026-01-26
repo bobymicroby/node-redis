@@ -1,39 +1,11 @@
-import { DoublyLinkedNode, DoublyLinkedList, EmptyAwareSinglyLinkedList } from '../client/linked-list';
+import { DoublyLinkedNode, DoublyLinkedList, EmptyAwareSinglyLinkedList } from './linked-list';
 import encodeCommand from '../RESP/encoder';
 import { Decoder, PUSH_TYPE_MAPPING, RESP_TYPES } from '../RESP/decoder';
 import { TypeMapping, ReplyUnion, RespVersions, RedisArgument } from '../RESP/types';
-import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, PubSubTypeListeners } from '../client/pub-sub';
+import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, PubSubTypeListeners } from './pub-sub';
 import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, TimeoutError } from '../errors';
-import { MonitorCallback } from '../client';
-import { dbgMaintenance } from '../client/enterprise-maintenance-manager';
-import type { Cancellable, Scheduler } from './packing';
-
-export interface OutboundCodec {
-  transform(
-    encoded: ReadonlyArray<RedisArgument>,
-    args: ReadonlyArray<RedisArgument>
-  ): ReadonlyArray<RedisArgument> | null;
-  drain(): ReadonlyArray<RedisArgument> | null;
-  hasPending(): boolean;
-}
-
-export interface InboundCodec {
-  process(chunk: Buffer, decoder: Decoder): void;
-}
-
-export interface CommandCodec {
-  readonly outbound: OutboundCodec;
-  readonly inbound: InboundCodec;
-}
-
-export type TimerFlushCallback = (encoded: ReadonlyArray<RedisArgument>) => void;
-
-export interface TimerOptions {
-  readonly maxWaitMs: number;
-  readonly scheduler: Scheduler;
-}
-
-const NOOP_FLUSH_CALLBACK: TimerFlushCallback = () => {};
+import { MonitorCallback } from '.';
+import { dbgMaintenance } from './enterprise-maintenance-manager';
 
 export interface CommandOptions<T = TypeMapping> {
   chainId?: symbol;
@@ -96,11 +68,6 @@ export default class RedisCommandsQueue {
   #chainInExecution: symbol | undefined;
   readonly decoder;
   readonly #pubSub = new PubSub();
-  readonly #codec: CommandCodec | null;
-  readonly #scheduler: Scheduler | null;
-  readonly #maxWaitMs: number;
-  #pendingFlush: Cancellable | null = null;
-  #timerFlushCallback: TimerFlushCallback = NOOP_FLUSH_CALLBACK;
 
   #pushHandlers: PushHandler[] = [this.#onPush.bind(this)];
 
@@ -156,51 +123,12 @@ export default class RedisCommandsQueue {
   constructor(
     respVersion: RespVersions,
     maxLength: number | null | undefined,
-    onShardedChannelMoved: OnShardedChannelMoved,
-    codec?: CommandCodec,
-    timerOptions?: TimerOptions
+    onShardedChannelMoved: OnShardedChannelMoved
   ) {
     this.#respVersion = respVersion;
     this.#maxLength = maxLength;
     this.#onShardedChannelMoved = onShardedChannelMoved;
-    this.#codec = codec ?? null;
-    this.#scheduler = timerOptions?.scheduler ?? null;
-    this.#maxWaitMs = timerOptions?.maxWaitMs ?? 0;
     this.decoder = this.#initiateDecoder();
-  }
-
-  setTimerFlushCallback(callback: TimerFlushCallback): void {
-    this.#timerFlushCallback = callback;
-  }
-
-  get maxWaitMs(): number {
-    return this.#maxWaitMs;
-  }
-
-  destroy(): void {
-    this.#cancelPendingFlush();
-    this.#timerFlushCallback = NOOP_FLUSH_CALLBACK;
-  }
-
-  #scheduleFlush(): void {
-    if (this.#pendingFlush !== null || this.#scheduler === null) {
-      return;
-    }
-
-    this.#pendingFlush = this.#scheduler.schedule(this.#maxWaitMs, () => {
-      this.#pendingFlush = null;
-      const packed = this.drainPendingOutbound();
-      if (packed !== null) {
-        this.#timerFlushCallback(packed);
-      }
-    });
-  }
-
-  #cancelPendingFlush(): void {
-    if (this.#pendingFlush !== null) {
-      this.#pendingFlush.cancel();
-      this.#pendingFlush = null;
-    }
   }
 
   #onReply(reply: ReplyUnion) {
@@ -523,13 +451,11 @@ export default class RedisCommandsQueue {
   }
 
   *commandsToWrite() {
-    const codec = this.#codec;
     let toSend = this.#toWrite.shift();
     while (toSend) {
-      const args = toSend.args;
       let encoded: ReadonlyArray<RedisArgument>
       try {
-        encoded = encodeCommand(args);
+        encoded = encodeCommand(toSend.args);
       } catch (err) {
         toSend.reject(err);
         toSend = this.#toWrite.shift();
@@ -550,45 +476,9 @@ export default class RedisCommandsQueue {
       toSend.chainId = undefined;
       this.#waitingForReply.push(toSend);
 
-      if (codec !== null) {
-        const wasEmpty = !codec.outbound.hasPending();
-        const result = codec.outbound.transform(encoded, args);
-        if (result !== null) {
-          this.#cancelPendingFlush();
-          yield result;
-        } else if (this.#scheduler !== null && wasEmpty && codec.outbound.hasPending()) {
-          this.#scheduleFlush();
-        }
-      } else {
-        yield encoded;
-      }
-
+      yield encoded;
       toSend = this.#toWrite.shift();
     }
-
-    if (codec !== null) {
-      const drained = codec.outbound.drain();
-      if (drained !== null) {
-        this.#cancelPendingFlush();
-        yield drained;
-      }
-    }
-  }
-
-  processIncomingData(chunk: Buffer): void {
-    if (this.#codec !== null) {
-      this.#codec.inbound.process(chunk, this.decoder);
-    } else {
-      this.decoder.write(chunk);
-    }
-  }
-
-  hasPendingOutbound(): boolean {
-    return this.#codec?.outbound.hasPending() ?? false;
-  }
-
-  drainPendingOutbound(): ReadonlyArray<RedisArgument> | null {
-    return this.#codec?.outbound.drain() ?? null;
   }
 
   #flushWaitingForReply(err: Error): void {
