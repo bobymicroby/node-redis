@@ -8,6 +8,7 @@ import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import { createBinhdrFrame, parseRespCommands } from './test-utils';
 import {
   createBaseQueue,
+  createMasterQueue,
   createBinhdrQueue,
   createBinhdrQueueWithTimer,
   createPassthroughQueue,
@@ -104,29 +105,41 @@ describe('Codec Queue [codec-queue]', function () {
 
   describe('without codec (baseline behavior)', function () {
     // Table-driven tests for baseline queue behavior
+    // Run same tests against BOTH createBaseQueue (new) and createMasterQueue (original)
+    // to verify they behave identically
+    const queueFactories = [
+      { name: 'createBaseQueue', factory: createBaseQueue },
+      { name: 'createMasterQueue', factory: createMasterQueue },
+    ];
+
     const baselineCases = [
       { name: 'single command', commands: [['PING']], expected: [[['PING']]] },
       { name: 'multiple commands yield separately', commands: [['SET', 'a', '1'], ['GET', 'a']], expected: [[['SET', 'a', '1']], [['GET', 'a']]] },
       { name: 'empty queue yields nothing', commands: [], expected: [] },
     ];
 
-    for (const { name, commands, expected } of baselineCases) {
-      it(name, function () {
-        const queue = createBaseQueue();
-        commands.forEach((cmd) => queue.addCommand(cmd));
-        assert.deepEqual(collectYieldedParsed(queue), expected);
+    // Run baseline tests against both implementations
+    for (const { name: factoryName, factory } of queueFactories) {
+      describe(`[${factoryName}]`, function () {
+        for (const { name, commands, expected } of baselineCases) {
+          it(name, function () {
+            const queue = factory();
+            commands.forEach((cmd) => queue.addCommand(cmd));
+            assert.deepEqual(collectYieldedParsed(queue), expected);
+          });
+        }
+
+        it('processIncomingData writes directly to decoder', async function () {
+          const queue = factory();
+          const promise = queue.addCommand<string>(['PING']);
+          for (const _ of queue.commandsToWrite()) {}
+
+          queue.processIncomingData(Buffer.from('+PONG\r\n'));
+          const result = await promise;
+          assert.equal(result, 'PONG');
+        });
       });
     }
-
-    it('processIncomingData writes directly to decoder', async function () {
-      const queue = createBaseQueue();
-      const promise = queue.addCommand<string>(['PING']);
-      for (const _ of queue.commandsToWrite()) {}
-
-      queue.processIncomingData(Buffer.from('+PONG\r\n'));
-      const result = await promise;
-      assert.equal(result, 'PONG');
-    });
   });
 
   describe('with BinaryHeadersCodec (static resolver)', function () {

@@ -6,18 +6,22 @@
  * ## Quick Start
  *
  * ```typescript
- * import { createBaseQueue, createBinhdrQueue } from './queue-test-factories';
+ * import { createBaseQueue, createBinhdrQueue, createMasterQueue } from './queue-test-factories';
  *
  * // Queue without codec (baseline behavior)
  * const baseQueue = createBaseQueue();
  *
  * // Queue with binary headers codec
  * const binhdrQueue = createBinhdrQueue();
+ *
+ * // Original master queue (for baseline verification)
+ * const masterQueue = createMasterQueue();
  * ```
  *
  * ## Factory Functions
  *
  * - `createBaseQueue()` - Queue without codec (baseline)
+ * - `createMasterQueue()` - Original master queue (for baseline verification)
  * - `createBinhdrQueue()` - Queue with binary headers codec
  * - `createBinhdrQueueWithTimer()` - Queue with binary headers + timer support
  * - `createPassthroughQueue()` - Queue with codec but no batching (NOOP_RESOLVER)
@@ -27,6 +31,7 @@ import type { RedisArgument, RespVersions } from '../RESP/types';
 import type { Decoder } from '../RESP/decoder';
 
 import RedisCommandsQueue from '../client/commands-queue';
+import MasterQueue from './master-queue';
 import { BinaryHeadersCodec } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 import type { EligibilityResolver } from './eligibility';
@@ -46,6 +51,35 @@ export interface TestableQueue {
   commandsToWrite(): Generator<ReadonlyArray<RedisArgument>>;
   processIncomingData(chunk: Buffer): void;
   readonly decoder: Decoder;
+}
+
+/**
+ * Adapter that wraps MasterQueue to implement TestableQueue interface.
+ * MasterQueue doesn't have processIncomingData, so we add it by writing directly to decoder.
+ */
+class MasterQueueAdapter implements TestableQueue {
+  readonly #queue: MasterQueue;
+
+  constructor(queue: MasterQueue) {
+    this.#queue = queue;
+  }
+
+  addCommand<T = unknown>(args: ReadonlyArray<RedisArgument>): Promise<T> {
+    return this.#queue.addCommand(args);
+  }
+
+  *commandsToWrite(): Generator<ReadonlyArray<RedisArgument>> {
+    yield* this.#queue.commandsToWrite();
+  }
+
+  processIncomingData(chunk: Buffer): void {
+    // MasterQueue expects caller to write directly to decoder
+    this.#queue.decoder.write(chunk);
+  }
+
+  get decoder(): Decoder {
+    return this.#queue.decoder;
+  }
 }
 
 /**
@@ -121,6 +155,20 @@ export function createBaseQueue(options: Omit<QueueFactoryOptions, 'resolver' | 
     options.maxLength ?? null,
     options.onShardedChannelMoved ?? (() => {})
   );
+}
+
+/**
+ * Creates the original master queue (for baseline verification).
+ * This wraps MasterQueue with an adapter to implement TestableQueue.
+ * Used to verify that createBaseQueue() behaves identically to the original.
+ */
+export function createMasterQueue(options: Omit<QueueFactoryOptions, 'resolver' | 'onProtocolError' | 'timer'> = {}): TestableQueue {
+  const queue = new MasterQueue(
+    options.respVersion ?? 2,
+    options.maxLength ?? null,
+    options.onShardedChannelMoved ?? (() => {})
+  );
+  return new MasterQueueAdapter(queue);
 }
 
 /**
