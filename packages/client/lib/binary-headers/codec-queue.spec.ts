@@ -150,6 +150,18 @@ describe('Codec Queue [codec-queue]', function () {
       return queue;
     }
 
+    // Timer-based flushing flow:
+    //
+    // 1. addCommand() adds to the queue's internal #toWrite list
+    // 2. commandsToWrite() generator is consumed by the socket layer
+    // 3. For each command: transform() may buffer (return null) and schedule timer
+    // 4. Socket may stop consuming early (backpressure: writableNeedDrain)
+    // 5. If scheduler is configured, generator does NOT drain at end - timer handles it
+    // 6. Timer fires after maxWaitMs, calls timerFlushCallback with packed data
+    //
+    // Key insight: When scheduler is configured, the generator leaves buffered
+    // commands for the timer to flush. Without scheduler, drain happens immediately.
+
     it('destroy cancels pending flush', function () {
       const queue = createQueueWithTimer(1000);
       let called = false;
@@ -165,22 +177,138 @@ describe('Codec Queue [codec-queue]', function () {
       assert.equal(queue.maxWaitMs, 42);
     });
 
-    // NOTE: Timer-based flushing tests require understanding the flow:
-    // 1. addCommand() adds to the queue's internal toWrite list
-    // 2. commandsToWrite() generator is consumed by the socket layer
-    // 3. During generator consumption, codec.transform() may buffer (return null)
-    // 4. At END of generator, codec.drain() is called and yields remaining data
-    // 5. Timer fires INDEPENDENTLY when generator is NOT being consumed
-    //
-    // This means: consuming the full generator always drains everything.
-    // Timer flushing is for when the generator is NOT fully consumed yet.
-    //
-    // For unit tests, we can test timer behavior by:
-    // - Testing that drain cancels pending timers (already done via destroy test)
-    // - Testing the underlying packer's time-bounded behavior (in packing.spec.ts)
-    // - Testing scheduler implementations (in packing.spec.ts)
-    //
-    // The comprehensive timer behavior is tested at integration level in the client.
+    it('with scheduler: generator does not drain, leaves commands for timer', function () {
+      const queue = createQueueWithTimer(100, false);
+
+      // Add commands with same slot
+      queue.addCommand(['SET', 'key', 'value1']);
+      queue.addCommand(['GET', 'key']);
+
+      // Consume generator - with scheduler, it should NOT drain at end
+      const results = collectYielded(queue);
+
+      // No yields because all commands buffered and not drained
+      assert.equal(results.length, 0, 'Generator should not drain when scheduler configured');
+
+      // Commands are still pending in codec buffer
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'Commands should be pending');
+    });
+
+    it('without scheduler: generator drains immediately at end', function () {
+      // Create queue WITHOUT timer/scheduler
+      const queue = createBinhdrQueue();
+
+      queue.addCommand(['SET', 'key', 'value1']);
+      queue.addCommand(['GET', 'key']);
+
+      const results = collectYielded(queue);
+
+      // Should yield because drain happens at end (no scheduler)
+      assert.equal(results.length, 1, 'Generator should drain when no scheduler');
+      assertPackedHeader(results[0], { commandCount: 2 });
+    });
+
+    it('timer fires and flushes buffered commands via callback', async function () {
+      const queue = createQueueWithTimer(10, false);
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => {
+        flushedData.push(encoded);
+      });
+
+      // Add command and consume generator (yields nothing due to scheduler)
+      queue.addCommand(['SET', 'key', 'value']);
+      const results = collectYielded(queue);
+      assert.equal(results.length, 0, 'Command should be buffered, not yielded');
+
+      // Wait for timer to fire
+      await delay(20);
+
+      // Timer should have invoked callback with packed data
+      assert.equal(flushedData.length, 1, 'Timer callback should have been called once');
+      assertPackedHeader(flushedData[0], { commandCount: 1 });
+    });
+
+    it('timer is cancelled when slot incompatibility causes flush', async function () {
+      const queue = createQueueWithTimer(50, false);
+      let callbackCount = 0;
+      queue.setTimerFlushCallback(() => { callbackCount++; });
+
+      // Add first command - buffered, timer scheduled
+      queue.addCommand(['SET', 'key1', 'value1']);
+      collectYielded(queue);
+
+      // Add second command with different slot - triggers flush via transform()
+      queue.addCommand(['SET', 'key2', 'value2']);
+      const results = collectYielded(queue);
+
+      // Should yield the first command (flushed due to slot incompatibility)
+      assert.equal(results.length, 1, 'Should yield flushed data from slot change');
+      assertPackedHeader(results[0], { commandCount: 1 });
+
+      // Wait past the original timer
+      await delay(60);
+
+      // Timer should have been cancelled - callback should not be called
+      assert.equal(callbackCount, 0, 'Timer callback should not fire after slot-triggered flush');
+    });
+
+    it('multiple commands buffered, timer fires with all packed together', async function () {
+      const queue = createQueueWithTimer(15, false);
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => {
+        flushedData.push(encoded);
+      });
+
+      // Add multiple commands with same slot (all buffered)
+      queue.addCommand(['SET', 'key', 'value1']);
+      collectYielded(queue);
+      queue.addCommand(['GET', 'key']);
+      collectYielded(queue);
+      queue.addCommand(['DEL', 'key']);
+      collectYielded(queue);
+
+      // Wait for timer
+      await delay(25);
+
+      // Should have received one callback with all 3 commands packed
+      assert.equal(flushedData.length, 1, 'Should have one callback');
+      assertPackedHeader(flushedData[0], { commandCount: 3 });
+    });
+
+    it('destroy during active timer prevents callback', async function () {
+      const queue = createQueueWithTimer(30, false);
+      let called = false;
+      queue.setTimerFlushCallback(() => { called = true; });
+
+      // Add command to start timer
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+
+      // Small delay, then destroy while timer is pending
+      await delay(5);
+      queue.destroy();
+
+      // Wait past original timer
+      await delay(40);
+
+      assert.equal(called, false, 'Callback should not fire after destroy');
+    });
+
+    it('uses immediate scheduler for synchronous flush', async function () {
+      const queue = createQueueWithTimer(1000, true); // useImmediate = true
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => {
+        flushedData.push(encoded);
+      });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+
+      // Immediate scheduler fires on next tick, not after 1000ms
+      await new Promise(resolve => setImmediate(resolve));
+
+      assert.equal(flushedData.length, 1, 'Immediate scheduler should fire on next tick');
+    });
 
     it('hasPendingOutbound reflects codec buffer state', function () {
       const queue = createQueueWithTimer(100, false) as RedisCommandsQueue;
@@ -189,35 +317,26 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Add command but don't consume generator yet - command is in toWrite, not codec buffer
       queue.addCommand(['SET', 'key', 'value']);
-      // Note: hasPendingOutbound checks codec's buffer, not toWrite queue
       assert.equal(queue.hasPendingOutbound(), false, 'Nothing in codec until generator runs');
+
+      // Consume generator - command moves to codec buffer
+      collectYielded(queue);
+      assert.equal(queue.hasPendingOutbound(), true, 'Command now in codec buffer');
     });
 
-    it('drainPendingOutbound returns null when nothing buffered in codec', function () {
+    it('drainPendingOutbound manually drains buffered commands', function () {
       const queue = createQueueWithTimer(100, false) as RedisCommandsQueue;
 
-      // Add command but don't consume generator
       queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue); // Moves to codec buffer, not drained due to scheduler
 
-      // Drain returns null because codec hasn't received anything yet
+      assert.equal(queue.hasPendingOutbound(), true, 'Command should be pending');
+
       const drained = queue.drainPendingOutbound();
-      assert.equal(drained, null, 'Nothing to drain before generator consumption');
-    });
+      assert.ok(drained !== null, 'Should have drained data');
+      assertPackedHeader(drained, { commandCount: 1 });
 
-    it('generator yields all buffered commands via drain at end', function () {
-      const queue = createQueueWithTimer(100, false);
-
-      // Add multiple commands with same slot
-      queue.addCommand(['SET', 'key', 'value1']);
-      queue.addCommand(['GET', 'key']);
-      queue.addCommand(['DEL', 'key']);
-
-      // Consuming generator should yield everything (drain called at end)
-      const results = collectYielded(queue);
-
-      // All commands packed together in single yield
-      assert.equal(results.length, 1, 'All commands yielded as single batch');
-      assertPackedHeader(results[0], { commandCount: 3 });
+      assert.equal(queue.hasPendingOutbound(), false, 'No longer pending after drain');
     });
 
     it('slot incompatibility causes flush mid-generator', function () {
@@ -230,8 +349,9 @@ describe('Codec Queue [codec-queue]', function () {
 
       const results = collectYielded(queue);
 
-      // Should have multiple yields due to slot changes
-      assert.ok(results.length >= 2, 'Slot incompatibility causes multiple yields');
+      // Should have yields due to slot changes (transform returns data)
+      // Last batch stays buffered (scheduler configured, no drain at end)
+      assert.ok(results.length >= 1, 'Slot incompatibility causes yields');
     });
   });
 
