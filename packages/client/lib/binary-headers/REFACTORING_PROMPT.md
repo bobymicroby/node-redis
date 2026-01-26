@@ -407,3 +407,156 @@ git show master:packages/client/lib/client/commands-queue.ts > packages/client/l
 ```
 
 Then reapply codec changes to `codec-queue.ts` while preserving formatting.
+
+---
+
+## Phase 2: Finalization (Current)
+
+Implementation is **complete**. We now focus on:
+1. **Explore** - Is there a better architecture for codec integration?
+2. **Simplify** - Remove redundant code, consolidate implementations
+3. **Finalize** - Create a clean branch with only the chosen implementation
+4. **Document** - Update docs to reflect final architecture
+
+### What We Have Now
+
+Two working implementations that both pass all 158 tests:
+
+| Implementation | Approach | File |
+|---------------|----------|------|
+| **CodecQueue** | Composition - codec passed to constructor | `codec-queue.ts` |
+| **BinhdrCommandsQueue** | Subclass - extends base queue | `binhdr-commands-queue.ts` |
+
+Plus test infrastructure to swap between them (`queue-test-factories.ts`).
+
+### Finalization Tasks
+
+#### 1. Architecture Decision
+
+Questions to answer:
+
+- [ ] **Is CodecQueue the right approach?** Or should we use subclassing?
+- [ ] **Can we simplify the codec interface further?**
+- [ ] **Is timer integration in the right place?** Should it be in the codec instead?
+- [ ] **Should codec be optional or always present?** (null-object pattern vs null check)
+
+#### 2. Code Cleanup
+
+Files to potentially remove after deciding on architecture:
+
+- [ ] `binhdr-commands-queue.ts` - If we choose CodecQueue
+- [ ] `commands-queue-original.ts` - Reference file, not needed in final
+- [ ] `master-queue.ts` - Benchmark baseline, not needed in final
+- [ ] `queue-test-factories.ts` - Simplify once we have one implementation
+
+#### 3. Test Cleanup
+
+- [ ] Remove `getBothImplementations()` tests - only need one implementation
+- [ ] Simplify `queue-test-factories.ts` or inline factories
+- [ ] Update test descriptions to remove `[codec-queue]` / `[binhdr-subclass]` labels
+- [ ] Ensure coverage of final implementation
+
+#### 4. Integration
+
+- [ ] Integrate `codec-queue.ts` changes back into main `commands-queue.ts`
+- [ ] Or keep as separate file if that's cleaner
+- [ ] Update client to use the new queue with codec support
+- [ ] Ensure all existing functionality preserved (PubSub, MONITOR, etc.)
+
+#### 5. Documentation
+
+- [ ] Update this file to be final documentation (not task tracking)
+- [ ] Add inline code comments where helpful
+- [ ] Update README if needed
+
+### Architectural Options to Explore
+
+#### Option A: Keep CodecQueue Separate
+
+```
+lib/client/commands-queue.ts      # Original, unchanged
+lib/binary-headers/codec-queue.ts # Extended version with codec
+```
+
+**Pros:** No risk to existing code, clear separation
+**Cons:** Two queue implementations to maintain
+
+#### Option B: Merge into commands-queue.ts
+
+```
+lib/client/commands-queue.ts  # Now supports optional codec
+```
+
+**Pros:** Single implementation, codec is just an option
+**Cons:** Changes to critical path code
+
+#### Option C: Codec as Wrapper
+
+```typescript
+// Codec wraps the queue instead of being injected
+const queue = new RedisCommandsQueue(...);
+const codecQueue = wrapWithCodec(queue, codec);
+```
+
+**Pros:** Zero changes to original queue
+**Cons:** May be awkward for timer integration
+
+#### Option D: Middleware/Interceptor Chain
+
+```typescript
+const queue = new RedisCommandsQueue(...);
+queue.use(binaryHeadersMiddleware);
+```
+
+**Pros:** Familiar pattern, extensible
+**Cons:** May add overhead, more complex
+
+### File Disposition Guide
+
+```
+lib/binary-headers/
+├── codec-queue.ts              # ✅ Keep - Main implementation
+├── codec.ts                    # ✅ Keep - BinaryHeadersCodec
+├── commands-queue-original.ts  # ❓ Remove after finalization
+├── master-queue.ts             # ❓ Remove after finalization
+├── binhdr-commands-queue.ts    # ❓ Remove if choosing CodecQueue
+├── queue-test-factories.ts     # ❓ Simplify after choosing implementation
+├── packing.ts                  # ✅ Keep - Command batching
+├── interceptor.ts              # ✅ Keep - Inbound processing
+├── eligibility-resolver.ts     # ✅ Keep - Command eligibility
+├── eligibility-static-data.ts  # ✅ Keep - Static data
+├── eligibility-types.ts        # ✅ Keep - Types
+├── codec-queue.spec.ts         # ✅ Keep - Simplify dual-impl tests
+├── interceptor.spec.ts         # ✅ Keep - Simplify dual-impl tests
+├── packing.spec.ts             # ✅ Keep
+├── eligibility.spec.ts         # ✅ Keep
+├── flyweight.spec.ts           # ✅ Keep
+├── abort-timeout.spec.ts       # ✅ Keep
+├── test-utils.ts               # ✅ Keep
+├── queue-codec-bench.ts        # ✅ Keep - For validation
+├── ralph.sh                    # 🔧 Tool - Remove before merge
+└── index.ts                    # ✅ Keep - Update exports
+```
+
+### Success Criteria for Finalization
+
+1. **Single implementation** - One queue approach chosen and kept
+2. **All tests pass** - No regressions
+3. **Performance maintained** - <5% overhead without codec
+4. **Clean codebase** - No dead code, no duplicate implementations
+5. **Clear documentation** - Easy to understand for future maintainers
+6. **Ready for PR** - Can be merged to main branch
+
+### Ralph Script for Finalization
+
+Use `ralph.sh` to assist with finalization tasks:
+
+```bash
+cd packages/client/lib/binary-headers
+
+# Single iteration - explore and decide
+./ralph.sh once
+
+# Multiple iterations - cleanup work
+./ralph.sh 5
+```

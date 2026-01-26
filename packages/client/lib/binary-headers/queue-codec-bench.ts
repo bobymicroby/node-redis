@@ -6,9 +6,6 @@
  */
 
 import RedisCommandsQueue from '../client/commands-queue';
-import MasterQueue from './master-queue';
-import BinhdrCommandsQueue from './binhdr-commands-queue';
-import CodecQueue from './codec-queue';
 import { BinaryHeadersCodec } from './codec';
 import { createBinhdrResponse } from './test-utils';
 
@@ -32,33 +29,8 @@ function createQueue(): RedisCommandsQueue {
   );
 }
 
-function createBinhdrQueue(): BinhdrCommandsQueue {
-  return new BinhdrCommandsQueue(
-    2,
-    null,
-    () => {},
-    {}
-  );
-}
-
-function createMasterQueue(): MasterQueue {
-  return new MasterQueue(
-    2,
-    null,
-    () => {}
-  );
-}
-
-function createCodecQueue(): CodecQueue {
-  return new CodecQueue(
-    2,
-    null,
-    () => {}
-  );
-}
-
-function createCodecQueueWithBinhdr(): CodecQueue {
-  return new CodecQueue(
+function createQueueWithBinhdr(): RedisCommandsQueue {
+  return new RedisCommandsQueue(
     2,
     null,
     () => {},
@@ -76,7 +48,7 @@ interface BenchQueue {
   decode(chunk: Buffer): void;
 }
 
-function wrapCurrentQueue(): BenchQueue {
+function wrapQueue(): BenchQueue {
   const queue = createQueue();
   return {
     addCommand: (args) => { queue.addCommand(args); },
@@ -85,35 +57,8 @@ function wrapCurrentQueue(): BenchQueue {
   };
 }
 
-function wrapBinhdrQueue(): BenchQueue {
-  const queue = createBinhdrQueue();
-  return {
-    addCommand: (args) => { queue.addCommand(args); },
-    commandsToWrite: () => queue.commandsToWrite(),
-    decode: (chunk) => queue.processIncomingData(chunk),
-  };
-}
-
-function wrapMasterQueue(): BenchQueue {
-  const queue = createMasterQueue();
-  return {
-    addCommand: (args) => { queue.addCommand(args); },
-    commandsToWrite: () => queue.commandsToWrite(),
-    decode: (chunk) => queue.decoder.write(chunk),
-  };
-}
-
-function wrapCodecQueue(): BenchQueue {
-  const queue = createCodecQueue();
-  return {
-    addCommand: (args) => { queue.addCommand(args); },
-    commandsToWrite: () => queue.commandsToWrite(),
-    decode: (chunk) => queue.processIncomingData(chunk),
-  };
-}
-
-function wrapCodecQueueWithBinhdr(): BenchQueue {
-  const queue = createCodecQueueWithBinhdr();
+function wrapQueueWithBinhdr(): BenchQueue {
+  const queue = createQueueWithBinhdr();
   return {
     addCommand: (args) => { queue.addCommand(args); },
     commandsToWrite: () => queue.commandsToWrite(),
