@@ -136,7 +136,9 @@ export class CommandPacker {
     }
 
     const result = new Array<RedisArgument>(totalParts);
-    result[0] = this.#headerBuffer;
+    // Copy the header buffer to prevent reuse issues - the caller may hold
+    // a reference to this result while we start building the next batch
+    result[0] = Buffer.from(this.#headerBuffer);
 
     let idx = 1;
     for (let i = 0; i < count; i++) {

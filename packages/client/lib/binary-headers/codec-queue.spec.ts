@@ -795,3 +795,224 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
     });
   });
 });
+
+// ============================================================================
+// Auto-pipelining behavior verification
+// Ensures queue behavior matches master queue when no timers configured
+// ============================================================================
+
+describe('Auto-pipelining behavior', function () {
+  // Auto-pipelining works by batching all commands issued in the same event loop
+  // tick into a single socket write (via cork/uncork in socket.ts).
+  // The queue must yield all commands from the same tick when generator is consumed.
+
+  describe('no codec (baseline - matches master queue)', function () {
+    it('yields each command separately for same-tick commands', function () {
+      const queue = createBaseQueue();
+
+      // Simulate same-tick commands (auto-pipelining scenario)
+      queue.addCommand(['SET', 'key1', 'value1']);
+      queue.addCommand(['GET', 'key1']);
+      queue.addCommand(['DEL', 'key1']);
+
+      // Consume generator - should yield 3 separate encoded commands
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 3, 'Should yield 3 separate commands');
+
+      // Verify each is a valid RESP-encoded command
+      const parsed = results.map(r => parseRespCommands((r as string[]).join('')));
+      assert.deepEqual(parsed, [
+        [['SET', 'key1', 'value1']],
+        [['GET', 'key1']],
+        [['DEL', 'key1']]
+      ]);
+    });
+
+    it('generator completes after processing all toWrite commands', function () {
+      const queue = createBaseQueue();
+
+      queue.addCommand(['PING']);
+      queue.addCommand(['PING']);
+
+      const results = collectYielded(queue);
+      assert.equal(results.length, 2);
+
+      // Generator should be exhausted - no more yields
+      const moreResults = collectYielded(queue);
+      assert.equal(moreResults.length, 0, 'Generator should be exhausted');
+    });
+  });
+
+  describe('codec WITHOUT scheduler (should drain at end)', function () {
+    it('batches same-slot commands and drains at generator end', function () {
+      // Create queue with codec but NO scheduler
+      const codec = new BinaryHeadersCodec({
+        outbound: { resolver: STATIC_RESOLVER }
+        // Note: no maxWaitMs, no scheduler
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+
+      // Same-tick commands with same slot
+      queue.addCommand(['SET', 'key1', 'value1']);
+      queue.addCommand(['GET', 'key1']);
+      queue.addCommand(['DEL', 'key1']);
+
+      // Consume generator - should yield ONE packed batch (drained at end)
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 1, 'Should yield 1 packed batch');
+      assertPackedData(results[0], {
+        commandCount: 3,
+        commands: [['SET', 'key1', 'value1'], ['GET', 'key1'], ['DEL', 'key1']]
+      });
+    });
+
+    it('flushes on slot change and drains remaining at end', function () {
+      const codec = new BinaryHeadersCodec({
+        outbound: { resolver: STATIC_RESOLVER }
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+
+      // Commands with different slots - use {hashtag} syntax to guarantee different slots
+      queue.addCommand(['SET', '{slot1}key', 'value1']); // slot for {slot1}
+      queue.addCommand(['SET', '{slot2}key', 'value2']); // different slot - triggers flush
+      queue.addCommand(['GET', '{slot2}key']);           // same slot as {slot2} - batched
+
+      const results = collectYielded(queue);
+
+      // Should have 2 yields: first batch (slot1), then drain (slot2 commands)
+      assert.equal(results.length, 2, 'Should yield 2 batches');
+
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', '{slot1}key', 'value1']]
+      });
+
+      assertPackedData(results[1], {
+        commandCount: 2,
+        commands: [['SET', '{slot2}key', 'value2'], ['GET', '{slot2}key']]
+      });
+    });
+
+    it('generator completes with nothing pending after drain', function () {
+      const codec = new BinaryHeadersCodec({
+        outbound: { resolver: STATIC_RESOLVER }
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+
+      queue.addCommand(['PING']);
+      queue.addCommand(['PING']);
+
+      collectYielded(queue);
+
+      // Nothing should be pending after drain
+      assert.equal(queue.hasPendingOutbound(), false, 'Nothing pending after drain');
+      assert.equal(queue.drainPendingOutbound(), null, 'Drain returns null');
+    });
+  });
+
+  describe('codec WITH scheduler (should NOT drain at end)', function () {
+    let queue: TestableQueueWithTimer;
+
+    afterEach(function () {
+      if (queue) queue.destroy();
+    });
+
+    it('does NOT drain at generator end - leaves commands for timer', function () {
+      queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler: createTimeoutScheduler() }
+      });
+
+      // Same-tick commands
+      queue.addCommand(['SET', 'key1', 'value1']);
+      queue.addCommand(['GET', 'key1']);
+
+      // Consume generator - should yield NOTHING (commands left for timer)
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 0, 'Should yield nothing - timer handles it');
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'Commands pending for timer');
+    });
+
+    it('still flushes on slot change mid-generator', function () {
+      queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler: createTimeoutScheduler() }
+      });
+
+      queue.addCommand(['SET', 'key1', 'value1']); // slot A
+      queue.addCommand(['SET', 'key2', 'value2']); // slot B - triggers flush
+
+      const results = collectYielded(queue);
+
+      // First batch flushed due to slot change
+      assert.equal(results.length, 1, 'Should yield 1 batch from slot change');
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', 'key1', 'value1']]
+      });
+
+      // Second command still pending for timer
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'key2 pending for timer');
+    });
+  });
+
+  describe('comparison: all modes yield all same-tick commands', function () {
+    // This is the key auto-pipelining guarantee: all commands from the same tick
+    // must be yielded (or made available) when the generator is consumed.
+
+    it('no-codec: all commands yielded individually', function () {
+      const queue = createBaseQueue();
+      queue.addCommand(['SET', 'a', '1']);
+      queue.addCommand(['SET', 'b', '2']);
+      queue.addCommand(['SET', 'c', '3']);
+
+      const results = collectYielded(queue);
+      assert.equal(results.length, 3, 'All 3 commands yielded');
+    });
+
+    it('codec-no-scheduler: all commands yielded via drain', function () {
+      const queue = createBinhdrQueue(); // Uses STATIC_RESOLVER, no scheduler
+      queue.addCommand(['SET', 'key', '1']);
+      queue.addCommand(['SET', 'key', '2']);
+      queue.addCommand(['SET', 'key', '3']);
+
+      const results = collectYielded(queue);
+      // All commands batched into 1 yield (same slot)
+      assert.equal(results.length, 1, 'All commands in 1 batch');
+      assertPackedData(results[0], {
+        commandCount: 3,
+        commands: [['SET', 'key', '1'], ['SET', 'key', '2'], ['SET', 'key', '3']]
+      });
+    });
+
+    it('codec-with-scheduler: commands available via timer callback', async function () {
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 10, scheduler: createTimeoutScheduler() }
+      });
+
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((data) => flushedData.push(data));
+
+      queue.addCommand(['SET', 'key', '1']);
+      queue.addCommand(['SET', 'key', '2']);
+      queue.addCommand(['SET', 'key', '3']);
+
+      // Generator yields nothing (timer handles it)
+      const results = collectYielded(queue);
+      assert.equal(results.length, 0);
+
+      // Wait for timer
+      await delay(20);
+
+      // All commands available via callback
+      assert.equal(flushedData.length, 1, 'Timer flushed all commands');
+      assertPackedData(flushedData[0], {
+        commandCount: 3,
+        commands: [['SET', 'key', '1'], ['SET', 'key', '2'], ['SET', 'key', '3']]
+      });
+
+      queue.destroy();
+    });
+  });
+});
