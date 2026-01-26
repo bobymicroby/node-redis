@@ -120,7 +120,7 @@ export class EligibilityResolver {
   }
 }
 
-function buildCommandNode(record: CommandRecord): CommandNode {
+export function buildCommandNode(record: CommandRecord): CommandNode {
   const { keyPosition, blocking } = record;
 
   if (!record.subcommands?.length) {

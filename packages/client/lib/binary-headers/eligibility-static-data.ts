@@ -2,9 +2,8 @@ import type {
   CommandRecord,
   CommandRecordFetcher,
   CommandNode,
-  CommandAttrs,
 } from './eligibility-types';
-import { EligibilityResolver, createEligibilityResolver } from './eligibility-resolver';
+import { EligibilityResolver, createEligibilityResolver, buildCommandNode } from './eligibility-resolver';
 
 export const STATIC_COMMAND_RECORDS: ReadonlyArray<CommandRecord> = [
   { name: 'SET' },
@@ -116,24 +115,6 @@ export const STATIC_COMMAND_RECORDS: ReadonlyArray<CommandRecord> = [
     ]
   },
 ];
-
-function buildCommandNode(record: CommandRecord): CommandNode {
-  const { keyPosition, blocking } = record;
-
-  if (!record.subcommands?.length) {
-    return { keyPosition, blocking };
-  }
-
-  const subs = new Map<string, CommandAttrs>();
-  for (const sub of record.subcommands) {
-    subs.set(sub.name.toUpperCase(), {
-      keyPosition: sub.keyPosition,
-      blocking: sub.blocking,
-    });
-  }
-
-  return { keyPosition, blocking, subs };
-}
 
 function buildCommandMap(records: ReadonlyArray<CommandRecord>): Map<string, CommandNode> {
   const map = new Map<string, CommandNode>();
