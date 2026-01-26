@@ -46,7 +46,6 @@ export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): numb
 }
 
 export class CommandPacker {
-  readonly #headerBuffer: Buffer;
   readonly #maxWaitMs: number | null;
   readonly #resps: Array<ReadonlyArray<RedisArgument>> = [];
 
@@ -55,7 +54,6 @@ export class CommandPacker {
   #bufferStartTime: number | null = null;
 
   constructor(maxWaitMs: number | null = null) {
-    this.#headerBuffer = Buffer.allocUnsafe(RequestHeaderEncoder.ENCODED_LENGTH);
     this.#maxWaitMs = maxWaitMs;
   }
 
@@ -121,9 +119,9 @@ export class CommandPacker {
   #flush(): ReadonlyArray<RedisArgument> {
     const count = this.#resps.length;
 
-    RequestHeaderEncoder.encodeInto(
-      this.#headerBuffer,
-      0,
+    // Allocate fresh header buffer each flush - simple and safe
+    // (16 bytes is trivial overhead vs RESP payload sizes)
+    const headerBuffer = RequestHeaderEncoder.allocateAndEncode(
       toWireSlot(this.#resolvedSlot),
       this.#totalPayloadLength,
       count,
@@ -136,9 +134,7 @@ export class CommandPacker {
     }
 
     const result = new Array<RedisArgument>(totalParts);
-    // Copy the header buffer to prevent reuse issues - the caller may hold
-    // a reference to this result while we start building the next batch
-    result[0] = Buffer.from(this.#headerBuffer);
+    result[0] = headerBuffer;
 
     let idx = 1;
     for (let i = 0; i < count; i++) {
