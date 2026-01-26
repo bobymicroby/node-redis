@@ -79,6 +79,35 @@ describe('Packing', () => {
         assert.equal(packer.bufferSize, 1);
       });
 
+      it('header buffer is not corrupted by subsequent flush (buffer reuse regression)', () => {
+        // This test catches a bug where the packer reused its internal header buffer
+        // without copying. If the caller holds a reference to the first flush result
+        // while a second flush occurs, the first result's header would be corrupted.
+        const packer = new CommandPacker();
+
+        // First batch: slot 1000, 2 commands
+        packer.add(['cmd1'], 1000, 4);
+        packer.add(['cmd2'], 1000, 4);
+        const firstFlush = packer.add(['cmd3'], 2000, 4); // triggers flush (slot change)
+
+        // Second batch: slot 2000, 2 commands
+        packer.add(['cmd4'], 2000, 4);
+        const secondFlush = packer.add(['cmd5'], 3000, 4); // triggers flush (slot change)
+
+        // Third batch via drain: slot 3000, 1 command
+        const thirdFlush = packer.drain();
+
+        // CRITICAL: Verify first flush header is still valid after subsequent flushes
+        // Before the fix, firstFlush[0] would contain thirdFlush's header data
+        assertPackedHeader(firstFlush, { commandCount: 2, slot: 1000 });
+        assertPackedHeader(secondFlush, { commandCount: 2, slot: 2000 });
+        assertPackedHeader(thirdFlush, { commandCount: 1, slot: 3000 });
+
+        // Also verify the header buffers are distinct objects (not aliased)
+        assert.notStrictEqual(firstFlush![0], secondFlush![0], 'Header buffers should be distinct');
+        assert.notStrictEqual(secondFlush![0], thirdFlush![0], 'Header buffers should be distinct');
+      });
+
       it('drain returns packed commands and empties buffer', () => {
         const packer = new CommandPacker();
         packer.add(['*1\r\n$4\r\nPING\r\n'], 1000, 14);
