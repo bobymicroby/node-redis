@@ -1,3 +1,4 @@
+// Binary Header Protocol Types
 export type {
   RequestHeader as BinaryRequestHeader,
 } from './generated/request-header-codec';
@@ -5,6 +6,7 @@ export type {
   ResponseHeader as BinaryResponseHeader,
 } from './generated/response-header-codec';
 
+// Binary Header Encoders/Decoders
 export {
   RequestHeaderEncoder,
   RequestHeaderDecoder,
@@ -17,6 +19,7 @@ export {
   hasProtocolError,
 } from './generated/response-header-codec';
 
+// Inbound Decoder
 export type {
   OnHeader,
   OnProtocolError,
@@ -26,12 +29,9 @@ export type {
 
 export {
   BinhdrInboundDecoder,
-  createBinhdrInterceptor,
-  passthroughInbound,
-  passthroughOutbound,
-  chainInbound,
 } from './interceptor';
 
+// Packing
 export type {
   Scheduler,
   Cancellable,
@@ -44,6 +44,7 @@ export {
   calculatePayloadLength,
 } from './packing';
 
+// Eligibility
 export type {
   EligibilityResult,
   CommandRecord,
@@ -68,14 +69,13 @@ export {
   createDynamicResolver,
 } from './eligibility-static-data';
 
+// Codec (integrates with commands-queue)
 export type {
   TimerFlushCallback,
   TimerOptions,
   CommandCodec,
   OutboundCodec,
   InboundCodec,
-  Scheduler,
-  Cancellable,
 } from '../client/commands-queue';
 
 export {
