@@ -164,6 +164,75 @@ describe('Codec Queue [codec-queue]', function () {
       const queue = createQueueWithTimer(42);
       assert.equal(queue.maxWaitMs, 42);
     });
+
+    // NOTE: Timer-based flushing tests require understanding the flow:
+    // 1. addCommand() adds to the queue's internal toWrite list
+    // 2. commandsToWrite() generator is consumed by the socket layer
+    // 3. During generator consumption, codec.transform() may buffer (return null)
+    // 4. At END of generator, codec.drain() is called and yields remaining data
+    // 5. Timer fires INDEPENDENTLY when generator is NOT being consumed
+    //
+    // This means: consuming the full generator always drains everything.
+    // Timer flushing is for when the generator is NOT fully consumed yet.
+    //
+    // For unit tests, we can test timer behavior by:
+    // - Testing that drain cancels pending timers (already done via destroy test)
+    // - Testing the underlying packer's time-bounded behavior (in packing.spec.ts)
+    // - Testing scheduler implementations (in packing.spec.ts)
+    //
+    // The comprehensive timer behavior is tested at integration level in the client.
+
+    it('hasPendingOutbound reflects codec buffer state', function () {
+      const queue = createQueueWithTimer(100, false) as RedisCommandsQueue;
+
+      assert.equal(queue.hasPendingOutbound(), false, 'No pending before adding');
+
+      // Add command but don't consume generator yet - command is in toWrite, not codec buffer
+      queue.addCommand(['SET', 'key', 'value']);
+      // Note: hasPendingOutbound checks codec's buffer, not toWrite queue
+      assert.equal(queue.hasPendingOutbound(), false, 'Nothing in codec until generator runs');
+    });
+
+    it('drainPendingOutbound returns null when nothing buffered in codec', function () {
+      const queue = createQueueWithTimer(100, false) as RedisCommandsQueue;
+
+      // Add command but don't consume generator
+      queue.addCommand(['SET', 'key', 'value']);
+
+      // Drain returns null because codec hasn't received anything yet
+      const drained = queue.drainPendingOutbound();
+      assert.equal(drained, null, 'Nothing to drain before generator consumption');
+    });
+
+    it('generator yields all buffered commands via drain at end', function () {
+      const queue = createQueueWithTimer(100, false);
+
+      // Add multiple commands with same slot
+      queue.addCommand(['SET', 'key', 'value1']);
+      queue.addCommand(['GET', 'key']);
+      queue.addCommand(['DEL', 'key']);
+
+      // Consuming generator should yield everything (drain called at end)
+      const results = collectYielded(queue);
+
+      // All commands packed together in single yield
+      assert.equal(results.length, 1, 'All commands yielded as single batch');
+      assertPackedHeader(results[0], { commandCount: 3 });
+    });
+
+    it('slot incompatibility causes flush mid-generator', function () {
+      const queue = createQueueWithTimer(100, false);
+
+      // Add commands with different slots
+      queue.addCommand(['SET', 'key1', 'value1']); // slot A
+      queue.addCommand(['SET', 'key2', 'value2']); // slot B (different)
+      queue.addCommand(['SET', 'key1', 'value3']); // slot A again
+
+      const results = collectYielded(queue);
+
+      // Should have multiple yields due to slot changes
+      assert.ok(results.length >= 2, 'Slot incompatibility causes multiple yields');
+    });
   });
 
   describe('integration with existing components', function () {
