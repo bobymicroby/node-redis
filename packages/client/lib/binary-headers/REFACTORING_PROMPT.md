@@ -560,3 +560,6 @@ cd packages/client/lib/binary-headers
 # Multiple iterations - cleanup work
 ./ralph.sh 5
 ```
+
+**Note:** The `ralph-progress.txt` file is gitignored - it's a local tracking file only.
+Do not attempt to commit it or worry about its git status.
