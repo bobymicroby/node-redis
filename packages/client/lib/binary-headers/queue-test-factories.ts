@@ -34,13 +34,12 @@
  *
  * ## Test Matrix Helpers
  *
- * Use `forEachQueue()` to run tests against multiple queue implementations without
+ * Use `forQueues()` to run tests against multiple queue implementations without
  * writing loops in your test file:
  *
  * ```typescript
- * // Registers one test per queue implementation
- * forEachQueue(['master', 'no-codec'], 'yields commands separately', (create) => {
- *   const queue = create();
+ * // Registers one test per queue implementation - queue is created for you
+ * forQueues(['master', 'no-codec'], 'yields commands separately', (queue) => {
  *   queue.addCommand(['PING']);
  *   assert.equal(collectYielded(queue).length, 1);
  * });
@@ -200,37 +199,35 @@ export const createBaseQueue = createNoCodecQueue;
 // Test Matrix Helpers
 // ============================================================================
 
-type QueueName = 'master' | 'no-codec';
-type QueueFactory = () => TestableQueue;
+export type QueueName = 'master' | 'no-codec';
 
-const QUEUE_FACTORIES: Record<QueueName, QueueFactory> = {
+const QUEUE_FACTORIES: Record<QueueName, () => TestableQueue> = {
   'master': createMasterQueue,
   'no-codec': createNoCodecQueue,
 };
 
 /**
  * Registers a test for each specified queue implementation.
- * Eliminates the need for loops in test files.
+ * Queue is created automatically and passed to the test function.
  *
  * @param queues - Queue implementations to test against
  * @param name - Test name (will be prefixed with [queueName])
- * @param fn - Test function receiving the queue factory
+ * @param fn - Test function receiving the queue instance
  *
  * @example
- * forEachQueue(['master', 'no-codec'], 'yields commands', (create) => {
- *   const queue = create();
+ * forQueues(['master', 'no-codec'], 'yields commands', (queue) => {
  *   queue.addCommand(['PING']);
  *   assert.equal(collectYielded(queue).length, 1);
  * });
  */
-export function forEachQueue(
+export function forQueues(
   queues: QueueName[],
   name: string,
-  fn: (create: QueueFactory) => void | Promise<void>
+  fn: (queue: TestableQueue) => void | Promise<void>
 ): void {
   for (const q of queues) {
     it(`[${q}] ${name}`, function () {
-      return fn(QUEUE_FACTORIES[q]);
+      return fn(QUEUE_FACTORIES[q]());
     });
   }
 }
@@ -240,9 +237,9 @@ export function forEachQueue(
  */
 export function forBothQueues(
   name: string,
-  fn: (create: QueueFactory) => void | Promise<void>
+  fn: (queue: TestableQueue) => void | Promise<void>
 ): void {
-  forEachQueue(['master', 'no-codec'], name, fn);
+  forQueues(['master', 'no-codec'], name, fn);
 }
 
 /**
