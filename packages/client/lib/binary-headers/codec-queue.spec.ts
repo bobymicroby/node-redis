@@ -39,6 +39,55 @@ function assertPackedHeader(
   }
 }
 
+/**
+ * Asserts packed data has correct header AND payload.
+ * Verifies header fields and parses RESP payload to check command contents.
+ */
+function assertPackedData(
+  packed: ReadonlyArray<unknown> | null,
+  expected: {
+    commandCount: number;
+    slot?: number;
+    commands?: string[][]; // Expected commands, e.g. [['SET', 'key', 'value'], ['GET', 'key']]
+  }
+): void {
+  assert.ok(packed !== null, 'Expected packed data to be non-null');
+  assert.ok(packed.length > 1, 'Expected header + payload parts');
+  assert.ok(packed[0] instanceof Buffer, 'Expected first element to be header Buffer');
+
+  // Verify header
+  const decoder = new RequestHeaderDecoder().wrap(packed[0] as Buffer, 0);
+  assert.ok(decoder.isValid(), 'Expected valid header');
+  assert.equal(decoder.commandCount(), expected.commandCount, 'commandCount mismatch');
+
+  if (expected.slot !== undefined) {
+    assert.equal(decoder.slot(), expected.slot, 'slot mismatch');
+  }
+
+  // Verify payload if commands specified
+  if (expected.commands !== undefined) {
+    // Concatenate all payload parts
+    const payloadParts = packed.slice(1);
+    const payloadBuffer = Buffer.concat(
+      payloadParts.map(p => typeof p === 'string' ? Buffer.from(p) : p as Buffer)
+    );
+
+    // Parse RESP commands from payload
+    const parsedCommands = parseRespCommands(payloadBuffer);
+    assert.equal(parsedCommands.length, expected.commands.length, 'Number of commands mismatch');
+
+    for (let i = 0; i < expected.commands.length; i++) {
+      const expectedCmd = expected.commands[i];
+      const actualCmd = parsedCommands[i] as unknown[];
+      assert.deepEqual(
+        actualCmd.map(v => v instanceof Buffer ? v.toString() : v),
+        expectedCmd,
+        `Command ${i} mismatch`
+      );
+    }
+  }
+}
+
 // ============================================================================
 // Tests for RedisCommandsQueue with codec support
 // ============================================================================
@@ -205,7 +254,10 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Should yield because drain happens at end (no scheduler)
       assert.equal(results.length, 1, 'Generator should drain when no scheduler');
-      assertPackedHeader(results[0], { commandCount: 2 });
+      assertPackedData(results[0], {
+        commandCount: 2,
+        commands: [['SET', 'key', 'value1'], ['GET', 'key']]
+      });
     });
 
     it('timer fires and flushes buffered commands via callback', async function () {
@@ -225,7 +277,10 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Timer should have invoked callback with packed data
       assert.equal(flushedData.length, 1, 'Timer callback should have been called once');
-      assertPackedHeader(flushedData[0], { commandCount: 1 });
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', 'key', 'value']]
+      });
     });
 
     it('timer is cancelled when slot incompatibility causes flush', async function () {
@@ -272,7 +327,10 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Should have received one callback with all 3 commands packed
       assert.equal(flushedData.length, 1, 'Should have one callback');
-      assertPackedHeader(flushedData[0], { commandCount: 3 });
+      assertPackedData(flushedData[0], {
+        commandCount: 3,
+        commands: [['SET', 'key', 'value1'], ['GET', 'key'], ['DEL', 'key']]
+      });
     });
 
     it('destroy during active timer prevents callback', async function () {
@@ -334,7 +392,10 @@ describe('Codec Queue [codec-queue]', function () {
 
       const drained = queue.drainPendingOutbound();
       assert.ok(drained !== null, 'Should have drained data');
-      assertPackedHeader(drained, { commandCount: 1 });
+      assertPackedData(drained, {
+        commandCount: 1,
+        commands: [['SET', 'key', 'value']]
+      });
 
       assert.equal(queue.hasPendingOutbound(), false, 'No longer pending after drain');
     });
