@@ -6,7 +6,7 @@
 
 import type { RedisArgument } from '../RESP/types';
 import type { Decoder } from '../RESP/decoder';
-import type { OutboundCodec, InboundCodec, CommandCodec } from './codec-queue';
+import type { OutboundCodec, InboundCodec, CommandCodec } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility-resolver';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility-resolver';
 import { CommandPacker, calculatePayloadLength } from './packing';

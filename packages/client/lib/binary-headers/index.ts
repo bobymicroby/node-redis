@@ -69,8 +69,24 @@ export {
 } from './eligibility-static-data';
 
 export type {
-  BinhdrQueueOptions,
   TimerFlushCallback,
-} from './binhdr-commands-queue';
+  TimerOptions,
+  CommandCodec,
+  OutboundCodec,
+  InboundCodec,
+  Scheduler,
+  Cancellable,
+} from '../client/commands-queue';
 
-export { default as BinhdrCommandsQueue } from './binhdr-commands-queue';
+export {
+  BinaryHeadersCodec,
+  BinaryHeadersOutboundCodec,
+  BinaryHeadersInboundCodec,
+  createBinaryHeadersCodec,
+} from './codec';
+
+export type {
+  BinaryHeadersCodecOptions,
+  BinaryHeadersOutboundOptions,
+  BinaryHeadersInboundOptions,
+} from './codec';
