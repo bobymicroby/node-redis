@@ -1,10 +1,4 @@
 import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
-import type {
-  InboundNext,
-  InboundInterceptor,
-  OutboundInterceptor,
-  OutboundCommand
-} from '../client/commands-queue';
 import type { Decoder } from '../RESP/decoder';
 
 export type OnHeader = (header: BinaryResponseHeader) => void;
@@ -26,6 +20,10 @@ const enum ParseResult {
   BUFFER_PARTIAL,
 }
 
+/**
+ * Decodes binary header frames from incoming data.
+ * Strips headers and forwards payloads to a sink or decoder.
+ */
 export class BinhdrInboundDecoder {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
@@ -110,50 +108,4 @@ export class BinhdrInboundDecoder {
 
     return ParseResult.CONTINUE;
   }
-}
-
-export function createBinhdrInterceptor(options: InterceptorOptions = {}): InboundInterceptor {
-  const decoder = new BinhdrInboundDecoder(options);
-  return (chunk: Buffer, next: InboundNext): void => {
-    decoder.process(chunk, next);
-  };
-}
-
-export function passthroughInbound(): InboundInterceptor {
-  return (chunk: Buffer, next: InboundNext): void => {
-    next(chunk);
-  };
-}
-
-export function passthroughOutbound(): OutboundInterceptor {
-  return {
-    process(command: OutboundCommand): OutboundCommand | null {
-      return command;
-    },
-    drain(): OutboundCommand | null {
-      return null;
-    }
-  };
-}
-
-export function chainInbound(interceptors: ReadonlyArray<InboundInterceptor>): InboundInterceptor {
-  const count = interceptors.length;
-
-  if (count === 0) {
-    return passthroughInbound();
-  }
-
-  if (count === 1) {
-    return interceptors[0];
-  }
-
-  return (chunk: Buffer, next: InboundNext): void => {
-    let current = next;
-    for (let i = count - 1; i >= 0; i--) {
-      const interceptor = interceptors[i];
-      const downstream = current;
-      current = (data: Buffer) => interceptor(data, downstream);
-    }
-    current(chunk);
-  };
 }

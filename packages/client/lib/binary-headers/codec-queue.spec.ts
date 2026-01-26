@@ -1,9 +1,10 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
 import RedisCommandsQueue, { type CommandCodec, type TimerFlushCallback } from '../client/commands-queue';
-import { BinaryHeadersCodec } from './codec';
+import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
 import { createTimeoutScheduler, createImmediateScheduler } from './packing';
 import { RequestHeaderDecoder } from './generated/request-header-codec';
+import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import { createBinhdrFrame, parseRespCommands } from './test-utils';
 import {
   createBaseQueue,
@@ -219,6 +220,189 @@ describe('Codec Queue [codec-queue]', function () {
 
       const result = await promise;
       assert.equal(result, 'PONG');
+    });
+  });
+
+  describe('inbound codec chunked data handling', function () {
+    const chunkingCases = [
+      { name: 'header split at byte 4', splitAt: 4 },
+      { name: 'split at header boundary', splitAt: 16 },
+      { name: 'payload split mid-stream', splitAt: 20 },
+    ];
+
+    for (const { name, splitAt } of chunkingCases) {
+      it(`handles ${name}`, async function () {
+        const queue = createBinhdrQueue();
+        const promise = queue.addCommand<string>(['PING']);
+        for (const _ of queue.commandsToWrite()) {}
+
+        const frame = createBinhdrFrame(Buffer.from('+PONG\r\n'));
+
+        queue.processIncomingData(frame.subarray(0, splitAt));
+        queue.processIncomingData(frame.subarray(splitAt));
+
+        const result = await promise;
+        assert.equal(result, 'PONG');
+      });
+    }
+
+    it('handles single byte chunks', async function () {
+      const queue = createBinhdrQueue();
+      const promise = queue.addCommand<string>(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      const frame = createBinhdrFrame(Buffer.from('+PONG\r\n'));
+
+      for (let i = 0; i < frame.length; i++) {
+        queue.processIncomingData(frame.subarray(i, i + 1));
+      }
+
+      const result = await promise;
+      assert.equal(result, 'PONG');
+    });
+
+    it('handles multiple complete frames in one chunk', async function () {
+      const queue = createBinhdrQueue();
+      const promise1 = queue.addCommand<string>(['PING']);
+      const promise2 = queue.addCommand<number>(['INCR', 'counter']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      const payload1 = Buffer.from('+PONG\r\n');
+      const payload2 = Buffer.from(':123\r\n');
+      const combined = Buffer.concat([createBinhdrFrame(payload1), createBinhdrFrame(payload2)]);
+
+      queue.processIncomingData(combined);
+
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+      assert.equal(result1, 'PONG');
+      assert.equal(result2, 123);
+    });
+
+    it('handles frame boundary across chunks', async function () {
+      const queue = createBinhdrQueue();
+      const promise1 = queue.addCommand<string>(['PING']);
+      const promise2 = queue.addCommand<number>(['INCR', 'x']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      const frame1 = createBinhdrFrame(Buffer.from('+PONG\r\n'));
+      const frame2 = createBinhdrFrame(Buffer.from(':456\r\n'));
+      const combined = Buffer.concat([frame1, frame2]);
+      const splitPoint = frame1.length + 3; // Split in middle of second frame's header
+
+      queue.processIncomingData(combined.subarray(0, splitPoint));
+      queue.processIncomingData(combined.subarray(splitPoint));
+
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+      assert.equal(result1, 'PONG');
+      assert.equal(result2, 456);
+    });
+
+    it('handles empty payload frame', async function () {
+      const queue = createBinhdrQueue();
+      const promise = queue.addCommand<null>(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      // Create frame with empty payload followed by actual response
+      const emptyFrame = ResponseHeaderEncoder.allocateAndEncode(0, 1, false, 0);
+      const responseFrame = createBinhdrFrame(Buffer.from('$-1\r\n')); // null bulk string
+
+      queue.processIncomingData(Buffer.concat([emptyFrame, responseFrame]));
+
+      const result = await promise;
+      assert.equal(result, null);
+    });
+
+    it('handles large payload', async function () {
+      const queue = createBinhdrQueue();
+      const promise = queue.addCommand<Buffer>(['GET', 'bigkey']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      const largeData = Buffer.alloc(10000, 'x');
+      const respPayload = Buffer.from(`$${largeData.length}\r\n${largeData.toString()}\r\n`);
+      const frame = createBinhdrFrame(respPayload);
+
+      queue.processIncomingData(frame);
+
+      const result = await promise;
+      assert.equal(result.length, 10000);
+    });
+
+    it('switches from binary header frame to regular RESP passthrough', async function () {
+      // This tests when non-binhdr data comes through (passthrough behavior)
+      const queue = createBaseQueue(); // No codec - baseline
+      const promise = queue.addCommand<number>(['INCR', 'x']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      // Regular RESP (not binary header wrapped)
+      queue.processIncomingData(Buffer.from(':999\r\n'));
+
+      const result = await promise;
+      assert.equal(result, 999);
+    });
+  });
+
+  describe('inbound codec callbacks', function () {
+    it('calls onProtocolError when flag is set', async function () {
+      const errors: number[] = [];
+      const codec = new BinaryHeadersCodec({
+        outbound: { resolver: STATIC_RESOLVER },
+        inbound: { onProtocolError: (requestId) => errors.push(requestId) }
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+
+      const promise = queue.addCommand<string>(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      // Frame with protocolError flag set
+      queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n'), 1, 99, true));
+
+      await promise;
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0], 99);
+    });
+
+    it('does not call onProtocolError when flag is not set', async function () {
+      let called = false;
+      const codec = new BinaryHeadersCodec({
+        outbound: { resolver: STATIC_RESOLVER },
+        inbound: { onProtocolError: () => { called = true; } }
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+
+      const promise = queue.addCommand<string>(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      queue.processIncomingData(createBinhdrFrame(Buffer.from('+PONG\r\n')));
+
+      await promise;
+      assert.equal(called, false);
+    });
+  });
+
+  describe('inbound codec state isolation', function () {
+    it('maintains separate state per queue instance', async function () {
+      const queue1 = createBinhdrQueue();
+      const queue2 = createBinhdrQueue();
+
+      const promise1 = queue1.addCommand<string>(['PING']);
+      const promise2 = queue2.addCommand<string>(['PING']);
+      for (const _ of queue1.commandsToWrite()) {}
+      for (const _ of queue2.commandsToWrite()) {}
+
+      const frame = createBinhdrFrame(Buffer.from('+PONG\r\n'));
+
+      // Send partial to queue1
+      queue1.processIncomingData(frame.subarray(0, 4));
+
+      // Send complete to queue2
+      queue2.processIncomingData(frame);
+      const result2 = await promise2;
+      assert.equal(result2, 'PONG');
+
+      // Complete queue1
+      queue1.processIncomingData(frame.subarray(4));
+      const result1 = await promise1;
+      assert.equal(result1, 'PONG');
     });
   });
 });
