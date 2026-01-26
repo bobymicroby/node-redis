@@ -1,17 +1,13 @@
 import type { RedisArgument } from '../RESP/types';
 import { RequestHeaderEncoder } from './generated/request-header-codec';
+import type { Cancellable, Scheduler } from '../client/commands-queue';
+
+// Re-export for convenience (canonical source is commands-queue.ts)
+export type { Cancellable, Scheduler };
 
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
 const MAX_COMMAND_COUNT = RequestHeaderEncoder.commandCountMaxValue();
 const MAX_PAYLOAD_LENGTH = RequestHeaderEncoder.lengthMaxValue();
-
-export interface Cancellable {
-  cancel(): void;
-}
-
-export interface Scheduler {
-  schedule(delayMs: number, task: () => void): Cancellable;
-}
 
 export function createTimeoutScheduler(): Scheduler {
   return {
