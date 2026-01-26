@@ -138,7 +138,10 @@ describe('Codec Queue [codec-queue]', function () {
       const results = collectYielded(queue);
 
       assert.equal(results.length, 1);
-      assertPackedHeader(results[0], { commandCount: 3 });
+      assertPackedData(results[0], {
+        commandCount: 3,
+        commands: [['PING'], ['PING'], ['PING']]
+      });
     });
 
     it('single command is batched with header', function () {
@@ -148,7 +151,10 @@ describe('Codec Queue [codec-queue]', function () {
       const results = collectYielded(queue);
 
       assert.equal(results.length, 1);
-      assertPackedHeader(results[0], { commandCount: 1 });
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['PING']]
+      });
     });
 
     it('processes incoming data through inbound codec', async function () {
@@ -298,7 +304,10 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Should yield the first command (flushed due to slot incompatibility)
       assert.equal(results.length, 1, 'Should yield flushed data from slot change');
-      assertPackedHeader(results[0], { commandCount: 1 });
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', 'key1', 'value1']]
+      });
 
       // Wait past the original timer
       await delay(60);
@@ -428,7 +437,10 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Should be batched together (same slot)
       assert.equal(results.length, 1);
-      assertPackedHeader(results[0], { commandCount: 2 });
+      assertPackedData(results[0], {
+        commandCount: 2,
+        commands: [['SET', 'key1', 'value1'], ['GET', 'key1']]
+      });
     });
 
     it('handles inbound binary header frames correctly', async function () {
