@@ -3,7 +3,7 @@ import RedisSocket, { RedisSocketOptions } from './socket';
 import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
 import RedisCommandsQueue, { CommandOptions } from './commands-queue';
 import { BinaryHeadersCodec } from '../binary-headers/codec';
-import { STATIC_RESOLVER } from '../binary-headers/eligibility-static-data';
+import { STATIC_RESOLVER } from '../binary-headers/eligibility';
 import { createTimeoutScheduler } from '../binary-headers/packing';
 import { EventEmitter } from 'node:events';
 import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';

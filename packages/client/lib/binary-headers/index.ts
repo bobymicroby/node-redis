@@ -56,21 +56,17 @@ export type {
   BlockingBehavior,
   CommandAttrs,
   CommandNode,
-} from './eligibility-types';
+} from './eligibility';
 
 export {
   EligibilityResolver,
   NOOP_RESOLVER,
   SLOT_INELIGIBLE,
-} from './eligibility-resolver';
-
-export {
   STATIC_COMMAND_RECORDS,
   STATIC_RESOLVER,
   createMockRecordFetcher,
-  createDefaultResolver,
-  createDynamicResolver,
-} from './eligibility-static-data';
+  createEligibilityResolver,
+} from './eligibility';
 
 // Codec (integrates with commands-queue)
 export type {

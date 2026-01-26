@@ -1,15 +1,19 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach } from 'mocha';
-import { EligibilityResolver, createEligibilityResolver } from './eligibility-resolver';
-import { createMockRecordFetcher, createDefaultResolver } from './eligibility-static-data';
-import type { CommandRecord } from './eligibility-types';
+import {
+  EligibilityResolver,
+  createEligibilityResolver,
+  createMockRecordFetcher,
+  STATIC_RESOLVER,
+  type CommandRecord,
+} from './eligibility';
 
 describe('Eligibility', () => {
   describe('EligibilityResolver', () => {
     let resolver: EligibilityResolver;
 
-    beforeEach(async () => {
-      resolver = await createDefaultResolver();
+    beforeEach(() => {
+      resolver = STATIC_RESOLVER;
     });
 
     const eligibleCommands = [
