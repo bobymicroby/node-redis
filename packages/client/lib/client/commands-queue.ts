@@ -573,10 +573,12 @@ export default class RedisCommandsQueue {
       toSend = this.#toWrite.shift();
     }
 
-    if (codec !== null) {
+    // Only drain immediately if no timer-based batching is configured.
+    // When a scheduler is set, the timer callback handles flushing buffered commands.
+    // This allows commands to batch up to maxWaitMs before being sent.
+    if (codec !== null && this.#scheduler === null) {
       const drained = codec.outbound.drain();
       if (drained !== null) {
-        this.#cancelPendingFlush();
         yield drained;
       }
     }
