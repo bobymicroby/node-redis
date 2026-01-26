@@ -12,7 +12,7 @@
  * ## Quick Start
  *
  * ```typescript
- * import { createMasterQueue, createNoCodecQueue, createBinhdrQueue, noCodecFactories } from './queue-test-factories';
+ * import { createMasterQueue, createNoCodecQueue, createBinhdrQueue, forEachQueue } from './queue-test-factories';
  *
  * // Original master queue (true baseline)
  * const masterQueue = createMasterQueue();
@@ -22,11 +22,6 @@
  *
  * // Queue with binary headers codec
  * const binhdrQueue = createBinhdrQueue();
- *
- * // Run tests against both master and no-codec to verify identical behavior
- * for (const { name, factory } of noCodecFactories) {
- *   describe(`[${name}]`, () => { ... });
- * }
  * ```
  *
  * ## Factory Functions
@@ -37,9 +32,19 @@
  * - `createBinhdrQueueWithTimer()` - Queue with binary headers + timer support
  * - `createPassthroughQueue()` - Queue with codec but no batching (NOOP_RESOLVER)
  *
- * ## Testing Helpers
+ * ## Test Matrix Helpers
  *
- * - `noCodecFactories` - Array of { name, factory } for running tests against both master and no-codec
+ * Use `forEachQueue()` to run tests against multiple queue implementations without
+ * writing loops in your test file:
+ *
+ * ```typescript
+ * // Registers one test per queue implementation
+ * forEachQueue(['master', 'no-codec'], 'yields commands separately', (create) => {
+ *   const queue = create();
+ *   queue.addCommand(['PING']);
+ *   assert.equal(collectYielded(queue).length, 1);
+ * });
+ * ```
  */
 
 import type { RedisArgument, RespVersions } from '../RESP/types';
@@ -191,24 +196,54 @@ export function createNoCodecQueue(options: Omit<QueueFactoryOptions, 'resolver'
  */
 export const createBaseQueue = createNoCodecQueue;
 
+// ============================================================================
+// Test Matrix Helpers
+// ============================================================================
+
+type QueueName = 'master' | 'no-codec';
+type QueueFactory = () => TestableQueue;
+
+const QUEUE_FACTORIES: Record<QueueName, QueueFactory> = {
+  'master': createMasterQueue,
+  'no-codec': createNoCodecQueue,
+};
+
 /**
- * Factory definitions for running tests against both master and no-codec queues.
- * Use this to verify the new implementation matches the original behavior.
+ * Registers a test for each specified queue implementation.
+ * Eliminates the need for loops in test files.
+ *
+ * @param queues - Queue implementations to test against
+ * @param name - Test name (will be prefixed with [queueName])
+ * @param fn - Test function receiving the queue factory
  *
  * @example
- * for (const { name, factory } of noCodecFactories) {
- *   describe(`[${name}]`, () => {
- *     it('some test', () => {
- *       const queue = factory();
- *       // test...
- *     });
- *   });
- * }
+ * forEachQueue(['master', 'no-codec'], 'yields commands', (create) => {
+ *   const queue = create();
+ *   queue.addCommand(['PING']);
+ *   assert.equal(collectYielded(queue).length, 1);
+ * });
  */
-export const noCodecFactories: ReadonlyArray<{ name: string; factory: typeof createNoCodecQueue }> = [
-  { name: 'master', factory: createMasterQueue },
-  { name: 'no-codec', factory: createNoCodecQueue },
-];
+export function forEachQueue(
+  queues: QueueName[],
+  name: string,
+  fn: (create: QueueFactory) => void | Promise<void>
+): void {
+  for (const q of queues) {
+    it(`[${q}] ${name}`, function () {
+      return fn(QUEUE_FACTORIES[q]);
+    });
+  }
+}
+
+/**
+ * Shorthand for running a test against both master and no-codec queues.
+ */
+export function forBothQueues(
+  name: string,
+  fn: (create: QueueFactory) => void | Promise<void>
+): void {
+  forEachQueue(['master', 'no-codec'], name, fn);
+}
 
 /**
  * Creates a queue with binary headers support.
