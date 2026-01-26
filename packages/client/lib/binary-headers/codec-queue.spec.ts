@@ -1,120 +1,52 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
-import RedisCommandsQueue, { type CommandCodec, type TimerFlushCallback } from '../client/commands-queue';
+import RedisCommandsQueue, { type CommandCodec } from '../client/commands-queue';
 import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
-import { createTimeoutScheduler, createImmediateScheduler } from './packing';
-import { RequestHeaderDecoder } from './generated/request-header-codec';
-import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import {
+  // Async utilities
+  delay,
+  // Frame utilities
   createBinhdrFrame,
+  createMultipleFrames,
+  // RESP utilities
   parseRespCommands,
-  splitAt,
-  splitIntoBytes,
   respSimpleString,
   respInteger,
   respBulkString,
   respError,
   respNull,
+  // Chunking utilities
+  splitAt,
+  splitIntoBytes,
+  // Stress utilities
   largeBuffer,
-  createMultipleFrames,
-} from './test-utils';
-import {
+  // Collection helpers
+  collectYielded,
+  collectYieldedParsed,
+  // Assertion helpers
+  assertPackedHeader,
+  assertPackedData,
+  // Queue factories
   createNoCodecQueue,
   createBinhdrQueue,
   createBinhdrQueueWithTimer,
   createPassthroughQueue,
-  collectYielded,
   forQueues,
+  // Re-exports
+  createTimeoutScheduler,
+  createImmediateScheduler,
   STATIC_RESOLVER,
+  ResponseHeaderEncoder,
+  // Types
   type TestableQueue,
   type TestableQueueWithTimer,
-} from './queue-test-factories';
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function assertPackedHeader(
-  packed: ReadonlyArray<unknown> | null,
-  expected: { commandCount?: number; slot?: number }
-): void {
-  assert.ok(packed !== null, 'Expected packed data to be non-null');
-  assert.ok(packed[0] instanceof Buffer, 'Expected first element to be a Buffer');
-
-  const decoder = new RequestHeaderDecoder().wrap(packed[0] as Buffer, 0);
-  assert.ok(decoder.isValid(), 'Expected valid header');
-
-  if (expected.commandCount !== undefined) {
-    assert.equal(decoder.commandCount(), expected.commandCount);
-  }
-  if (expected.slot !== undefined) {
-    assert.equal(decoder.slot(), expected.slot);
-  }
-}
-
-/**
- * Asserts packed data has correct header AND payload.
- * Verifies header fields and parses RESP payload to check command contents.
- */
-function assertPackedData(
-  packed: ReadonlyArray<unknown> | null,
-  expected: {
-    commandCount: number;
-    slot?: number;
-    commands?: string[][]; // Expected commands, e.g. [['SET', 'key', 'value'], ['GET', 'key']]
-  }
-): void {
-  assert.ok(packed !== null, 'Expected packed data to be non-null');
-  assert.ok(packed.length > 1, 'Expected header + payload parts');
-  assert.ok(packed[0] instanceof Buffer, 'Expected first element to be header Buffer');
-
-  // Verify header
-  const decoder = new RequestHeaderDecoder().wrap(packed[0] as Buffer, 0);
-  assert.ok(decoder.isValid(), 'Expected valid header');
-  assert.equal(decoder.commandCount(), expected.commandCount, 'commandCount mismatch');
-
-  if (expected.slot !== undefined) {
-    assert.equal(decoder.slot(), expected.slot, 'slot mismatch');
-  }
-
-  // Verify payload if commands specified
-  if (expected.commands !== undefined) {
-    // Concatenate all payload parts
-    const payloadParts = packed.slice(1);
-    const payloadBuffer = Buffer.concat(
-      payloadParts.map(p => typeof p === 'string' ? Buffer.from(p) : p as Buffer)
-    );
-
-    // Parse RESP commands from payload
-    const parsedCommands = parseRespCommands(payloadBuffer);
-    assert.equal(parsedCommands.length, expected.commands.length, 'Number of commands mismatch');
-
-    for (let i = 0; i < expected.commands.length; i++) {
-      const expectedCmd = expected.commands[i];
-      const actualCmd = parsedCommands[i] as unknown[];
-      assert.deepEqual(
-        actualCmd.map(v => v instanceof Buffer ? v.toString() : v),
-        expectedCmd,
-        `Command ${i} mismatch`
-      );
-    }
-  }
-}
+} from './test-utils';
 
 // ============================================================================
 // Tests for RedisCommandsQueue with codec support
 // ============================================================================
 
 describe('Codec Queue [codec-queue]', function () {
-  // Helper to collect yielded commands and parse them back to arrays
-  function collectYieldedParsed(queue: TestableQueue): unknown[][] {
-    const results: unknown[][] = [];
-    for (const encoded of queue.commandsToWrite()) {
-      results.push(parseRespCommands((encoded as string[]).join('')));
-    }
-    return results;
-  }
-
   describe('without codec (master vs no-codec verification)', function () {
     forQueues(['master', 'no-codec'], 'single command', (queue) => {
       queue.addCommand(['PING']);
