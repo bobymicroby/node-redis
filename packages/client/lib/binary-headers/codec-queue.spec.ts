@@ -1121,6 +1121,150 @@ describe('Auto-pipelining behavior', function () {
         commands: [['SET', 'k2', 'v2'], ['GET', 'k2']]
       });
     });
+
+    it('multiple ineligible commands in a row', function () {
+      const queue = createBinhdrQueue();
+
+      queue.addCommand(['SET', 'k', 'v']);  // Eligible - buffered
+      queue.addCommand(['UNKNOWN1']);        // Ineligible - flushes SET, passes through
+      queue.addCommand(['UNKNOWN2']);        // Ineligible - nothing to flush, passes through
+      queue.addCommand(['GET', 'k']);        // Eligible - buffered, drained at end
+
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 4, 'Should have 4 yields');
+
+      // First: packed SET (flushed when UNKNOWN1 arrived)
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', 'k', 'v']]
+      });
+
+      // Second: UNKNOWN1 passthrough
+      const parsed1 = parseRespCommands((results[1] as string[]).join(''));
+      assert.deepEqual(parsed1, [['UNKNOWN1']]);
+
+      // Third: UNKNOWN2 passthrough (no flush needed, buffer was empty)
+      const parsed2 = parseRespCommands((results[2] as string[]).join(''));
+      assert.deepEqual(parsed2, [['UNKNOWN2']]);
+
+      // Fourth: packed GET (drained at end)
+      assertPackedData(results[3], {
+        commandCount: 1,
+        commands: [['GET', 'k']]
+      });
+    });
+
+    it('ineligible command when buffer is empty', function () {
+      const queue = createBinhdrQueue();
+
+      queue.addCommand(['UNKNOWNCMD', 'arg']);  // Ineligible - nothing to flush
+
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 1, 'Should have 1 yield');
+
+      // Just the passthrough, no flush needed
+      const parsed = parseRespCommands((results[0] as string[]).join(''));
+      assert.deepEqual(parsed, [['UNKNOWNCMD', 'arg']]);
+    });
+
+    it('ineligible at start, middle, and end', function () {
+      const queue = createBinhdrQueue();
+
+      queue.addCommand(['UNKNOWN1']);        // Ineligible at start
+      queue.addCommand(['PING']);            // Eligible - buffered
+      queue.addCommand(['UNKNOWN2']);        // Ineligible in middle - flushes PING
+      queue.addCommand(['PING']);            // Eligible - buffered
+      queue.addCommand(['UNKNOWN3']);        // Ineligible at end - flushes PING
+
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 5, 'Should have 5 yields');
+
+      // 1. UNKNOWN1 passthrough
+      const parsed1 = parseRespCommands((results[0] as string[]).join(''));
+      assert.deepEqual(parsed1, [['UNKNOWN1']]);
+
+      // 2. packed PING (flushed when UNKNOWN2 arrived)
+      assertPackedData(results[1], {
+        commandCount: 1,
+        commands: [['PING']]
+      });
+
+      // 3. UNKNOWN2 passthrough
+      const parsed2 = parseRespCommands((results[2] as string[]).join(''));
+      assert.deepEqual(parsed2, [['UNKNOWN2']]);
+
+      // 4. packed PING (flushed when UNKNOWN3 arrived)
+      assertPackedData(results[3], {
+        commandCount: 1,
+        commands: [['PING']]
+      });
+
+      // 5. UNKNOWN3 passthrough
+      const parsed3 = parseRespCommands((results[4] as string[]).join(''));
+      assert.deepEqual(parsed3, [['UNKNOWN3']]);
+    });
+
+    it('different slots interleaved with ineligible commands', function () {
+      const queue = createBinhdrQueue();
+
+      queue.addCommand(['SET', '{a}k', 'v']);   // Slot A - buffered
+      queue.addCommand(['UNKNOWNCMD']);         // Ineligible - flushes slot A
+      queue.addCommand(['SET', '{b}k', 'v']);   // Slot B - buffered, drained at end
+
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 3, 'Should have 3 yields');
+
+      // First: packed slot A (flushed when ineligible arrived)
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', '{a}k', 'v']]
+      });
+
+      // Second: ineligible passthrough
+      const parsed = parseRespCommands((results[1] as string[]).join(''));
+      assert.deepEqual(parsed, [['UNKNOWNCMD']]);
+
+      // Third: packed slot B (drained at end)
+      assertPackedData(results[2], {
+        commandCount: 1,
+        commands: [['SET', '{b}k', 'v']]
+      });
+    });
+
+    it('ineligible commands with timer-based batching', function () {
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 1000, scheduler: createTimeoutScheduler() }
+      });
+
+      queue.addCommand(['PING']);            // Eligible - buffered
+      queue.addCommand(['UNKNOWNCMD']);      // Ineligible - flushes PING, passes through
+      queue.addCommand(['PING']);            // Eligible - buffered (for timer)
+
+      const results = collectYielded(queue);
+
+      // With scheduler, drain doesn't happen at generator end
+      // But ineligible still triggers flush of buffered commands
+      assert.equal(results.length, 2, 'Should have 2 yields (flush + passthrough)');
+
+      // First: packed PING (flushed when ineligible arrived)
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['PING']]
+      });
+
+      // Second: ineligible passthrough
+      const parsed = parseRespCommands((results[1] as string[]).join(''));
+      assert.deepEqual(parsed, [['UNKNOWNCMD']]);
+
+      // Third PING is still buffered for timer
+      assert.equal(queue.hasPendingOutbound(), true, 'Should have pending for timer');
+
+      queue.destroy();
+    });
   });
 
   describe('edge cases', function () {
