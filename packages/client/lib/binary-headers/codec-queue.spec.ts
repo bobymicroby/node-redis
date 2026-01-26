@@ -841,31 +841,10 @@ describe('Auto-pipelining behavior', function () {
   // Auto-pipelining works by batching all commands issued in the same event loop
   // tick into a single socket write (via cork/uncork in socket.ts).
   // The queue must yield all commands from the same tick when generator is consumed.
-
-  describe('no codec (master vs no-codec verification)', function () {
-    forQueues(['master', 'no-codec'], 'yields each command separately for same-tick commands', (queue) => {
-      queue.addCommand(['SET', 'key1', 'value1']);
-      queue.addCommand(['GET', 'key1']);
-      queue.addCommand(['DEL', 'key1']);
-
-      const results = collectYielded(queue);
-      assert.equal(results.length, 3);
-
-      const parsed = results.map(r => parseRespCommands((r as string[]).join('')));
-      assert.deepEqual(parsed, [
-        [['SET', 'key1', 'value1']],
-        [['GET', 'key1']],
-        [['DEL', 'key1']]
-      ]);
-    });
-
-    forQueues(['master', 'no-codec'], 'generator exhausts after processing all commands', (queue) => {
-      queue.addCommand(['PING']);
-      queue.addCommand(['PING']);
-      assert.equal(collectYielded(queue).length, 2);
-      assert.equal(collectYielded(queue).length, 0);
-    });
-  });
+  //
+  // NOTE: Master vs no-codec baseline verification tests are in:
+  //   'Codec Queue [codec-queue]' > 'without codec (master vs no-codec verification)'
+  // This section focuses on codec-specific auto-pipelining behavior.
 
   describe('codec WITHOUT scheduler (should drain at end)', function () {
     it('batches same-slot commands and drains at generator end', function () {
@@ -984,11 +963,21 @@ describe('Auto-pipelining behavior', function () {
     // This is the key auto-pipelining guarantee: all commands from the same tick
     // must be yielded (or made available) when the generator is consumed.
 
-    forQueues(['master', 'no-codec'], 'all commands yielded individually', (queue) => {
+    forQueues(['master', 'no-codec'], 'all commands yielded individually with correct content and order', (queue) => {
       queue.addCommand(['SET', 'a', '1']);
       queue.addCommand(['SET', 'b', '2']);
       queue.addCommand(['SET', 'c', '3']);
-      assert.equal(collectYielded(queue).length, 3);
+
+      const results = collectYielded(queue);
+      assert.equal(results.length, 3, 'Should yield 3 separate commands');
+
+      // Verify content and order - this is the key auto-pipelining guarantee
+      const parsed = results.map(r => parseRespCommands((r as string[]).join('')));
+      assert.deepEqual(parsed, [
+        [['SET', 'a', '1']],
+        [['SET', 'b', '2']],
+        [['SET', 'c', '3']]
+      ], 'Commands yielded in order with correct content');
     });
 
     it('codec-no-scheduler: all commands yielded via drain', function () {
@@ -1042,16 +1031,32 @@ describe('Auto-pipelining behavior', function () {
 
       // PING is eligible (keyless), UNKNOWNCMD is ineligible
       queue.addCommand(['PING']);
-      queue.addCommand(['UNKNOWNCMD', 'arg']); // Not in STATIC_RESOLVER
+      queue.addCommand(['UNKNOWNCMD', 'arg']); // Not in STATIC_RESOLVER - triggers flush
       queue.addCommand(['PING']);
 
       const results = collectYielded(queue);
 
-      // Should have 3 yields:
-      // 1. First PING batched alone (flushed when ineligible arrives? No - ineligible passes through)
-      // Actually: ineligible commands are yielded separately, eligible ones batch
-      // Let's verify actual behavior
-      assert.ok(results.length >= 1, 'Should have at least 1 yield');
+      // Ineligible command triggers flush of buffered eligible commands to preserve order
+      // 1. PING is buffered
+      // 2. UNKNOWNCMD is ineligible - flushes PING first, then passes through
+      // 3. Second PING is buffered, then drained at end
+      assert.equal(results.length, 3, 'Should have 3 yields');
+
+      // First yield: packed PING batch (flushed when ineligible arrived)
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['PING']]
+      });
+
+      // Second yield: ineligible command passed through as-is (unpacked RESP)
+      const parsedIneligible = parseRespCommands((results[1] as string[]).join(''));
+      assert.deepEqual(parsedIneligible, [['UNKNOWNCMD', 'arg']], 'Ineligible passes through unpacked');
+
+      // Third yield: second PING drained at end
+      assertPackedData(results[2], {
+        commandCount: 1,
+        commands: [['PING']]
+      });
     });
 
     it('eligible commands with different slots cause separate batches', function () {
@@ -1069,9 +1074,52 @@ describe('Auto-pipelining behavior', function () {
       // 2. slot2->slot1 flushes slot2 (1 cmd)
       // 3. drain flushes remaining slot1 (1 cmd)
       assert.equal(results.length, 3, 'Should have 3 batches due to slot changes');
-      assertPackedHeader(results[0], { commandCount: 1 }); // First slot1 command
-      assertPackedHeader(results[1], { commandCount: 1 }); // slot2 command
-      assertPackedHeader(results[2], { commandCount: 1 }); // Second slot1 via drain
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', '{slot1}key', 'value1']]
+      });
+      assertPackedData(results[1], {
+        commandCount: 1,
+        commands: [['SET', '{slot2}key', 'value2']]
+      });
+      assertPackedData(results[2], {
+        commandCount: 1,
+        commands: [['SET', '{slot1}key2', 'value3']]
+      });
+    });
+
+    it('multiple eligible commands between ineligible ones batch correctly', function () {
+      const queue = createBinhdrQueue();
+
+      queue.addCommand(['SET', 'k1', 'v1']);
+      queue.addCommand(['GET', 'k1']);
+      queue.addCommand(['UNKNOWNCMD']); // Ineligible - triggers flush of k1 commands
+      queue.addCommand(['SET', 'k2', 'v2']);
+      queue.addCommand(['GET', 'k2']);
+
+      const results = collectYielded(queue);
+
+      // Ineligible command triggers flush of buffered commands to preserve order
+      // 1. SET+GET for k1 are buffered
+      // 2. UNKNOWNCMD triggers flush of k1 batch, then passes through
+      // 3. SET+GET for k2 are buffered, then drained at end
+      assert.equal(results.length, 3, 'Should have 3 yields');
+
+      // First batch: SET+GET for k1 (flushed when ineligible arrived)
+      assertPackedData(results[0], {
+        commandCount: 2,
+        commands: [['SET', 'k1', 'v1'], ['GET', 'k1']]
+      });
+
+      // Ineligible passes through
+      const parsedIneligible = parseRespCommands((results[1] as string[]).join(''));
+      assert.deepEqual(parsedIneligible, [['UNKNOWNCMD']]);
+
+      // Second batch: SET+GET for k2 (drained at end)
+      assertPackedData(results[2], {
+        commandCount: 2,
+        commands: [['SET', 'k2', 'v2'], ['GET', 'k2']]
+      });
     });
   });
 
