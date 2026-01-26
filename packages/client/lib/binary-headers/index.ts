@@ -23,13 +23,16 @@ export {
 export type {
   OnHeader,
   OnProtocolError,
-  InterceptorOptions,
+  InboundDecoderOptions,
   PayloadSink,
-} from './interceptor';
+} from './codec';
 
 export {
   BinhdrInboundDecoder,
-} from './interceptor';
+} from './codec';
+
+/** @deprecated Use InboundDecoderOptions instead */
+export type { InboundDecoderOptions as InterceptorOptions } from './codec';
 
 // Packing
 export type {
