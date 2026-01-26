@@ -3,28 +3,43 @@
  *
  * Provides factory functions for creating RedisCommandsQueue instances for testing.
  *
+ * ## Terminology
+ *
+ * - **Master queue** (`master-queue.ts`) - The original, untouched implementation (true baseline)
+ * - **No-codec queue** (`commands-queue.ts` without codec) - New implementation, should behave identically to master
+ * - **With-codec queue** (`commands-queue.ts` with codec) - New implementation with binary headers support
+ *
  * ## Quick Start
  *
  * ```typescript
- * import { createBaseQueue, createBinhdrQueue, createMasterQueue } from './queue-test-factories';
+ * import { createMasterQueue, createNoCodecQueue, createBinhdrQueue, noCodecFactories } from './queue-test-factories';
  *
- * // Queue without codec (baseline behavior)
- * const baseQueue = createBaseQueue();
+ * // Original master queue (true baseline)
+ * const masterQueue = createMasterQueue();
+ *
+ * // New implementation without codec (should match master behavior)
+ * const noCodecQueue = createNoCodecQueue();
  *
  * // Queue with binary headers codec
  * const binhdrQueue = createBinhdrQueue();
  *
- * // Original master queue (for baseline verification)
- * const masterQueue = createMasterQueue();
+ * // Run tests against both master and no-codec to verify identical behavior
+ * for (const { name, factory } of noCodecFactories) {
+ *   describe(`[${name}]`, () => { ... });
+ * }
  * ```
  *
  * ## Factory Functions
  *
- * - `createBaseQueue()` - Queue without codec (baseline)
- * - `createMasterQueue()` - Original master queue (for baseline verification)
+ * - `createMasterQueue()` - Original master queue (true baseline)
+ * - `createNoCodecQueue()` - New implementation without codec (should match master)
  * - `createBinhdrQueue()` - Queue with binary headers codec
  * - `createBinhdrQueueWithTimer()` - Queue with binary headers + timer support
  * - `createPassthroughQueue()` - Queue with codec but no batching (NOOP_RESOLVER)
+ *
+ * ## Testing Helpers
+ *
+ * - `noCodecFactories` - Array of { name, factory } for running tests against both master and no-codec
  */
 
 import type { RedisArgument, RespVersions } from '../RESP/types';
@@ -146,21 +161,9 @@ function createCodecQueueWithTimer(options: QueueFactoryOptions = {}): TestableQ
 // ============================================================================
 
 /**
- * Creates a queue without binary headers support.
- * This is equivalent to the base queue behavior.
- */
-export function createBaseQueue(options: Omit<QueueFactoryOptions, 'resolver' | 'onProtocolError' | 'timer'> = {}): TestableQueue {
-  return new RedisCommandsQueue(
-    options.respVersion ?? 2,
-    options.maxLength ?? null,
-    options.onShardedChannelMoved ?? (() => {})
-  );
-}
-
-/**
- * Creates the original master queue (for baseline verification).
+ * Creates the original master queue (true baseline).
  * This wraps MasterQueue with an adapter to implement TestableQueue.
- * Used to verify that createBaseQueue() behaves identically to the original.
+ * Used to verify that createNoCodecQueue() behaves identically.
  */
 export function createMasterQueue(options: Omit<QueueFactoryOptions, 'resolver' | 'onProtocolError' | 'timer'> = {}): TestableQueue {
   const queue = new MasterQueue(
@@ -170,6 +173,42 @@ export function createMasterQueue(options: Omit<QueueFactoryOptions, 'resolver' 
   );
   return new MasterQueueAdapter(queue);
 }
+
+/**
+ * Creates a queue without codec (new implementation).
+ * Should behave identically to createMasterQueue().
+ */
+export function createNoCodecQueue(options: Omit<QueueFactoryOptions, 'resolver' | 'onProtocolError' | 'timer'> = {}): TestableQueue {
+  return new RedisCommandsQueue(
+    options.respVersion ?? 2,
+    options.maxLength ?? null,
+    options.onShardedChannelMoved ?? (() => {})
+  );
+}
+
+/**
+ * @deprecated Use createNoCodecQueue instead. Kept for backwards compatibility.
+ */
+export const createBaseQueue = createNoCodecQueue;
+
+/**
+ * Factory definitions for running tests against both master and no-codec queues.
+ * Use this to verify the new implementation matches the original behavior.
+ *
+ * @example
+ * for (const { name, factory } of noCodecFactories) {
+ *   describe(`[${name}]`, () => {
+ *     it('some test', () => {
+ *       const queue = factory();
+ *       // test...
+ *     });
+ *   });
+ * }
+ */
+export const noCodecFactories: ReadonlyArray<{ name: string; factory: typeof createNoCodecQueue }> = [
+  { name: 'master', factory: createMasterQueue },
+  { name: 'no-codec', factory: createNoCodecQueue },
+];
 
 /**
  * Creates a queue with binary headers support.
