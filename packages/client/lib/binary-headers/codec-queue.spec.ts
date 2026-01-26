@@ -749,11 +749,11 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
   });
 
   describe('codec interface compliance', function () {
-    it('OutboundCodec transform can return null to buffer', function () {
+    it('OutboundCodec transform can return buffered to buffer', function () {
       let transformCalls = 0;
       const mockCodec: CommandCodec = {
         outbound: {
-          transform: () => { transformCalls++; return null; },
+          transform: () => { transformCalls++; return { type: 'buffered' as const }; },
           drain: () => null,
           hasPending: () => false
         },
@@ -771,7 +771,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       }
 
       assert.equal(transformCalls, 1);
-      assert.equal(results.length, 0); // Nothing yielded because transform returned null
+      assert.equal(results.length, 0); // Nothing yielded because transform returned buffered
     });
 
     it('OutboundCodec drain is called at end of iteration', function () {
@@ -779,7 +779,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       const drainResult = ['drained-data'];
       const mockCodec: CommandCodec = {
         outbound: {
-          transform: () => null,
+          transform: () => ({ type: 'buffered' as const }),
           drain: () => { drainCalls++; return drainResult; },
           hasPending: () => drainCalls === 0
         },
@@ -806,7 +806,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
 
       const mockCodec: CommandCodec = {
         outbound: {
-          transform: (encoded) => encoded,
+          transform: (encoded) => ({ type: 'packed' as const, data: encoded }),
           drain: () => null,
           hasPending: () => false
         },

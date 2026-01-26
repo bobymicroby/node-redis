@@ -15,11 +15,16 @@ export interface Scheduler {
   schedule(delayMs: number, callback: () => void): Cancellable;
 }
 
+export type TransformResult =
+  | { type: 'buffered' }
+  | { type: 'passthrough'; data: ReadonlyArray<RedisArgument> }
+  | { type: 'packed'; data: ReadonlyArray<RedisArgument> };
+
 export interface OutboundCodec {
   transform(
     encoded: ReadonlyArray<RedisArgument>,
     args: ReadonlyArray<RedisArgument>
-  ): ReadonlyArray<RedisArgument> | null;
+  ): TransformResult;
   drain(): ReadonlyArray<RedisArgument> | null;
   hasPending(): boolean;
 }
@@ -561,21 +566,25 @@ export default class RedisCommandsQueue {
         const hadPending = codec.outbound.hasPending();
         const result = codec.outbound.transform(encoded, args);
 
-        // Passthrough detected: if we had pending commands and result is the original
-        // encoded data (not transformed), drain buffered commands first to preserve order
-        if (hadPending && result === encoded) {
-          const drained = codec.outbound.drain();
-          if (drained !== null) {
-            this.#cancelPendingFlush();
-            yield drained;
+        if (result.type === 'passthrough') {
+          // Passthrough (ineligible command): drain buffered commands first to preserve order
+          if (hadPending) {
+            const drained = codec.outbound.drain();
+            if (drained !== null) {
+              this.#cancelPendingFlush();
+              yield drained;
+            }
           }
-        }
-
-        if (result !== null) {
           this.#cancelPendingFlush();
-          yield result;
-        } else if (this.#scheduler !== null && !hadPending && codec.outbound.hasPending()) {
-          this.#scheduleFlush();
+          yield result.data;
+        } else if (result.type === 'packed') {
+          this.#cancelPendingFlush();
+          yield result.data;
+        } else {
+          // result.type === 'buffered'
+          if (this.#scheduler !== null && !hadPending && codec.outbound.hasPending()) {
+            this.#scheduleFlush();
+          }
         }
       } else {
         yield encoded;

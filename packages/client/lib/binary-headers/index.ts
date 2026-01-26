@@ -75,6 +75,7 @@ export type {
   CommandCodec,
   OutboundCodec,
   InboundCodec,
+  TransformResult,
 } from '../client/commands-queue';
 
 export {
