@@ -53,6 +53,70 @@ describe('Packing', () => {
   });
 
   describe('CommandPacker', () => {
+    describe('flush trigger conditions (table-driven)', () => {
+      // Comprehensive table of all flush triggers
+      const flushTriggerCases = [
+        {
+          name: 'incompatible slot triggers flush',
+          setup: (p: CommandPacker) => {
+            p.add(['cmd1'], 1000, 4);
+            p.add(['cmd2'], 1000, 4);
+          },
+          triggerAdd: { resp: ['cmd3'], slot: 2000, len: 4 },
+          expectFlush: true,
+          expectFlushedCount: 2,
+          expectBufferedAfter: 1,
+        },
+        {
+          name: 'max commands triggers flush',
+          setup: (p: CommandPacker) => {
+            for (let i = 0; i < MAX_COMMANDS; i++) {
+              p.add([`cmd${i}`], 1000, 4);
+            }
+          },
+          triggerAdd: { resp: ['overflow'], slot: 1000, len: 4 },
+          expectFlush: true,
+          expectFlushedCount: MAX_COMMANDS,
+          expectBufferedAfter: 1,
+        },
+        {
+          name: 'compatible slot does not flush',
+          setup: (p: CommandPacker) => {
+            p.add(['cmd1'], 1000, 4);
+          },
+          triggerAdd: { resp: ['cmd2'], slot: 1000, len: 4 },
+          expectFlush: false,
+          expectBufferedAfter: 2,
+        },
+        {
+          name: 'null slot compatible with any',
+          setup: (p: CommandPacker) => {
+            p.add(['cmd1'], 5000, 4);
+          },
+          triggerAdd: { resp: ['cmd2'], slot: NULL_SLOT, len: 4 },
+          expectFlush: false,
+          expectBufferedAfter: 2,
+        },
+      ];
+
+      for (const tc of flushTriggerCases) {
+        it(tc.name, () => {
+          const packer = new CommandPacker();
+          tc.setup(packer);
+
+          const result = packer.add(tc.triggerAdd.resp, tc.triggerAdd.slot, tc.triggerAdd.len);
+
+          if (tc.expectFlush) {
+            assert.ok(result !== null, 'Expected flush');
+            assertPackedHeader(result, { commandCount: tc.expectFlushedCount });
+          } else {
+            assert.equal(result, null, 'Expected no flush');
+          }
+          assert.equal(packer.bufferSize, tc.expectBufferedAfter);
+        });
+      }
+    });
+
     describe('basic operations', () => {
       it('buffers first command and returns null', () => {
         const packer = new CommandPacker();
@@ -155,6 +219,45 @@ describe('Packing', () => {
         const packed = packer.drain();
         assertPackedHeader(packed, { commandCount: 2, slot: 0 });
       });
+
+      it('keyless commands can join any existing slot batch', () => {
+        const packer = new CommandPacker();
+        packer.add(['keyed'], 5000, 5);      // Sets slot to 5000
+        packer.add(['keyless1'], NULL_SLOT, 8); // NULL_SLOT compatible with 5000
+        packer.add(['keyless2'], NULL_SLOT, 8); // Still compatible
+
+        assert.equal(packer.bufferSize, 3);
+        const packed = packer.drain();
+        assertPackedHeader(packed, { commandCount: 3, slot: 5000 });
+      });
+
+      it('keyed command joins keyless batch and sets slot', () => {
+        const packer = new CommandPacker();
+        packer.add(['keyless1'], NULL_SLOT, 8);
+        packer.add(['keyless2'], NULL_SLOT, 8);
+        packer.add(['keyed'], 3000, 5); // First non-null slot wins
+
+        assert.equal(packer.bufferSize, 3);
+        const packed = packer.drain();
+        assertPackedHeader(packed, { commandCount: 3, slot: 3000 });
+      });
+
+      // Table-driven slot compatibility tests
+      const slotCompatibilityCases = [
+        { name: 'same slot', slots: [1000, 1000, 1000], expectBatched: 3 },
+        { name: 'null then keyed', slots: [NULL_SLOT, 2000, NULL_SLOT], expectBatched: 3 },
+        { name: 'keyed then null', slots: [3000, NULL_SLOT, NULL_SLOT], expectBatched: 3 },
+        { name: 'all null', slots: [NULL_SLOT, NULL_SLOT, NULL_SLOT], expectBatched: 3 },
+      ];
+
+      for (const { name, slots, expectBatched } of slotCompatibilityCases) {
+        it(`batches compatible slots: ${name}`, () => {
+          const packer = new CommandPacker();
+          slots.forEach((slot, i) => packer.add([`cmd${i}`], slot, 4));
+
+          assert.equal(packer.bufferSize, expectBatched);
+        });
+      }
     });
 
     describe('time-bounded flushing', () => {
@@ -177,6 +280,50 @@ describe('Packing', () => {
         assert.equal(result, null);
         assert.equal(packer.bufferSize, 2);
       });
+
+      it('maxWaitMs=0 flushes immediately on next add', async () => {
+        const packer = new CommandPacker(0); // Zero wait time
+
+        packer.add(['cmd1'], 1000, 4);
+        // Even without delay, next add should flush (time >= 0ms has passed)
+        await delay(1); // Tiny delay to ensure performance.now() advances
+        const flushed = packer.add(['cmd2'], 1000, 4);
+
+        assert.ok(flushed !== null, 'Should flush with maxWaitMs=0');
+        assertPackedHeader(flushed, { commandCount: 1, slot: 1000 });
+        assert.equal(packer.bufferSize, 1);
+      });
+
+      it('maxWaitMs=null disables time-based flushing', () => {
+        const packer = new CommandPacker(null); // No time limit
+
+        packer.add(['cmd1'], 1000, 4);
+        packer.add(['cmd2'], 1000, 4);
+        packer.add(['cmd3'], 1000, 4);
+
+        // Should all be buffered regardless of time
+        assert.equal(packer.bufferSize, 3);
+
+        // Only flushes via drain or incompatible slot
+        const drained = packer.drain();
+        assertPackedHeader(drained, { commandCount: 3, slot: 1000 });
+      });
+
+      it('timer resets after flush', async () => {
+        const packer = new CommandPacker(10);
+
+        // First batch
+        packer.add(['cmd1'], 1000, 4);
+        await delay(15);
+        const firstFlush = packer.add(['cmd2'], 1000, 4);
+        assert.ok(firstFlush !== null, 'First batch should flush after timeout');
+
+        // Second batch - timer should have reset
+        // cmd2 is now in buffer, add cmd3 immediately (no delay)
+        const noFlush = packer.add(['cmd3'], 1000, 4);
+        assert.equal(noFlush, null, 'Should not flush - timer just reset');
+        assert.equal(packer.bufferSize, 2);
+      });
     });
 
     describe('payload limits', () => {
@@ -189,6 +336,37 @@ describe('Packing', () => {
         const flushed = packer.add(['overflow'], 1000, 200);
 
         assert.ok(flushed !== null);
+        assert.equal(packer.bufferSize, 1);
+      });
+
+      it('does not flush when payload exactly at max length', () => {
+        const packer = new CommandPacker();
+        const maxPayload = RequestHeaderEncoder.lengthMaxValue();
+
+        // First command takes up most of the space
+        packer.add(['first'], 1000, maxPayload - 10);
+        // Second command exactly fills remaining space
+        const result = packer.add(['second'], 1000, 10);
+
+        // Should NOT flush - we're exactly at the limit, not over
+        assert.equal(result, null);
+        assert.equal(packer.bufferSize, 2);
+
+        // Verify drain works and has correct total
+        const drained = packer.drain();
+        assertPackedHeader(drained, { commandCount: 2, slot: 1000 });
+      });
+
+      it('flushes when payload would exceed by even 1 byte', () => {
+        const packer = new CommandPacker();
+        const maxPayload = RequestHeaderEncoder.lengthMaxValue();
+
+        packer.add(['first'], 1000, maxPayload - 10);
+        // One byte over the limit
+        const flushed = packer.add(['second'], 1000, 11);
+
+        assert.ok(flushed !== null);
+        assertPackedHeader(flushed, { commandCount: 1, slot: 1000 });
         assert.equal(packer.bufferSize, 1);
       });
     });
