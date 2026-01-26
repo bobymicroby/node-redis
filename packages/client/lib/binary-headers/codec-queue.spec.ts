@@ -5,7 +5,19 @@ import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
 import { createTimeoutScheduler, createImmediateScheduler } from './packing';
 import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { ResponseHeaderEncoder } from './generated/response-header-codec';
-import { createBinhdrFrame, parseRespCommands } from './test-utils';
+import {
+  createBinhdrFrame,
+  parseRespCommands,
+  splitAt,
+  splitIntoBytes,
+  respSimpleString,
+  respInteger,
+  respBulkString,
+  respError,
+  respNull,
+  largeBuffer,
+  createMultipleFrames,
+} from './test-utils';
 import {
   createNoCodecQueue,
   createBinhdrQueue,
@@ -1132,4 +1144,245 @@ describe('Auto-pipelining behavior', function () {
       queue.destroy();
     });
   });
+});
+
+// ============================================================================
+// Table-driven tests for chunking, stress, and error scenarios
+// ============================================================================
+
+describe('Chunking scenarios (table-driven)', function () {
+  const chunkingCases = [
+    {
+      name: 'single byte chunks',
+      payload: respSimpleString('PONG'),
+      chunk: (frame: Buffer) => splitIntoBytes(frame),
+      expected: 'PONG',
+    },
+    {
+      name: 'split at header boundary (byte 8)',
+      payload: respSimpleString('OK'),
+      chunk: (frame: Buffer) => splitAt(frame, 8),
+      expected: 'OK',
+    },
+    {
+      name: 'split mid-header (byte 4)',
+      payload: respSimpleString('HI'),
+      chunk: (frame: Buffer) => splitAt(frame, 4),
+      expected: 'HI',
+    },
+    {
+      name: 'split mid-payload',
+      payload: respSimpleString('HELLO'),
+      chunk: (frame: Buffer) => splitAt(frame, 10),
+      expected: 'HELLO',
+    },
+    {
+      name: 'two-byte chunks',
+      payload: respInteger(12345),
+      chunk: (frame: Buffer) => {
+        const chunks: Buffer[] = [];
+        for (let i = 0; i < frame.length; i += 2) {
+          chunks.push(frame.subarray(i, Math.min(i + 2, frame.length)));
+        }
+        return chunks;
+      },
+      expected: 12345,
+    },
+    {
+      name: 'random split points',
+      payload: respBulkString('test-value'),
+      chunk: (frame: Buffer) => splitAt(frame, 3, 7, 12, 18),
+      expected: 'test-value', // bulk string returns string by default
+    },
+  ];
+
+  for (const tc of chunkingCases) {
+    it(tc.name, async function () {
+      const queue = createBinhdrQueue();
+      const promise = queue.addCommand(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      const frame = createBinhdrFrame(tc.payload);
+      const chunks = tc.chunk(frame);
+
+      for (const chunk of chunks) {
+        queue.processIncomingData(chunk);
+      }
+
+      const result = await promise;
+      assert.deepEqual(result, tc.expected);
+    });
+  }
+});
+
+describe('Stress scenarios (table-driven)', function () {
+  const stressCases = [
+    {
+      name: '100 commands batched',
+      commandCount: 100,
+      payload: () => respSimpleString('OK'),
+    },
+    {
+      name: '1000 commands batched',
+      commandCount: 1000,
+      payload: () => respSimpleString('OK'),
+    },
+    {
+      name: '10KB payload per response',
+      commandCount: 10,
+      payload: () => respBulkString(largeBuffer(10 * 1024)),
+    },
+    {
+      name: '100KB payload single response',
+      commandCount: 1,
+      payload: () => respBulkString(largeBuffer(100 * 1024)),
+    },
+    {
+      name: 'many small responses in one chunk',
+      commandCount: 50,
+      payload: () => respInteger(42),
+    },
+  ];
+
+  for (const tc of stressCases) {
+    it(tc.name, async function () {
+      this.timeout(5000); // Allow more time for stress tests
+
+      const queue = createBinhdrQueue();
+      const promises: Promise<unknown>[] = [];
+
+      for (let i = 0; i < tc.commandCount; i++) {
+        promises.push(queue.addCommand(['PING']));
+      }
+      for (const _ of queue.commandsToWrite()) {}
+
+      // Send all responses
+      const payload = tc.payload();
+      const allFrames = createMultipleFrames(tc.commandCount, payload);
+      queue.processIncomingData(allFrames);
+
+      const results = await Promise.all(promises);
+      assert.equal(results.length, tc.commandCount);
+    });
+  }
+});
+
+describe('Error scenarios (table-driven)', function () {
+  const errorCases = [
+    {
+      name: 'single error response',
+      commands: [['GET', 'key']],
+      responses: [respError('WRONGTYPE Operation against a key')],
+      expectedErrors: 1,
+    },
+    {
+      name: 'error followed by success',
+      commands: [['GET', 'key1'], ['GET', 'key2']],
+      responses: [respError('WRONGTYPE'), respSimpleString('value2')],
+      expectedErrors: 1,
+    },
+    {
+      name: 'success followed by error',
+      commands: [['GET', 'key1'], ['GET', 'key2']],
+      responses: [respSimpleString('value1'), respError('READONLY')],
+      expectedErrors: 1,
+    },
+    {
+      name: 'multiple errors',
+      commands: [['GET', 'a'], ['GET', 'b'], ['GET', 'c']],
+      responses: [respError('ERR1'), respError('ERR2'), respError('ERR3')],
+      expectedErrors: 3,
+    },
+    {
+      name: 'null response',
+      commands: [['GET', 'nonexistent']],
+      responses: [respNull()],
+      expectedErrors: 0,
+    },
+  ];
+
+  for (const tc of errorCases) {
+    it(tc.name, async function () {
+      const queue = createBinhdrQueue();
+      const promises = tc.commands.map(cmd => queue.addCommand(cmd));
+      for (const _ of queue.commandsToWrite()) {}
+
+      // Send responses
+      for (const resp of tc.responses) {
+        queue.processIncomingData(createBinhdrFrame(resp));
+      }
+
+      let errorCount = 0;
+      const results = await Promise.allSettled(promises);
+
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          errorCount++;
+        }
+      }
+
+      assert.equal(errorCount, tc.expectedErrors);
+    });
+  }
+});
+
+describe('Multi-frame chunking scenarios (table-driven)', function () {
+  const multiFrameCases = [
+    {
+      name: 'two frames split at boundary',
+      payloads: [respSimpleString('A'), respSimpleString('B')],
+      splitStrategy: 'boundary', // Split exactly between frames
+    },
+    {
+      name: 'two frames split mid-second-header',
+      payloads: [respSimpleString('X'), respSimpleString('Y')],
+      splitStrategy: 'mid-header', // Split 4 bytes into second frame
+    },
+    {
+      name: 'three frames as single chunk',
+      payloads: [respInteger(1), respInteger(2), respInteger(3)],
+      splitStrategy: 'none', // All in one chunk
+    },
+    {
+      name: 'three frames byte-by-byte',
+      payloads: [respSimpleString('A'), respSimpleString('B'), respSimpleString('C')],
+      splitStrategy: 'bytes',
+    },
+  ];
+
+  for (const tc of multiFrameCases) {
+    it(tc.name, async function () {
+      const queue = createBinhdrQueue();
+      const promises = tc.payloads.map(() => queue.addCommand(['PING']));
+      for (const _ of queue.commandsToWrite()) {}
+
+      const frames = tc.payloads.map(p => createBinhdrFrame(p));
+      const combined = Buffer.concat(frames);
+
+      let chunks: Buffer[];
+      switch (tc.splitStrategy) {
+        case 'boundary':
+          chunks = frames; // Each frame is its own chunk
+          break;
+        case 'mid-header':
+          chunks = splitAt(combined, frames[0].length + 4);
+          break;
+        case 'none':
+          chunks = [combined];
+          break;
+        case 'bytes':
+          chunks = splitIntoBytes(combined);
+          break;
+        default:
+          chunks = [combined];
+      }
+
+      for (const chunk of chunks) {
+        queue.processIncomingData(chunk);
+      }
+
+      const results = await Promise.all(promises);
+      assert.equal(results.length, tc.payloads.length);
+    });
+  }
 });
