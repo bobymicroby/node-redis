@@ -1,6 +1,6 @@
 import type { RedisArgument } from '../RESP/types';
 import type { Decoder } from '../RESP/decoder';
-import type { OutboundCodec, InboundCodec, CommandCodec } from '../client/commands-queue';
+import type { OutboundCodec, InboundCodec, CommandCodec, TransformResult } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength } from './packing';
@@ -41,14 +41,18 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
   transform(
     encoded: ReadonlyArray<RedisArgument>,
     args: ReadonlyArray<RedisArgument>
-  ): ReadonlyArray<RedisArgument> | null {
+  ): TransformResult {
     const slot = this.#resolver.getSlot(args);
 
     if (slot === SLOT_INELIGIBLE) {
-      return encoded;
+      return { type: 'passthrough', data: encoded };
     }
 
-    return this.#packer.add(encoded, slot, calculatePayloadLength(encoded));
+    const packed = this.#packer.add(encoded, slot, calculatePayloadLength(encoded));
+    if (packed !== null) {
+      return { type: 'packed', data: packed };
+    }
+    return { type: 'buffered' };
   }
 
   drain(): ReadonlyArray<RedisArgument> | null {

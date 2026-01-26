@@ -1,6 +1,5 @@
 import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import { Decoder } from '../RESP/decoder';
-import { ErrorReply } from '../errors';
 
 /**
  * Creates a complete binary header response buffer with RESP payload.
