@@ -558,12 +558,23 @@ export default class RedisCommandsQueue {
       this.#waitingForReply.push(toSend);
 
       if (codec !== null) {
-        const wasEmpty = !codec.outbound.hasPending();
+        const hadPending = codec.outbound.hasPending();
         const result = codec.outbound.transform(encoded, args);
+
+        // Passthrough detected: if we had pending commands and result is the original
+        // encoded data (not transformed), drain buffered commands first to preserve order
+        if (hadPending && result === encoded) {
+          const drained = codec.outbound.drain();
+          if (drained !== null) {
+            this.#cancelPendingFlush();
+            yield drained;
+          }
+        }
+
         if (result !== null) {
           this.#cancelPendingFlush();
           yield result;
-        } else if (this.#scheduler !== null && wasEmpty && codec.outbound.hasPending()) {
+        } else if (this.#scheduler !== null && !hadPending && codec.outbound.hasPending()) {
           this.#scheduleFlush();
         }
       } else {
