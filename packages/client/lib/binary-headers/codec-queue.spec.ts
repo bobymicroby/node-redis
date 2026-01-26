@@ -7,12 +7,12 @@ import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import { createBinhdrFrame, parseRespCommands } from './test-utils';
 import {
+  createMasterQueue,
   createNoCodecQueue,
   createBinhdrQueue,
   createBinhdrQueueWithTimer,
   createPassthroughQueue,
   collectYielded,
-  noCodecFactories,
   STATIC_RESOLVER,
   type TestableQueue,
   type TestableQueueWithTimer,
@@ -104,9 +104,13 @@ describe('Codec Queue [codec-queue]', function () {
   }
 
   describe('without codec (master vs no-codec verification)', function () {
-    // Table-driven tests run against BOTH master queue (true baseline) and
-    // no-codec queue (new implementation) to verify identical behavior
-    const baselineCases = [
+    // Go-style: define cases once, run against all queue implementations
+    const queues = [
+      { name: 'master', create: createMasterQueue },
+      { name: 'no-codec', create: createNoCodecQueue },
+    ];
+
+    const yieldCases = [
       { name: 'single command', commands: [['PING']], expected: [[['PING']]] },
       { name: 'multiple commands yield separately', commands: [['SET', 'a', '1'], ['GET', 'a']], expected: [[['SET', 'a', '1']], [['GET', 'a']]] },
       { name: 'empty queue yields nothing', commands: [], expected: [] },
@@ -114,71 +118,51 @@ describe('Codec Queue [codec-queue]', function () {
       { name: 'many commands yield in order', commands: [['A'], ['B'], ['C'], ['D']], expected: [[['A']], [['B']], [['C']], [['D']]] },
     ];
 
-    // Run tests against both master (true baseline) and no-codec (new implementation)
-    for (const { name: factoryName, factory } of noCodecFactories) {
-      describe(`[${factoryName}]`, function () {
-        for (const { name, commands, expected } of baselineCases) {
-          it(name, function () {
-            const queue = factory();
-            commands.forEach((cmd) => queue.addCommand(cmd));
-            assert.deepEqual(collectYieldedParsed(queue), expected);
-          });
-        }
-
-        it('processIncomingData writes directly to decoder', async function () {
-          const queue = factory();
-          const promise = queue.addCommand<string>(['PING']);
-          for (const _ of queue.commandsToWrite()) {}
-
-          queue.processIncomingData(Buffer.from('+PONG\r\n'));
-          const result = await promise;
-          assert.equal(result, 'PONG');
+    // queues × yieldCases
+    for (const q of queues) {
+      for (const tc of yieldCases) {
+        it(`[${q.name}] ${tc.name}`, function () {
+          const queue = q.create();
+          tc.commands.forEach(cmd => queue.addCommand(cmd));
+          assert.deepEqual(collectYieldedParsed(queue), tc.expected);
         });
+      }
+    }
 
-        it('multiple responses resolve in order', async function () {
-          const queue = factory();
-          const p1 = queue.addCommand<string>(['GET', 'a']);
-          const p2 = queue.addCommand<string>(['GET', 'b']);
-          const p3 = queue.addCommand<string>(['GET', 'c']);
-          for (const _ of queue.commandsToWrite()) {}
+    // queues × other behaviors
+    for (const q of queues) {
+      it(`[${q.name}] processIncomingData writes to decoder`, async function () {
+        const queue = q.create();
+        const promise = queue.addCommand<string>(['PING']);
+        for (const _ of queue.commandsToWrite()) {}
+        queue.processIncomingData(Buffer.from('+PONG\r\n'));
+        assert.equal(await promise, 'PONG');
+      });
 
-          queue.processIncomingData(Buffer.from('+val1\r\n+val2\r\n+val3\r\n'));
-          const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
-          assert.equal(r1, 'val1');
-          assert.equal(r2, 'val2');
-          assert.equal(r3, 'val3');
-        });
+      it(`[${q.name}] multiple responses resolve in order`, async function () {
+        const queue = q.create();
+        const promises = ['a', 'b', 'c'].map(k => queue.addCommand<string>(['GET', k]));
+        for (const _ of queue.commandsToWrite()) {}
+        queue.processIncomingData(Buffer.from('+val1\r\n+val2\r\n+val3\r\n'));
+        assert.deepEqual(await Promise.all(promises), ['val1', 'val2', 'val3']);
+      });
 
-        it('generator exhausts after consuming all commands', function () {
-          const queue = factory();
-          queue.addCommand(['PING']);
-          queue.addCommand(['PING']);
+      it(`[${q.name}] generator exhausts after consuming`, function () {
+        const queue = q.create();
+        queue.addCommand(['PING']);
+        queue.addCommand(['PING']);
+        assert.equal(collectYieldedParsed(queue).length, 2);
+        assert.equal(collectYieldedParsed(queue).length, 0);
+      });
 
-          const results1 = collectYieldedParsed(queue);
-          assert.equal(results1.length, 2);
-
-          // Generator should be exhausted
-          const results2 = collectYieldedParsed(queue);
-          assert.equal(results2.length, 0);
-        });
-
-        it('commands added after generator starts are yielded', function () {
-          const queue = factory();
-          queue.addCommand(['A']);
-
-          const gen = queue.commandsToWrite();
-          const first = gen.next();
-          assert.equal(first.done, false);
-
-          // Add more while iterating
-          queue.addCommand(['B']);
-
-          const second = gen.next();
-          assert.equal(second.done, false);
-
-          const third = gen.next();
-          assert.equal(third.done, true);
-        });
+      it(`[${q.name}] commands added while iterating are yielded`, function () {
+        const queue = q.create();
+        queue.addCommand(['A']);
+        const gen = queue.commandsToWrite();
+        assert.equal(gen.next().done, false);
+        queue.addCommand(['B']);
+        assert.equal(gen.next().done, false);
+        assert.equal(gen.next().done, true);
       });
     }
   });
@@ -853,44 +837,35 @@ describe('Auto-pipelining behavior', function () {
   // The queue must yield all commands from the same tick when generator is consumed.
 
   describe('no codec (master vs no-codec verification)', function () {
-    // Run auto-pipelining tests against both master (true baseline) and no-codec (new implementation)
-    for (const { name: factoryName, factory } of noCodecFactories) {
-      describe(`[${factoryName}]`, function () {
-        it('yields each command separately for same-tick commands', function () {
-          const queue = factory();
+    const queues = [
+      { name: 'master', create: createMasterQueue },
+      { name: 'no-codec', create: createNoCodecQueue },
+    ];
 
-          // Simulate same-tick commands (auto-pipelining scenario)
-          queue.addCommand(['SET', 'key1', 'value1']);
-          queue.addCommand(['GET', 'key1']);
-          queue.addCommand(['DEL', 'key1']);
+    for (const q of queues) {
+      it(`[${q.name}] yields each command separately for same-tick commands`, function () {
+        const queue = q.create();
+        queue.addCommand(['SET', 'key1', 'value1']);
+        queue.addCommand(['GET', 'key1']);
+        queue.addCommand(['DEL', 'key1']);
 
-          // Consume generator - should yield 3 separate encoded commands
-          const results = collectYielded(queue);
+        const results = collectYielded(queue);
+        assert.equal(results.length, 3);
 
-          assert.equal(results.length, 3, 'Should yield 3 separate commands');
+        const parsed = results.map(r => parseRespCommands((r as string[]).join('')));
+        assert.deepEqual(parsed, [
+          [['SET', 'key1', 'value1']],
+          [['GET', 'key1']],
+          [['DEL', 'key1']]
+        ]);
+      });
 
-          // Verify each is a valid RESP-encoded command
-          const parsed = results.map(r => parseRespCommands((r as string[]).join('')));
-          assert.deepEqual(parsed, [
-            [['SET', 'key1', 'value1']],
-            [['GET', 'key1']],
-            [['DEL', 'key1']]
-          ]);
-        });
-
-        it('generator completes after processing all toWrite commands', function () {
-          const queue = factory();
-
-          queue.addCommand(['PING']);
-          queue.addCommand(['PING']);
-
-          const results = collectYielded(queue);
-          assert.equal(results.length, 2);
-
-          // Generator should be exhausted - no more yields
-          const moreResults = collectYielded(queue);
-          assert.equal(moreResults.length, 0, 'Generator should be exhausted');
-        });
+      it(`[${q.name}] generator exhausts after processing all commands`, function () {
+        const queue = q.create();
+        queue.addCommand(['PING']);
+        queue.addCommand(['PING']);
+        assert.equal(collectYielded(queue).length, 2);
+        assert.equal(collectYielded(queue).length, 0);
       });
     }
   });
@@ -1012,16 +987,18 @@ describe('Auto-pipelining behavior', function () {
     // This is the key auto-pipelining guarantee: all commands from the same tick
     // must be yielded (or made available) when the generator is consumed.
 
-    // Run no-codec test against both master and no-codec queues
-    for (const { name: factoryName, factory } of noCodecFactories) {
-      it(`[${factoryName}] all commands yielded individually`, function () {
-        const queue = factory();
+    const queues = [
+      { name: 'master', create: createMasterQueue },
+      { name: 'no-codec', create: createNoCodecQueue },
+    ];
+
+    for (const q of queues) {
+      it(`[${q.name}] all commands yielded individually`, function () {
+        const queue = q.create();
         queue.addCommand(['SET', 'a', '1']);
         queue.addCommand(['SET', 'b', '2']);
         queue.addCommand(['SET', 'c', '3']);
-
-        const results = collectYielded(queue);
-        assert.equal(results.length, 3, 'All 3 commands yielded');
+        assert.equal(collectYielded(queue).length, 3);
       });
     }
 
