@@ -28,9 +28,8 @@ import type { Decoder } from '../RESP/decoder';
 
 import RedisCommandsQueue from '../client/commands-queue';
 import { BinaryHeadersCodec } from './codec';
-import { STATIC_RESOLVER } from './eligibility-static-data';
-import { NOOP_RESOLVER } from './eligibility-resolver';
-import type { EligibilityResolver } from './eligibility-resolver';
+import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
+import type { EligibilityResolver } from './eligibility';
 import type { Scheduler } from './packing';
 import { createTimeoutScheduler, createImmediateScheduler } from './packing';
 
@@ -168,5 +167,5 @@ export { createTimeoutScheduler, createImmediateScheduler };
 export { STATIC_RESOLVER, NOOP_RESOLVER };
 
 // Re-export types for convenience
-export type { EligibilityResolver } from './eligibility-resolver';
+export type { EligibilityResolver } from './eligibility';
 export type { Scheduler } from './packing';

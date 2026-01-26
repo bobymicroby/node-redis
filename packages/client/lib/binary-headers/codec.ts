@@ -1,20 +1,10 @@
-/**
- * Binary Headers Codec Implementation
- *
- * Standalone codec that can be passed to RedisCommandsQueue.
- */
-
 import type { RedisArgument } from '../RESP/types';
 import type { Decoder } from '../RESP/decoder';
 import type { OutboundCodec, InboundCodec, CommandCodec } from '../client/commands-queue';
-import type { EligibilityResolver } from './eligibility-resolver';
-import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility-resolver';
+import type { EligibilityResolver } from './eligibility';
+import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength } from './packing';
 import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
-
-// ============================================================================
-// Types
-// ============================================================================
 
 export type OnHeader = (header: BinaryResponseHeader) => void;
 export type OnProtocolError = (header: BinaryResponseHeader) => void;
@@ -24,10 +14,6 @@ export interface InboundDecoderOptions {
   readonly onHeader?: OnHeader;
   readonly onProtocolError?: OnProtocolError;
 }
-
-// ============================================================================
-// Options
-// ============================================================================
 
 export interface BinaryHeadersOutboundOptions {
   readonly resolver?: EligibilityResolver;
@@ -42,10 +28,6 @@ export interface BinaryHeadersCodecOptions {
   readonly outbound?: BinaryHeadersOutboundOptions;
   readonly inbound?: BinaryHeadersInboundOptions;
 }
-
-// ============================================================================
-// Outbound Codec
-// ============================================================================
 
 export class BinaryHeadersOutboundCodec implements OutboundCodec {
   readonly #resolver: EligibilityResolver;
@@ -62,12 +44,10 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
   ): ReadonlyArray<RedisArgument> | null {
     const slot = this.#resolver.getSlot(args);
 
-    // Ineligible commands pass through unchanged
     if (slot === SLOT_INELIGIBLE) {
       return encoded;
     }
 
-    // Try to add to batch
     return this.#packer.add(encoded, slot, calculatePayloadLength(encoded));
   }
 
@@ -80,10 +60,6 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
   }
 }
 
-// ============================================================================
-// Inbound Decoder (frame parser)
-// ============================================================================
-
 const HEADER_LENGTH = ResponseHeaderDecoder.ENCODED_LENGTH;
 const DESIGNATOR = ResponseHeaderDecoder.designatorConstantValue();
 
@@ -93,10 +69,6 @@ const enum ParseResult {
   BUFFER_PARTIAL,
 }
 
-/**
- * Decodes binary header frames from incoming data.
- * Strips headers and forwards payloads to a sink or decoder.
- */
 export class BinhdrInboundDecoder {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
@@ -183,10 +155,6 @@ export class BinhdrInboundDecoder {
   }
 }
 
-// ============================================================================
-// Inbound Codec
-// ============================================================================
-
 export class BinaryHeadersInboundCodec implements InboundCodec {
   readonly #decoder: BinhdrInboundDecoder;
 
@@ -202,10 +170,6 @@ export class BinaryHeadersInboundCodec implements InboundCodec {
     this.#decoder.writeToDecoder(chunk, decoder);
   }
 }
-
-// ============================================================================
-// Combined Codec
-// ============================================================================
 
 export class BinaryHeadersCodec implements CommandCodec {
   readonly outbound: BinaryHeadersOutboundCodec;
