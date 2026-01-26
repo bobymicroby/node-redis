@@ -172,16 +172,17 @@ Output <promise>COMPLETE</promise> when ALL of these are true:
 ## Key Files
 
 **Keep:**
-- codec-queue.ts OR binhdr-commands-queue.ts (not both)
+- commands-queue.ts (in lib/client/ - now has codec support built-in)
 - codec.ts, packing.ts, interceptor.ts
 - eligibility-*.ts files
 - All component spec files
 
-**Remove (after decision):**
-- The unchosen queue implementation
+**Already Removed:**
+- binhdr-commands-queue.ts (subclass approach - not chosen)
+- codec-queue.ts (merged into commands-queue.ts)
 - commands-queue-original.ts (reference only)
 - master-queue.ts (benchmark baseline only)
-- Dual-implementation test code in queue-test-factories.ts
+- Dual-implementation test code (getBothImplementations, ACTIVE_IMPLEMENTATION)
 
 ## Constraints
 
@@ -196,48 +197,56 @@ PROMPT_END
 }
 
 build_zed_prompt() {
-  # Read current progress to show status
-  local progress_status=""
-  if [ -f "$PROGRESS_FILE" ]; then
-    # Extract the cleanup checklist status
-    progress_status=$(grep -A 10 "## Cleanup Progress" "$PROGRESS_FILE" 2>/dev/null | head -10 || echo "")
-  fi
-
   cat << 'ZED_PROMPT_END'
 I'm running the "Ralph Wiggum" autonomous coding loop manually through Zed AI instead of the `claude` CLI.
 
-**Context:** Binary Headers finalization for node-redis. See:
-- `packages/client/lib/binary-headers/REFACTORING_PROMPT.md` - Full context (Phase 2: Finalization)
-- `packages/client/lib/binary-headers/ralph-progress.txt` - Progress from previous iterations
+**Context:** Binary Headers finalization for node-redis. Read these files:
+- `packages/client/lib/binary-headers/REFACTORING_PROMPT.md` - Full project context
+- `packages/client/lib/binary-headers/ralph-progress.txt` - **READ THIS FIRST** to see current state
 
 **Your Task (ONE task per iteration):**
 
-1. Read `ralph-progress.txt` to see what's been done
-2. Pick the next uncompleted task from the cleanup checklist
-3. Before changes: Run tests to ensure they pass
+1. **Read `ralph-progress.txt`** to understand:
+   - What's been completed (marked with [x])
+   - What's remaining (marked with [ ])
+   - Current blockers or questions
+
+2. **Choose ONE uncompleted task** from the "Cleanup Progress" checklist
+   - Pick the highest priority remaining task
+   - If all tasks are done, verify and output completion signal
+
+3. **Before changes:** Run tests to ensure they pass
    ```
    npm run test-single -- "packages/client/lib/binary-headers/*.spec.ts" --ignore "**/enterprise.integration.spec.ts"
    ```
-4. Make the change (remove file, update imports, simplify code)
-5. After changes: Run tests again - must still pass
-6. Update `ralph-progress.txt` with what you did
-7. Commit: `git commit -m "binary-headers: <what changed>"`
 
-**Cleanup Tasks (in order):**
-- [ ] Architecture decision (choose CodecQueue or BinhdrCommandsQueue)
-- [ ] Remove the unchosen implementation
-- [ ] Simplify `queue-test-factories.ts` (remove dual-impl support)
-- [ ] Remove `commands-queue-original.ts`
-- [ ] Remove `master-queue.ts`
-- [ ] Clean up imports/exports in `index.ts`
-- [ ] Update tests to remove dual-implementation labels
+4. **Make the change** (ONE task only)
 
-**Completion Signal:** Output `<promise>COMPLETE</promise>` when ALL cleanup is done and tests pass.
+5. **After changes:** Run tests again - must still pass
+
+6. **Update `ralph-progress.txt`:**
+   - Mark completed task as [x]
+   - Add entry to "Session Log" with date and what you did
+   - Update "Files Modified" or "Files Removed" sections
+   - Note any new blockers in "Blockers / Questions"
+
+7. **Commit:** `git commit -m "binary-headers: <what changed>"`
+
+**Completion Signal:**
+
+Output `<promise>COMPLETE</promise>` when ALL of these are true:
+- All tasks in "Cleanup Progress" are marked [x]
+- All tests pass
+- No remaining blockers
+- Progress file updated with final state
 
 **Constraints:**
 - ONE task per iteration
 - Do NOT break tests
+- ALWAYS update ralph-progress.txt after completing a task
 - Commit after each logical change
+
+**The progress file is the source of truth - read it first!**
 ZED_PROMPT_END
 }
 
@@ -251,11 +260,20 @@ run_zed_mode() {
 
   init_progress_file
 
-  # Show current progress summary
+  # Show current progress summary from the actual file
   if [ -f "$PROGRESS_FILE" ]; then
-    echo -e "${YELLOW}Current Progress:${NC}"
-    grep -A 20 "## Cleanup Progress" "$PROGRESS_FILE" 2>/dev/null | head -10 || true
+    echo -e "${YELLOW}Current Progress (from ralph-progress.txt):${NC}"
     echo ""
+    # Show cleanup progress section
+    grep -A 15 "## Cleanup Progress" "$PROGRESS_FILE" 2>/dev/null | head -15 || true
+    echo ""
+    # Show any blockers
+    local blockers=$(grep -A 5 "## Blockers" "$PROGRESS_FILE" 2>/dev/null | head -5 || echo "")
+    if [ -n "$blockers" ] && [[ "$blockers" != *"(none"* ]]; then
+      echo -e "${RED}Blockers:${NC}"
+      echo "$blockers"
+      echo ""
+    fi
   fi
 
   echo -e "${GREEN}─────────────────── COPY BELOW THIS LINE ───────────────────${NC}"
@@ -268,8 +286,11 @@ run_zed_mode() {
   echo "  1. Copy the prompt above"
   echo "  2. Open a new Zed AI session (Cmd+Shift+P → 'assistant: new context')"
   echo "  3. Paste the prompt"
-  echo "  4. Let the AI complete ONE task"
-  echo "  5. Run './ralph.sh zed' again for the next iteration"
+  echo "  4. The AI will read ralph-progress.txt and pick the next task"
+  echo "  5. After it completes ONE task and commits, run './ralph.sh zed' again"
+  echo ""
+  echo -e "${BLUE}The AI reads ralph-progress.txt to know what to do next.${NC}"
+  echo -e "${BLUE}No need to manually update this script between iterations!${NC}"
   echo ""
 }
 
