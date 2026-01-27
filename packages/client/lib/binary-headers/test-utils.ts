@@ -3,9 +3,9 @@ import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { Decoder } from '../RESP/decoder';
 import type { RedisArgument, RespVersions } from '../RESP/types';
-import RedisCommandsQueue from '../client/commands-queue';
+import RedisCommandsQueue, { type SocketChunk } from '../client/commands-queue';
 import MasterQueue from './master-queue';
-import { BinaryHeadersCodec } from './codec';
+import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 import type { EligibilityResolver } from './eligibility';
 import type { Scheduler } from './packing';
@@ -310,7 +310,7 @@ export function largeBuffer(size: number, fill = 0x78): Buffer {
  */
 export interface TestableQueue {
   addCommand<T = unknown>(args: ReadonlyArray<RedisArgument>): Promise<T>;
-  commandsToWrite(): Generator<ReadonlyArray<RedisArgument>>;
+  commandsToWrite(): Generator<SocketChunk>;
   processIncomingData(chunk: Buffer): void;
   readonly decoder: Decoder;
 }
@@ -319,7 +319,7 @@ export interface TestableQueue {
  * Extended interface for queues with timer support.
  */
 export interface TestableQueueWithTimer extends TestableQueue {
-  setTimerFlushCallback(callback: (encoded: ReadonlyArray<RedisArgument>) => void): void;
+  setTimerFlushCallback(callback: (encoded: SocketChunk) => void): void;
   destroy(): void;
   readonly maxWaitMs: number;
   hasPendingOutbound(): boolean;
@@ -340,7 +340,7 @@ class MasterQueueAdapter implements TestableQueue {
     return this.#queue.addCommand(args);
   }
 
-  *commandsToWrite(): Generator<ReadonlyArray<RedisArgument>> {
+  *commandsToWrite(): Generator<SocketChunk> {
     yield* this.#queue.commandsToWrite();
   }
 
@@ -383,8 +383,8 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
     timer,
   } = options;
 
-  const codec = (resolver || onProtocolError)
-    ? new BinaryHeadersCodec({
+  const interceptor = (resolver || onProtocolError)
+    ? new BinaryHeadersInterceptor({
         outbound: resolver ? { resolver } : undefined,
         inbound: onProtocolError ? { onProtocolError: (header) => onProtocolError(header.requestId) } : undefined,
       })
@@ -394,7 +394,7 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
     ? { maxWaitMs: timer.maxWaitMs, scheduler: timer.scheduler ?? createTimeoutScheduler() }
     : undefined;
 
-  return new RedisCommandsQueue(respVersion, maxLength, onShardedChannelMoved, codec, timerOptions);
+  return new RedisCommandsQueue(respVersion, maxLength, onShardedChannelMoved, interceptor, timerOptions);
 }
 
 function createCodecQueueWithTimer(options: QueueFactoryOptions = {}): TestableQueueWithTimer {

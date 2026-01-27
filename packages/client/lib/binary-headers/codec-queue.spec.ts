@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
-import RedisCommandsQueue, { type CommandCodec } from '../client/commands-queue';
-import { BinaryHeadersCodec } from './codec';
+import RedisCommandsQueue, { type WireInterceptor } from '../client/commands-queue';
+import { BinaryHeadersInterceptor } from './codec';
 import {
   // Async utilities
   delay,
@@ -105,7 +105,7 @@ describe('Codec Queue [codec-queue]', function () {
     });
   });
 
-  describe('with BinaryHeadersCodec (static resolver)', function () {
+  describe('with BinaryHeadersInterceptor (static resolver)', function () {
     // Table-driven tests for batching behavior
     const batchingCases = [
       { name: 'single command is batched with header', commands: [['PING']], expectedYields: 1, expectedCommandCount: 1 },
@@ -574,11 +574,11 @@ describe('Codec Queue [codec-queue]', function () {
   describe('inbound codec callbacks', function () {
     it('calls onProtocolError when flag is set', async function () {
       const errors: number[] = [];
-      const codec = new BinaryHeadersCodec({
+      const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER },
         inbound: { onProtocolError: (header) => errors.push(header.requestId) }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
 
       const promise = queue.addCommand<string>(['PING']);
       for (const _ of queue.commandsToWrite()) {}
@@ -593,11 +593,11 @@ describe('Codec Queue [codec-queue]', function () {
 
     it('does not call onProtocolError when flag is not set', async function () {
       let called = false;
-      const codec = new BinaryHeadersCodec({
+      const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER },
         inbound: { onProtocolError: () => { called = true; } }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
 
       const promise = queue.addCommand<string>(['PING']);
       for (const _ of queue.commandsToWrite()) {}
@@ -661,16 +661,16 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
     });
   });
 
-  describe('with BinaryHeadersCodec', function () {
-    function createQueueWithCodec(): RedisCommandsQueue {
-      const codec = new BinaryHeadersCodec({
+  describe('with BinaryHeadersInterceptor', function () {
+    function createQueueWithInterceptor(): RedisCommandsQueue {
+      const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER }
       });
-      return new RedisCommandsQueue(2, null, () => {}, codec);
+      return new RedisCommandsQueue(2, null, () => {}, interceptor);
     }
 
     it('hasPendingOutbound reflects buffered commands', function () {
-      const queue = createQueueWithCodec();
+      const queue = createQueueWithInterceptor();
       assert.equal(queue.hasPendingOutbound(), false);
 
       // Commands are buffered until commandsToWrite() is called
@@ -680,21 +680,21 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
     });
   });
 
-  describe('codec interface compliance', function () {
-    it('OutboundCodec transform can return buffered to buffer', function () {
-      let transformCalls = 0;
-      const mockCodec: CommandCodec = {
+  describe('interceptor interface compliance', function () {
+    it('OutboundInterceptor intercept can return empty array to buffer', function () {
+      let interceptCalls = 0;
+      const mockInterceptor: WireInterceptor = {
         outbound: {
-          transform: () => { transformCalls++; return { type: 'buffered' as const }; },
-          drain: () => null,
+          intercept: () => { interceptCalls++; return []; },
+          flush: () => null,
           hasPending: () => false
         },
         inbound: {
-          process: (chunk, decoder) => decoder.write(chunk)
+          intercept: (chunk, next) => next(chunk)
         }
       };
 
-      const queue = new RedisCommandsQueue(2, null, () => {}, mockCodec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
       queue.addCommand(['PING']);
 
       const results: unknown[] = [];
@@ -702,25 +702,25 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         results.push(encoded);
       }
 
-      assert.equal(transformCalls, 1);
-      assert.equal(results.length, 0); // Nothing yielded because transform returned buffered
+      assert.equal(interceptCalls, 1);
+      assert.equal(results.length, 0); // Nothing yielded because intercept returned empty array
     });
 
-    it('OutboundCodec drain is called at end of iteration', function () {
-      let drainCalls = 0;
-      const drainResult = ['drained-data'];
-      const mockCodec: CommandCodec = {
+    it('OutboundInterceptor flush is called at end of iteration', function () {
+      let flushCalls = 0;
+      const flushResult = ['flushed-data'];
+      const mockInterceptor: WireInterceptor = {
         outbound: {
-          transform: () => ({ type: 'buffered' as const }),
-          drain: () => { drainCalls++; return drainResult; },
-          hasPending: () => drainCalls === 0
+          intercept: () => [],
+          flush: () => { flushCalls++; return flushResult; },
+          hasPending: () => flushCalls === 0
         },
         inbound: {
-          process: (chunk, decoder) => decoder.write(chunk)
+          intercept: (chunk, next) => next(chunk)
         }
       };
 
-      const queue = new RedisCommandsQueue(2, null, () => {}, mockCodec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
       queue.addCommand(['PING']);
 
       const results: unknown[] = [];
@@ -728,30 +728,30 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         results.push(encoded);
       }
 
-      assert.equal(drainCalls, 1);
-      assert.deepEqual(results, [drainResult]);
+      assert.equal(flushCalls, 1);
+      assert.deepEqual(results, [flushResult]);
     });
 
-    it('InboundCodec process receives chunk and sink callback', function () {
+    it('InboundInterceptor intercept receives chunk and next callback', function () {
       let receivedChunk: Buffer | null = null;
-      let receivedSink: ((data: Buffer) => void) | null = null;
+      let receivedNext: ((data: Buffer) => void) | null = null;
 
-      const mockCodec: CommandCodec = {
+      const mockInterceptor: WireInterceptor = {
         outbound: {
-          transform: (encoded) => ({ type: 'packed' as const, data: encoded }),
-          drain: () => null,
+          intercept: (encoded) => [encoded],
+          flush: () => null,
           hasPending: () => false
         },
         inbound: {
-          process: (chunk, sink) => {
+          intercept: (chunk, next) => {
             receivedChunk = chunk;
-            receivedSink = sink;
-            sink(chunk);
+            receivedNext = next;
+            next(chunk);
           }
         }
       };
 
-      const queue = new RedisCommandsQueue(2, null, () => {}, mockCodec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
       queue.addCommand(['PING']);
       for (const _ of queue.commandsToWrite()) {}
 
@@ -759,7 +759,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       queue.processIncomingData(testChunk);
 
       assert.deepEqual(receivedChunk, testChunk);
-      assert.ok(typeof receivedSink === 'function');
+      assert.ok(typeof receivedNext === 'function');
     });
   });
 });
@@ -780,12 +780,12 @@ describe('Auto-pipelining behavior', function () {
 
   describe('codec WITHOUT scheduler (should drain at end)', function () {
     it('batches same-slot commands and drains at generator end', function () {
-      // Create queue with codec but NO scheduler
-      const codec = new BinaryHeadersCodec({
+      // Create queue with interceptor but NO scheduler
+      const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER }
         // Note: no maxWaitMs, no scheduler
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
 
       // Same-tick commands with same slot
       queue.addCommand(['SET', 'key1', 'value1']);
@@ -803,10 +803,10 @@ describe('Auto-pipelining behavior', function () {
     });
 
     it('flushes on slot change and drains remaining at end', function () {
-      const codec = new BinaryHeadersCodec({
+      const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
 
       // Commands with different slots - use {hashtag} syntax to guarantee different slots
       queue.addCommand(['SET', '{slot1}key', 'value1']); // slot for {slot1}
@@ -830,10 +830,10 @@ describe('Auto-pipelining behavior', function () {
     });
 
     it('generator completes with nothing pending after drain', function () {
-      const codec = new BinaryHeadersCodec({
+      const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, codec);
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
 
       queue.addCommand(['PING']);
       queue.addCommand(['PING']);

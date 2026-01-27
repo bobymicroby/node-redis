@@ -1,5 +1,5 @@
 import type { RedisArgument } from '../RESP/types';
-import type { OutboundCodec, InboundCodec, CommandCodec, TransformResult } from '../client/commands-queue';
+import type { OutboundInterceptor, InboundInterceptor, WireInterceptor, SocketChunk, SocketChunks } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength } from './packing';
@@ -18,12 +18,30 @@ export interface BinaryHeadersInboundOptions {
   readonly onProtocolError?: OnProtocolError;
 }
 
-export interface BinaryHeadersCodecOptions {
+export interface BinaryHeadersInterceptorOptions {
   readonly outbound?: BinaryHeadersOutboundOptions;
   readonly inbound?: BinaryHeadersInboundOptions;
 }
 
-export class BinaryHeadersOutboundCodec implements OutboundCodec {
+/**
+ * Binary headers outbound interceptor.
+ *
+ * Intercepts outbound commands to batch eligible ones with binary headers.
+ * Uses the resolver to determine eligibility and the packer to batch by slot.
+ *
+ * Batching behavior:
+ * - Eligible commands accumulate in a buffer until a flush is triggered
+ * - Flush triggers: slot change, max commands reached, timer expiry, or ineligible command
+ * - Ineligible commands always pass through unchanged, but first flush any pending batch
+ * - This preserves command ordering while maximizing batching opportunities
+ *
+ * What write() returns in different scenarios:
+ * - Eligible, still buffering        → [] (nothing to send yet)
+ * - Eligible, triggers flush         → [packed] (batch with binary header)
+ * - Ineligible, nothing pending      → [encoded] (passthrough as-is)
+ * - Ineligible, pending batch exists → [pending, encoded] (flush first, then passthrough)
+ */
+export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   readonly #resolver: EligibilityResolver;
   readonly #packer: CommandPacker;
 
@@ -32,24 +50,26 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#packer = new CommandPacker(options.maxWaitMs ?? null);
   }
 
-  transform(
+  /**
+   * Eligible commands are batched by slot with binary headers.
+   * Ineligible commands pass through unchanged, flushing any pending batch first.
+   */
+  intercept(
     encoded: ReadonlyArray<RedisArgument>,
     args: ReadonlyArray<RedisArgument>
-  ): TransformResult {
+  ): SocketChunks {
     const slot = this.#resolver.getSlot(args);
 
     if (slot === SLOT_INELIGIBLE) {
-      return { type: 'passthrough', data: encoded };
+      const pending = this.#packer.drain();
+      return pending ? [pending, encoded] : [encoded];
     }
 
     const packed = this.#packer.add(encoded, slot, calculatePayloadLength(encoded));
-    if (packed !== null) {
-      return { type: 'packed', data: packed };
-    }
-    return { type: 'buffered' };
+    return packed ? [packed] : [];
   }
 
-  drain(): ReadonlyArray<RedisArgument> | null {
+  flush(): SocketChunk | null {
     return this.#packer.drain();
   }
 
@@ -67,7 +87,14 @@ const enum ParseResult {
   BUFFER_PARTIAL,
 }
 
-export class BinhdrInboundDecoder implements InboundCodec {
+/**
+ * Binary headers inbound interceptor.
+ *
+ * - Parses binary header frames from incoming data
+ * - Strips headers and forwards payload to decoder
+ * - Falls back to passthrough for non-binary-header data
+ */
+export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
   readonly #onProtocolError: OnProtocolError | undefined;
@@ -79,8 +106,8 @@ export class BinhdrInboundDecoder implements InboundCodec {
     this.#onProtocolError = options.onProtocolError;
   }
 
-  process(chunk: Buffer, sink: (data: Buffer) => void): void {
-    this.#decode(chunk, sink);
+  intercept(chunk: Buffer, next: (data: Buffer) => void): void {
+    this.#decode(chunk, next);
   }
 
   reset(): void {
@@ -149,16 +176,39 @@ export class BinhdrInboundDecoder implements InboundCodec {
   }
 }
 
-export class BinaryHeadersCodec implements CommandCodec {
-  readonly outbound: BinaryHeadersOutboundCodec;
-  readonly inbound: BinhdrInboundDecoder;
+/**
+ * Binary headers interceptor combining outbound and inbound processing.
+ * This is the main entry point for binary headers support.
+ */
+export class BinaryHeadersInterceptor implements WireInterceptor {
+  readonly outbound: BinaryHeadersOutboundInterceptor;
+  readonly inbound: BinaryHeadersInboundInterceptor;
 
-  constructor(options: BinaryHeadersCodecOptions = {}) {
-    this.outbound = new BinaryHeadersOutboundCodec(options.outbound);
-    this.inbound = new BinhdrInboundDecoder(options.inbound);
+  constructor(options: BinaryHeadersInterceptorOptions = {}) {
+    this.outbound = new BinaryHeadersOutboundInterceptor(options.outbound);
+    this.inbound = new BinaryHeadersInboundInterceptor(options.inbound);
   }
 }
 
-export function createBinaryHeadersCodec(options: BinaryHeadersCodecOptions = {}): BinaryHeadersCodec {
-  return new BinaryHeadersCodec(options);
+/**
+ * Factory function to create a WireInterceptor for binary headers.
+ */
+export function createBinaryHeadersInterceptor(
+  resolver: EligibilityResolver,
+  options?: {
+    maxWaitMs?: number;
+    onHeader?: OnHeader;
+    onProtocolError?: OnProtocolError;
+  }
+): WireInterceptor {
+  return new BinaryHeadersInterceptor({
+    outbound: {
+      resolver,
+      maxWaitMs: options?.maxWaitMs,
+    },
+    inbound: {
+      onHeader: options?.onHeader,
+      onProtocolError: options?.onProtocolError,
+    },
+  });
 }
