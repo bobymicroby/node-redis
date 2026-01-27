@@ -23,16 +23,11 @@ export {
 export type {
   OnHeader,
   OnProtocolError,
-  InboundDecoderOptions,
-  PayloadSink,
 } from './codec';
 
 export {
   BinhdrInboundDecoder,
 } from './codec';
-
-/** @deprecated Use InboundDecoderOptions instead */
-export type { InboundDecoderOptions as InterceptorOptions } from './codec';
 
 // Packing
 export type {
@@ -81,7 +76,6 @@ export type {
 export {
   BinaryHeadersCodec,
   BinaryHeadersOutboundCodec,
-  BinaryHeadersInboundCodec,
   createBinaryHeadersCodec,
 } from './codec';
 

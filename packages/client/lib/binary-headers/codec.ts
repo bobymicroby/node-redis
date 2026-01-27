@@ -1,5 +1,4 @@
 import type { RedisArgument } from '../RESP/types';
-import type { Decoder } from '../RESP/decoder';
 import type { OutboundCodec, InboundCodec, CommandCodec, TransformResult } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
@@ -8,12 +7,6 @@ import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } fr
 
 export type OnHeader = (header: BinaryResponseHeader) => void;
 export type OnProtocolError = (header: BinaryResponseHeader) => void;
-export type PayloadSink = (data: Buffer) => void;
-
-export interface InboundDecoderOptions {
-  readonly onHeader?: OnHeader;
-  readonly onProtocolError?: OnProtocolError;
-}
 
 export interface BinaryHeadersOutboundOptions {
   readonly resolver?: EligibilityResolver;
@@ -21,7 +14,8 @@ export interface BinaryHeadersOutboundOptions {
 }
 
 export interface BinaryHeadersInboundOptions {
-  readonly onProtocolError?: (requestId: number) => void;
+  readonly onHeader?: OnHeader;
+  readonly onProtocolError?: OnProtocolError;
 }
 
 export interface BinaryHeadersCodecOptions {
@@ -73,24 +67,20 @@ const enum ParseResult {
   BUFFER_PARTIAL,
 }
 
-export class BinhdrInboundDecoder {
+export class BinhdrInboundDecoder implements InboundCodec {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
   readonly #onProtocolError: OnProtocolError | undefined;
   #partial: Buffer | null = null;
   #payloadRemaining = 0;
 
-  constructor(options: InboundDecoderOptions = {}) {
+  constructor(options: BinaryHeadersInboundOptions = {}) {
     this.#onHeader = options.onHeader;
     this.#onProtocolError = options.onProtocolError;
   }
 
-  process(chunk: Buffer, sink: PayloadSink): void {
+  process(chunk: Buffer, sink: (data: Buffer) => void): void {
     this.#decode(chunk, sink);
-  }
-
-  writeToDecoder(chunk: Buffer, decoder: Decoder): void {
-    this.#decode(chunk, data => decoder.write(data));
   }
 
   reset(): void {
@@ -98,7 +88,7 @@ export class BinhdrInboundDecoder {
     this.#payloadRemaining = 0;
   }
 
-  #decode(chunk: Buffer, emit: PayloadSink): void {
+  #decode(chunk: Buffer, emit: (data: Buffer) => void): void {
     const data = this.#partial !== null ? Buffer.concat([this.#partial, chunk]) : chunk;
     this.#partial = null;
     let offset = 0;
@@ -117,7 +107,7 @@ export class BinhdrInboundDecoder {
     }
   }
 
-  #forwardPayload(data: Buffer, offset: number, emit: PayloadSink): number {
+  #forwardPayload(data: Buffer, offset: number, emit: (data: Buffer) => void): number {
     const available = data.length - offset;
     const toForward = available < this.#payloadRemaining ? available : this.#payloadRemaining;
     emit(data.subarray(offset, offset + toForward));
@@ -125,7 +115,7 @@ export class BinhdrInboundDecoder {
     return offset + toForward;
   }
 
-  #parseHeader(data: Buffer, offset: number, emit: PayloadSink): ParseResult {
+  #parseHeader(data: Buffer, offset: number, emit: (data: Buffer) => void): ParseResult {
     if (data[offset] !== DESIGNATOR) {
       emit(data.subarray(offset));
       return ParseResult.PASSTHROUGH;
@@ -159,29 +149,13 @@ export class BinhdrInboundDecoder {
   }
 }
 
-export class BinaryHeadersInboundCodec implements InboundCodec {
-  readonly #decoder: BinhdrInboundDecoder;
-
-  constructor(options: BinaryHeadersInboundOptions = {}) {
-    this.#decoder = new BinhdrInboundDecoder({
-      onProtocolError: options.onProtocolError !== undefined
-        ? header => options.onProtocolError!(header.requestId)
-        : undefined
-    });
-  }
-
-  process(chunk: Buffer, decoder: Decoder): void {
-    this.#decoder.writeToDecoder(chunk, decoder);
-  }
-}
-
 export class BinaryHeadersCodec implements CommandCodec {
   readonly outbound: BinaryHeadersOutboundCodec;
-  readonly inbound: BinaryHeadersInboundCodec;
+  readonly inbound: BinhdrInboundDecoder;
 
   constructor(options: BinaryHeadersCodecOptions = {}) {
     this.outbound = new BinaryHeadersOutboundCodec(options.outbound);
-    this.inbound = new BinaryHeadersInboundCodec(options.inbound);
+    this.inbound = new BinhdrInboundDecoder(options.inbound);
   }
 }
 

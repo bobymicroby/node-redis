@@ -30,7 +30,7 @@ export interface OutboundCodec {
 }
 
 export interface InboundCodec {
-  process(chunk: Buffer, decoder: Decoder): void;
+  process(chunk: Buffer, sink: (data: Buffer) => void): void;
 }
 
 export interface CommandCodec {
@@ -606,7 +606,7 @@ export default class RedisCommandsQueue {
 
   processIncomingData(chunk: Buffer): void {
     if (this.#codec !== null) {
-      this.#codec.inbound.process(chunk, this.decoder);
+      this.#codec.inbound.process(chunk, (data) => this.decoder.write(data));
     } else {
       this.decoder.write(chunk);
     }

@@ -386,7 +386,7 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
   const codec = (resolver || onProtocolError)
     ? new BinaryHeadersCodec({
         outbound: resolver ? { resolver } : undefined,
-        inbound: onProtocolError ? { onProtocolError } : undefined,
+        inbound: onProtocolError ? { onProtocolError: (header) => onProtocolError(header.requestId) } : undefined,
       })
     : undefined;
 
