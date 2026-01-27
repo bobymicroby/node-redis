@@ -1,5 +1,4 @@
-import type { RedisArgument } from '../RESP/types';
-import type { OutboundInterceptor, InboundInterceptor, WireInterceptor, SocketChunk, SocketChunks } from '../client/commands-queue';
+import type { OutboundInterceptor, InboundInterceptor, WireInterceptor, SocketChunk, SocketChunks, CommandArguments } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength } from './packing';
@@ -55,8 +54,8 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
    * Ineligible commands pass through unchanged, flushing any pending batch first.
    */
   intercept(
-    encoded: ReadonlyArray<RedisArgument>,
-    args: ReadonlyArray<RedisArgument>
+    encoded: SocketChunk,
+    args: CommandArguments
   ): SocketChunks {
     const slot = this.#resolver.getSlot(args);
 

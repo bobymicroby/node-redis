@@ -1,11 +1,12 @@
 import { DoublyLinkedNode, DoublyLinkedList, EmptyAwareSinglyLinkedList } from '../client/linked-list';
 import encodeCommand from '../RESP/encoder';
 import { Decoder, PUSH_TYPE_MAPPING, RESP_TYPES } from '../RESP/decoder';
-import { TypeMapping, ReplyUnion, RespVersions, RedisArgument } from '../RESP/types';
+import { TypeMapping, ReplyUnion, RespVersions } from '../RESP/types';
 import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, PubSubTypeListeners } from '../client/pub-sub';
 import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, TimeoutError } from '../errors';
 import { MonitorCallback } from '../client';
 import { dbgMaintenance } from '../client/enterprise-maintenance-manager';
+import type { CommandArguments, SocketChunk } from '../client/commands-queue';
 
 export interface CommandOptions<T = TypeMapping> {
   chainId?: symbol;
@@ -22,7 +23,7 @@ export interface CommandOptions<T = TypeMapping> {
 }
 
 export interface CommandToWrite extends CommandWaitingForReply {
-  args: ReadonlyArray<RedisArgument>;
+  args: CommandArguments;
   chainId: symbol | undefined;
   abort: {
     signal: AbortSignal;
@@ -198,7 +199,7 @@ export default class RedisCommandsQueue {
   }
 
   addCommand<T>(
-    args: ReadonlyArray<RedisArgument>,
+    args: CommandArguments,
     options?: CommandOptions
   ): Promise<T> {
     if (this.#maxLength && this.#toWrite.length + this.#waitingForReply.length >= this.#maxLength) {
@@ -453,7 +454,7 @@ export default class RedisCommandsQueue {
   *commandsToWrite() {
     let toSend = this.#toWrite.shift();
     while (toSend) {
-      let encoded: ReadonlyArray<RedisArgument>
+      let encoded: SocketChunk;
       try {
         encoded = encodeCommand(toSend.args);
       } catch (err) {

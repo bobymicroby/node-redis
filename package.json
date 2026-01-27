@@ -18,7 +18,8 @@
     "build": "tsc --build",
     "documentation": "typedoc --entryPointStrategy packages --entryPoints ./packages/client ./packages/bloom ./packages/json ./packages/search ./packages/time-series ./packages/entraid ./packages/redis --out ./documentation",
     "gh-pages": "gh-pages -d ./documentation -e ./documentation -u 'documentation-bot <documentation@bot>'",
-    "release": "npm run release --workspaces --if-present --"
+    "release": "npm run release --workspaces --if-present --",
+    "clean": "rm -rf ./packages/*/dist"
   },
   "devDependencies": {
     "@istanbuljs/nyc-config-typescript": "^1.0.2",

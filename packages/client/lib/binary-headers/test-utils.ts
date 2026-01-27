@@ -2,8 +2,8 @@ import { strict as assert } from 'node:assert';
 import { ResponseHeaderEncoder } from './generated/response-header-codec';
 import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { Decoder } from '../RESP/decoder';
-import type { RedisArgument, RespVersions } from '../RESP/types';
-import RedisCommandsQueue, { type SocketChunk } from '../client/commands-queue';
+import type { RespVersions } from '../RESP/types';
+import RedisCommandsQueue, { type SocketChunk, type CommandArguments } from '../client/commands-queue';
 import MasterQueue from './master-queue';
 import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
@@ -309,7 +309,7 @@ export function largeBuffer(size: number, fill = 0x78): Buffer {
  * This allows tests to work with the queue implementation.
  */
 export interface TestableQueue {
-  addCommand<T = unknown>(args: ReadonlyArray<RedisArgument>): Promise<T>;
+  addCommand<T = unknown>(args: CommandArguments): Promise<T>;
   commandsToWrite(): Generator<SocketChunk>;
   processIncomingData(chunk: Buffer): void;
   readonly decoder: Decoder;
@@ -336,7 +336,7 @@ class MasterQueueAdapter implements TestableQueue {
     this.#queue = queue;
   }
 
-  addCommand<T = unknown>(args: ReadonlyArray<RedisArgument>): Promise<T> {
+  addCommand<T = unknown>(args: CommandArguments): Promise<T> {
     return this.#queue.addCommand(args);
   }
 

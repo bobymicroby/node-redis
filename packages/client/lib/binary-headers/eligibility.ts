@@ -1,4 +1,5 @@
 import type { RedisArgument } from '../RESP/types';
+import type { CommandArguments } from '../client/commands-queue';
 import { RequestHeaderEncoder } from './generated/request-header-codec';
 import calculateSlot from 'cluster-key-slot';
 
@@ -47,14 +48,14 @@ function keyPositionToIndex(keyPosition: KeyPosition | undefined): number | null
   return keyPosition.index;
 }
 
-function calculateCommandSlot(args: ReadonlyArray<RedisArgument>, firstKeyIndex: number | null): number {
+function calculateCommandSlot(args: CommandArguments, firstKeyIndex: number | null): number {
   if (firstKeyIndex === null || firstKeyIndex >= args.length) return NULL_SLOT;
   const key = args[firstKeyIndex];
   const keyStr = typeof key === 'string' ? key : key.toString();
   return calculateSlot(keyStr);
 }
 
-function hasBlockingArg(args: ReadonlyArray<RedisArgument>, argName: string): boolean {
+function hasBlockingArg(args: CommandArguments, argName: string): boolean {
   const upperArgName = argName.toUpperCase();
   for (let i = 1; i < args.length; i++) {
     if (argToString(args[i]).toUpperCase() === upperArgName) return true;
@@ -62,13 +63,13 @@ function hasBlockingArg(args: ReadonlyArray<RedisArgument>, argName: string): bo
   return false;
 }
 
-function isBlocking(args: ReadonlyArray<RedisArgument>, blocking: BlockingBehavior | undefined): boolean {
+function isBlocking(args: CommandArguments, blocking: BlockingBehavior | undefined): boolean {
   if (!blocking) return false;
   if (blocking.type === 'always') return true;
   return hasBlockingArg(args, blocking.argName);
 }
 
-function getSlotForAttrs(args: ReadonlyArray<RedisArgument>, attrs: CommandAttrs): number {
+function getSlotForAttrs(args: CommandArguments, attrs: CommandAttrs): number {
   if (isBlocking(args, attrs.blocking)) return SLOT_INELIGIBLE;
   return calculateCommandSlot(args, keyPositionToIndex(attrs.keyPosition));
 }
@@ -106,13 +107,13 @@ export class EligibilityResolver {
     this.#map = map;
   }
 
-  getEligibility(args: ReadonlyArray<RedisArgument>): EligibilityResult {
+  getEligibility(args: CommandArguments): EligibilityResult {
     const slot = this.getSlot(args);
     if (slot === SLOT_INELIGIBLE) return { eligible: false };
     return { eligible: true, slot };
   }
 
-  getSlot(args: ReadonlyArray<RedisArgument>): number {
+  getSlot(args: CommandArguments): number {
     if (args.length === 0) return SLOT_INELIGIBLE;
 
     const node = this.#map.get(argToString(args[0]).toUpperCase());

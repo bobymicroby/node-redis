@@ -37,7 +37,7 @@ function toWireSlot(slot: number): number {
   return slot === NULL_SLOT ? 0 : slot;
 }
 
-export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): number {
+export function calculatePayloadLength(resp: SocketChunk): number {
   let length = 0;
   for (let i = 0; i < resp.length; i++) {
     const part = resp[i];
@@ -51,7 +51,7 @@ export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): numb
  */
 export class CommandPacker {
   readonly #maxWaitMs: number | null;
-  readonly #resps: Array<ReadonlyArray<RedisArgument>> = [];
+  readonly #resps: Array<SocketChunk> = [];
 
   #resolvedSlot: number = NULL_SLOT;
   #totalPayloadLength: number = 0;
@@ -62,7 +62,7 @@ export class CommandPacker {
   }
 
   add(
-    resp: ReadonlyArray<RedisArgument>,
+    resp: SocketChunk,
     slot: number,
     payloadLength: number
   ): SocketChunk | null {
@@ -101,7 +101,7 @@ export class CommandPacker {
     return true;
   }
 
-  #pushFirst(resp: ReadonlyArray<RedisArgument>, slot: number, payloadLength: number): void {
+  #pushFirst(resp: SocketChunk, slot: number, payloadLength: number): void {
     this.#resps.push(resp);
     this.#totalPayloadLength = payloadLength;
     if (this.#maxWaitMs !== null) {
@@ -112,7 +112,7 @@ export class CommandPacker {
     }
   }
 
-  #push(resp: ReadonlyArray<RedisArgument>, slot: number, payloadLength: number): void {
+  #push(resp: SocketChunk, slot: number, payloadLength: number): void {
     this.#resps.push(resp);
     this.#totalPayloadLength += payloadLength;
     if (slot !== NULL_SLOT) {
