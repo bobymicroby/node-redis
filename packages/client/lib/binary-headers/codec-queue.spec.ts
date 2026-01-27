@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
 import RedisCommandsQueue, { type CommandCodec } from '../client/commands-queue';
-import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
+import { BinaryHeadersCodec } from './codec';
 import {
   // Async utilities
   delay,
@@ -576,7 +576,7 @@ describe('Codec Queue [codec-queue]', function () {
       const errors: number[] = [];
       const codec = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
-        inbound: { onProtocolError: (requestId) => errors.push(requestId) }
+        inbound: { onProtocolError: (header) => errors.push(header.requestId) }
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, codec);
 
@@ -732,9 +732,9 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       assert.deepEqual(results, [drainResult]);
     });
 
-    it('InboundCodec process receives chunk and decoder', function () {
+    it('InboundCodec process receives chunk and sink callback', function () {
       let receivedChunk: Buffer | null = null;
-      let receivedDecoder: any = null;
+      let receivedSink: ((data: Buffer) => void) | null = null;
 
       const mockCodec: CommandCodec = {
         outbound: {
@@ -743,10 +743,10 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
           hasPending: () => false
         },
         inbound: {
-          process: (chunk, decoder) => {
+          process: (chunk, sink) => {
             receivedChunk = chunk;
-            receivedDecoder = decoder;
-            decoder.write(chunk);
+            receivedSink = sink;
+            sink(chunk);
           }
         }
       };
@@ -759,7 +759,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       queue.processIncomingData(testChunk);
 
       assert.deepEqual(receivedChunk, testChunk);
-      assert.ok(receivedDecoder !== null);
+      assert.ok(typeof receivedSink === 'function');
     });
   });
 });
