@@ -16,6 +16,11 @@ export interface Scheduler {
 }
 
 /**
+ * Raw command arguments before encoding.
+ */
+export type CommandArguments = ReadonlyArray<RedisArgument>;
+
+/**
  * A single chunk of data ready to be written to the socket.
  * Represents one encoded command or batch.
  */
@@ -45,8 +50,8 @@ export interface OutboundInterceptor {
    * @returns Chunks to write to socket (empty array = buffered, nothing to send yet)
    */
   intercept(
-    encoded: ReadonlyArray<RedisArgument>,
-    args: ReadonlyArray<RedisArgument>
+    encoded: SocketChunk,
+    args: CommandArguments
   ): SocketChunks;
 
   /**
@@ -112,7 +117,7 @@ export interface CommandOptions<T = TypeMapping> {
 }
 
 export interface CommandToWrite extends CommandWaitingForReply {
-  args: ReadonlyArray<RedisArgument>;
+  args: CommandArguments;
   chainId: symbol | undefined;
   abort: {
     signal: AbortSignal;
@@ -334,7 +339,7 @@ export default class RedisCommandsQueue {
   }
 
   addCommand<T>(
-    args: ReadonlyArray<RedisArgument>,
+    args: CommandArguments,
     options?: CommandOptions
   ): Promise<T> {
     if (this.#maxLength && this.#toWrite.length + this.#waitingForReply.length >= this.#maxLength) {
