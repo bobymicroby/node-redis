@@ -6,7 +6,7 @@ export type {
   ResponseHeader as BinaryResponseHeader,
 } from './generated/response-header-codec';
 
-// Binary Header Encoders/Decoders
+// Binary Header Encoders/Decoders (generated low-level codecs)
 export {
   RequestHeaderEncoder,
   RequestHeaderDecoder,
@@ -18,16 +18,6 @@ export {
   extractCommandCount,
   hasProtocolError,
 } from './generated/response-header-codec';
-
-// Inbound Decoder
-export type {
-  OnHeader,
-  OnProtocolError,
-} from './codec';
-
-export {
-  BinhdrInboundDecoder,
-} from './codec';
 
 // Packing
 export type {
@@ -63,24 +53,29 @@ export {
   createEligibilityResolver,
 } from './eligibility';
 
-// Codec (integrates with commands-queue)
+// Wire Interceptor interfaces
 export type {
+  OutboundInterceptor,
+  InboundInterceptor,
+  WireInterceptor,
+  SocketChunk,
+  SocketChunks,
   TimerFlushCallback,
   TimerOptions,
-  CommandCodec,
-  OutboundCodec,
-  InboundCodec,
-  TransformResult,
 } from '../client/commands-queue';
 
-export {
-  BinaryHeadersCodec,
-  BinaryHeadersOutboundCodec,
-  createBinaryHeadersCodec,
-} from './codec';
-
+// Binary Headers Interceptor (integrates with commands-queue)
 export type {
-  BinaryHeadersCodecOptions,
+  OnHeader,
+  OnProtocolError,
+  BinaryHeadersInterceptorOptions,
   BinaryHeadersOutboundOptions,
   BinaryHeadersInboundOptions,
+} from './codec';
+
+export {
+  BinaryHeadersInterceptor,
+  BinaryHeadersOutboundInterceptor,
+  BinaryHeadersInboundInterceptor,
+  createBinaryHeadersInterceptor,
 } from './codec';

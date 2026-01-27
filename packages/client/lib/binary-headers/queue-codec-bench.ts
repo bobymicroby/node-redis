@@ -12,7 +12,7 @@
 
 import RedisCommandsQueue from '../client/commands-queue';
 import MasterQueue from './master-queue';
-import { BinaryHeadersCodec } from './codec';
+import { BinaryHeadersInterceptor } from './codec';
 import { createBinhdrResponse } from './test-utils';
 
 // ============================================================================
@@ -48,7 +48,7 @@ function createQueueWithBinhdr(): RedisCommandsQueue {
     2,
     null,
     () => {},
-    new BinaryHeadersCodec()
+    new BinaryHeadersInterceptor()
   );
 }
 

@@ -1,5 +1,6 @@
 import type { RedisArgument } from '../RESP/types';
 import { RequestHeaderEncoder } from './generated/request-header-codec';
+import type { SocketChunk } from '../client/commands-queue';
 import type { Cancellable, Scheduler } from '../client/commands-queue';
 
 // Re-export for convenience (canonical source is commands-queue.ts)
@@ -47,20 +48,8 @@ export function calculatePayloadLength(resp: ReadonlyArray<RedisArgument>): numb
 
 /**
  * Batches commands into binary header frames for efficient proxy communication.
- *
- * **Buffer Strategy:** We pre-allocate a single 16-byte header buffer and reuse it
- * across flushes, copying it into the result array. This is faster than allocating
- * a fresh buffer each time:
- *
- * - `allocateAndEncode()` = alloc + encode = ~14.6% overhead
- * - `encodeInto()` + `Buffer.from()` = encode + copy = ~8.9% overhead
- *
- * The copy is essential because callers may hold references to previous results
- * while we build the next batch (e.g., generator yielding multiple batches).
  */
 export class CommandPacker {
-  /** Pre-allocated header buffer, reused across flushes (contents copied on return) */
-  readonly #headerBuffer: Buffer;
   readonly #maxWaitMs: number | null;
   readonly #resps: Array<ReadonlyArray<RedisArgument>> = [];
 
@@ -69,7 +58,6 @@ export class CommandPacker {
   #bufferStartTime: number | null = null;
 
   constructor(maxWaitMs: number | null = null) {
-    this.#headerBuffer = Buffer.allocUnsafe(RequestHeaderEncoder.ENCODED_LENGTH);
     this.#maxWaitMs = maxWaitMs;
   }
 
@@ -77,7 +65,7 @@ export class CommandPacker {
     resp: ReadonlyArray<RedisArgument>,
     slot: number,
     payloadLength: number
-  ): ReadonlyArray<RedisArgument> | null {
+  ): SocketChunk | null {
     const count = this.#resps.length;
 
     if (count > 0 && !this.#canAdd(count, slot, payloadLength)) {
@@ -94,7 +82,7 @@ export class CommandPacker {
     return null;
   }
 
-  drain(): ReadonlyArray<RedisArgument> | null {
+  drain(): SocketChunk | null {
     if (this.#resps.length === 0) return null;
     return this.#flush();
   }
@@ -132,13 +120,11 @@ export class CommandPacker {
     }
   }
 
-  #flush(): ReadonlyArray<RedisArgument> {
+  #flush(): SocketChunk {
     const count = this.#resps.length;
 
-    // Encode into pre-allocated buffer (reused across flushes)
-    RequestHeaderEncoder.encodeInto(
-      this.#headerBuffer,
-      0,
+    // Allocate and encode header in one step
+    const header = RequestHeaderEncoder.allocateAndEncode(
       toWireSlot(this.#resolvedSlot),
       this.#totalPayloadLength,
       count,
@@ -151,10 +137,7 @@ export class CommandPacker {
     }
 
     const result = new Array<RedisArgument>(totalParts);
-    // IMPORTANT: Copy the header buffer! Caller may hold this reference while we
-    // encode the next batch, which would corrupt their header. The 16-byte copy
-    // is faster than allocating a fresh buffer each time (benchmarked).
-    result[0] = Buffer.from(this.#headerBuffer);
+    result[0] = header;
 
     let idx = 1;
     for (let i = 0; i < count; i++) {

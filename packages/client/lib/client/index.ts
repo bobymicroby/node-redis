@@ -2,7 +2,7 @@ import COMMANDS from '../commands';
 import RedisSocket, { RedisSocketOptions } from './socket';
 import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
 import RedisCommandsQueue, { CommandOptions } from './commands-queue';
-import { BinaryHeadersCodec } from '../binary-headers/codec';
+import { BinaryHeadersInterceptor } from '../binary-headers/codec';
 import { STATIC_RESOLVER } from '../binary-headers/eligibility';
 import { createTimeoutScheduler } from '../binary-headers/packing';
 import { EventEmitter } from 'node:events';
@@ -615,16 +615,16 @@ export default class RedisClient<
 
   #initiateQueue(): RedisCommandsQueue {
     if (this.#options.binaryHeaders) {
-      const codec = new BinaryHeadersCodec({
+      const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER },
-        inbound: { onProtocolError: (clientIdx: number) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${clientIdx}`)) }
+        inbound: { onProtocolError: (header) => this.emit('error', new Error(`Binary header protocol error: requestId=${header.requestId}`)) }
       });
       const timerOptions = { maxWaitMs: 1, scheduler: createTimeoutScheduler() };
       return new RedisCommandsQueue(
         this.#options.RESP ?? 2,
         this.#options.commandsQueueMaxLength,
         (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
-        codec,
+        interceptor,
         timerOptions
       );
     }

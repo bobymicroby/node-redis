@@ -15,30 +15,80 @@ export interface Scheduler {
   schedule(delayMs: number, callback: () => void): Cancellable;
 }
 
-export type TransformResult =
-  | { type: 'buffered' }
-  | { type: 'passthrough'; data: ReadonlyArray<RedisArgument> }
-  | { type: 'packed'; data: ReadonlyArray<RedisArgument> };
+/**
+ * A single chunk of data ready to be written to the socket.
+ * Represents one encoded command or batch.
+ */
+export type SocketChunk = ReadonlyArray<RedisArgument>;
 
-export interface OutboundCodec {
-  transform(
+/**
+ * Multiple chunks ready to be written to the socket.
+ */
+export type SocketChunks = ReadonlyArray<SocketChunk>;
+
+/**
+ * Intercepts outbound command data before sending to socket.
+ *
+ * The queue treats this as a black box - it simply iterates over
+ * whatever the interceptor returns and yields each item to the socket.
+ *
+ * Note: Returns an array (pull-based) rather than using a callback because
+ * outbound flow is request/response - "here's a command, what should I send?"
+ * The caller controls the pace by iterating through the generator.
+ */
+export interface OutboundInterceptor {
+  /**
+   * Intercept an encoded command and return data to send.
+   *
+   * @param encoded - RESP-encoded command data
+   * @param args - Original command arguments (available for inspection)
+   * @returns Chunks to write to socket (empty array = buffered, nothing to send yet)
+   */
+  intercept(
     encoded: ReadonlyArray<RedisArgument>,
     args: ReadonlyArray<RedisArgument>
-  ): TransformResult;
-  drain(): ReadonlyArray<RedisArgument> | null;
+  ): SocketChunks;
+
+  /**
+   * Force flush any pending buffered data.
+   * @returns Flushed chunk, or null if nothing pending
+   */
+  flush(): SocketChunk | null;
+
+  /**
+   * Check if there's pending buffered data.
+   * Used by queue for timer scheduling.
+   */
   hasPending(): boolean;
 }
 
-export interface InboundCodec {
-  process(chunk: Buffer, sink: (data: Buffer) => void): void;
+/**
+ * Intercepts inbound data before passing to decoder.
+ *
+ * Note: Uses a callback (push-based) rather than returning an array because
+ * inbound flow is streaming - the socket pushes chunks as they arrive, and
+ * each chunk might contain partial frames, multiple frames, or be split
+ * across calls. The interceptor calls next() for each complete piece it parses.
+ */
+export interface InboundInterceptor {
+  /**
+   * Intercept incoming chunk, call next() with data to pass downstream.
+   * @param chunk - Raw data from socket
+   * @param next - Callback to pass data to the next handler (decoder)
+   */
+  intercept(chunk: Buffer, next: (data: Buffer) => void): void;
 }
 
-export interface CommandCodec {
-  readonly outbound: OutboundCodec;
-  readonly inbound: InboundCodec;
+/**
+ * Wire-level interceptor configuration.
+ * Both interceptors are optional - if not provided, data passes through unchanged.
+ */
+export interface WireInterceptor {
+  readonly outbound?: OutboundInterceptor;
+  readonly inbound?: InboundInterceptor;
 }
 
-export type TimerFlushCallback = (encoded: ReadonlyArray<RedisArgument>) => void;
+export type TimerFlushCallback = (encoded: SocketChunk) => void;
 
 export interface TimerOptions {
   readonly maxWaitMs: number;
@@ -108,7 +158,8 @@ export default class RedisCommandsQueue {
   #chainInExecution: symbol | undefined;
   readonly decoder;
   readonly #pubSub = new PubSub();
-  readonly #codec: CommandCodec | null;
+  readonly #outbound: OutboundInterceptor | null;
+  readonly #inbound: InboundInterceptor | null;
   readonly #scheduler: Scheduler | null;
   readonly #maxWaitMs: number;
   #pendingFlush: Cancellable | null = null;
@@ -169,13 +220,14 @@ export default class RedisCommandsQueue {
     respVersion: RespVersions,
     maxLength: number | null | undefined,
     onShardedChannelMoved: OnShardedChannelMoved,
-    codec?: CommandCodec,
+    interceptor?: WireInterceptor,
     timerOptions?: TimerOptions
   ) {
     this.#respVersion = respVersion;
     this.#maxLength = maxLength;
     this.#onShardedChannelMoved = onShardedChannelMoved;
-    this.#codec = codec ?? null;
+    this.#outbound = interceptor?.outbound ?? null;
+    this.#inbound = interceptor?.inbound ?? null;
     this.#scheduler = timerOptions?.scheduler ?? null;
     this.#maxWaitMs = timerOptions?.maxWaitMs ?? 0;
     this.decoder = this.#initiateDecoder();
@@ -535,7 +587,7 @@ export default class RedisCommandsQueue {
   }
 
   *commandsToWrite() {
-    const codec = this.#codec;
+    const outbound = this.#outbound;
     let toSend = this.#toWrite.shift();
     while (toSend) {
       const args = toSend.args;
@@ -562,29 +614,19 @@ export default class RedisCommandsQueue {
       toSend.chainId = undefined;
       this.#waitingForReply.push(toSend);
 
-      if (codec !== null) {
-        const hadPending = codec.outbound.hasPending();
-        const result = codec.outbound.transform(encoded, args);
+      if (outbound !== null) {
+        const hadPending = outbound.hasPending();
+        const outputs = outbound.intercept(encoded, args);
 
-        if (result.type === 'passthrough') {
-          // Passthrough (ineligible command): drain buffered commands first to preserve order
-          if (hadPending) {
-            const drained = codec.outbound.drain();
-            if (drained !== null) {
-              this.#cancelPendingFlush();
-              yield drained;
-            }
-          }
+        if (outputs.length > 0) {
           this.#cancelPendingFlush();
-          yield result.data;
-        } else if (result.type === 'packed') {
-          this.#cancelPendingFlush();
-          yield result.data;
-        } else {
-          // result.type === 'buffered'
-          if (this.#scheduler !== null && !hadPending && codec.outbound.hasPending()) {
-            this.#scheduleFlush();
+          for (const output of outputs) {
+            yield output;
           }
+        }
+
+        if (outputs.length === 0 && this.#scheduler !== null && !hadPending && outbound.hasPending()) {
+          this.#scheduleFlush();
         }
       } else {
         yield encoded;
@@ -596,8 +638,8 @@ export default class RedisCommandsQueue {
     // Only drain immediately if no timer-based batching is configured.
     // When a scheduler is set, the timer callback handles flushing buffered commands.
     // This allows commands to batch up to maxWaitMs before being sent.
-    if (codec !== null && this.#scheduler === null) {
-      const drained = codec.outbound.drain();
+    if (outbound !== null && this.#scheduler === null) {
+      const drained = outbound.flush();
       if (drained !== null) {
         yield drained;
       }
@@ -605,19 +647,19 @@ export default class RedisCommandsQueue {
   }
 
   processIncomingData(chunk: Buffer): void {
-    if (this.#codec !== null) {
-      this.#codec.inbound.process(chunk, (data) => this.decoder.write(data));
+    if (this.#inbound !== null) {
+      this.#inbound.intercept(chunk, (data) => this.decoder.write(data));
     } else {
       this.decoder.write(chunk);
     }
   }
 
   hasPendingOutbound(): boolean {
-    return this.#codec?.outbound.hasPending() ?? false;
+    return this.#outbound?.hasPending() ?? false;
   }
 
-  drainPendingOutbound(): ReadonlyArray<RedisArgument> | null {
-    return this.#codec?.outbound.drain() ?? null;
+  drainPendingOutbound(): SocketChunk | null {
+    return this.#outbound?.flush() ?? null;
   }
 
   #flushWaitingForReply(err: Error): void {
