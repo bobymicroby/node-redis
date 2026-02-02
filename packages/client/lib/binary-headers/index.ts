@@ -79,3 +79,15 @@ export {
   BinaryHeadersInboundInterceptor,
   createBinaryHeadersInterceptor,
 } from './codec';
+
+// Statistics
+export type {
+  BinaryHeaderStatsCounter,
+} from './stats';
+
+export {
+  BinaryHeaderStats,
+  FlushReason,
+  DefaultBinaryHeaderStatsCounter,
+  disabledBinaryHeaderStatsCounter,
+} from './stats';

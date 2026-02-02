@@ -2,6 +2,8 @@ import type { RedisArgument } from '../RESP/types';
 import { RequestHeaderEncoder } from './generated/request-header-codec';
 import type { SocketChunk } from '../client/commands-queue';
 import type { Cancellable, Scheduler } from '../client/commands-queue';
+import { FlushReason, disabledBinaryHeaderStatsCounter } from './stats';
+import type { BinaryHeaderStatsCounter } from './stats';
 
 // Re-export for convenience (canonical source is commands-queue.ts)
 export type { Cancellable, Scheduler };
@@ -51,14 +53,19 @@ export function calculatePayloadLength(resp: SocketChunk): number {
  */
 export class CommandPacker {
   readonly #maxWaitMs: number | null;
+  readonly #statsCounter: BinaryHeaderStatsCounter;
   readonly #resps: Array<SocketChunk> = [];
 
   #resolvedSlot: number = NULL_SLOT;
   #totalPayloadLength: number = 0;
   #bufferStartTime: number | null = null;
 
-  constructor(maxWaitMs: number | null = null) {
+  constructor(
+    maxWaitMs: number | null = null,
+    statsCounter?: BinaryHeaderStatsCounter
+  ) {
     this.#maxWaitMs = maxWaitMs;
+    this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
   }
 
   add(
@@ -68,10 +75,13 @@ export class CommandPacker {
   ): SocketChunk | null {
     const count = this.#resps.length;
 
-    if (count > 0 && !this.#canAdd(count, slot, payloadLength)) {
-      const packed = this.#flush();
-      this.#pushFirst(resp, slot, payloadLength);
-      return packed;
+    if (count > 0) {
+      const flushReason = this.#getFlushReason(count, slot, payloadLength);
+      if (flushReason !== null) {
+        const packed = this.#flush(flushReason);
+        this.#pushFirst(resp, slot, payloadLength);
+        return packed;
+      }
     }
 
     if (count === 0) {
@@ -84,21 +94,29 @@ export class CommandPacker {
 
   drain(): SocketChunk | null {
     if (this.#resps.length === 0) return null;
-    return this.#flush();
+    return this.#flush(FlushReason.DRAIN);
   }
 
   get bufferSize(): number {
     return this.#resps.length;
   }
 
-  #canAdd(count: number, slot: number, payloadLength: number): boolean {
+  #getFlushReason(count: number, slot: number, payloadLength: number): FlushReason | null {
     if (this.#maxWaitMs !== null && this.#bufferStartTime !== null) {
-      if ((performance.now() - this.#bufferStartTime) >= this.#maxWaitMs) return false;
+      if ((performance.now() - this.#bufferStartTime) >= this.#maxWaitMs) {
+        return FlushReason.TIMER_EXPIRED;
+      }
     }
-    if (count >= MAX_COMMAND_COUNT) return false;
-    if (!areSlotsCompatible(this.#resolvedSlot, slot)) return false;
-    if (this.#totalPayloadLength + payloadLength > MAX_PAYLOAD_LENGTH) return false;
-    return true;
+    if (count >= MAX_COMMAND_COUNT) {
+      return FlushReason.MAX_COMMANDS;
+    }
+    if (!areSlotsCompatible(this.#resolvedSlot, slot)) {
+      return FlushReason.SLOT_MISMATCH;
+    }
+    if (this.#totalPayloadLength + payloadLength > MAX_PAYLOAD_LENGTH) {
+      return FlushReason.MAX_PAYLOAD;
+    }
+    return null;
   }
 
   #pushFirst(resp: SocketChunk, slot: number, payloadLength: number): void {
@@ -120,10 +138,10 @@ export class CommandPacker {
     }
   }
 
-  #flush(): SocketChunk {
+  #flush(reason: FlushReason): SocketChunk {
     const count = this.#resps.length;
+    this.#statsCounter.recordFlush(reason);
 
-    // Allocate and encode header in one step
     const header = RequestHeaderEncoder.allocateAndEncode(
       toWireSlot(this.#resolvedSlot),
       this.#totalPayloadLength,

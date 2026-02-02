@@ -3,6 +3,7 @@ import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength } from './packing';
 import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
+import { disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from './stats';
 
 export type OnHeader = (header: BinaryResponseHeader) => void;
 export type OnProtocolError = (header: BinaryResponseHeader) => void;
@@ -20,6 +21,7 @@ export interface BinaryHeadersInboundOptions {
 export interface BinaryHeadersInterceptorOptions {
   readonly outbound?: BinaryHeadersOutboundOptions;
   readonly inbound?: BinaryHeadersInboundOptions;
+  readonly statsCounter?: BinaryHeaderStatsCounter;
 }
 
 /**
@@ -43,26 +45,29 @@ export interface BinaryHeadersInterceptorOptions {
 export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   readonly #resolver: EligibilityResolver;
   readonly #packer: CommandPacker;
+  readonly #statsCounter: BinaryHeaderStatsCounter;
 
-  constructor(options: BinaryHeadersOutboundOptions = {}) {
+  constructor(
+    options: BinaryHeadersOutboundOptions = {},
+    statsCounter?: BinaryHeaderStatsCounter
+  ) {
+    this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
     this.#resolver = options.resolver ?? NOOP_RESOLVER;
-    this.#packer = new CommandPacker(options.maxWaitMs ?? null);
+    this.#packer = new CommandPacker(options.maxWaitMs ?? null, this.#statsCounter);
   }
 
-  /**
-   * Eligible commands are batched by slot with binary headers.
-   * Ineligible commands pass through unchanged, flushing any pending batch first.
-   */
-  intercept(
-    encoded: SocketChunk,
-    args: CommandArguments
-  ): SocketChunks {
+  intercept(encoded: SocketChunk, args: CommandArguments): SocketChunks {
+    this.#statsCounter.recordCommand();
+
     const slot = this.#resolver.getSlot(args);
 
     if (slot === SLOT_INELIGIBLE) {
+      this.#statsCounter.recordIneligible();
       const pending = this.#packer.drain();
       return pending ? [pending, encoded] : [encoded];
     }
+
+    this.#statsCounter.recordBatchedCommand();
 
     const packed = this.#packer.add(encoded, slot, calculatePayloadLength(encoded));
     return packed ? [packed] : [];
@@ -74,6 +79,10 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
 
   hasPending(): boolean {
     return this.#packer.bufferSize > 0;
+  }
+
+  stats(): BinaryHeaderStats {
+    return this.#statsCounter.snapshot();
   }
 }
 
@@ -182,10 +191,16 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
 export class BinaryHeadersInterceptor implements WireInterceptor {
   readonly outbound: BinaryHeadersOutboundInterceptor;
   readonly inbound: BinaryHeadersInboundInterceptor;
+  readonly #statsCounter: BinaryHeaderStatsCounter;
 
   constructor(options: BinaryHeadersInterceptorOptions = {}) {
-    this.outbound = new BinaryHeadersOutboundInterceptor(options.outbound);
+    this.#statsCounter = options.statsCounter ?? disabledBinaryHeaderStatsCounter();
+    this.outbound = new BinaryHeadersOutboundInterceptor(options.outbound, this.#statsCounter);
     this.inbound = new BinaryHeadersInboundInterceptor(options.inbound);
+  }
+
+  stats(): BinaryHeaderStats {
+    return this.#statsCounter.snapshot();
   }
 }
 
@@ -198,6 +213,7 @@ export function createBinaryHeadersInterceptor(
     maxWaitMs?: number;
     onHeader?: OnHeader;
     onProtocolError?: OnProtocolError;
+    statsCounter?: BinaryHeaderStatsCounter;
   }
 ): WireInterceptor {
   return new BinaryHeadersInterceptor({
@@ -209,5 +225,6 @@ export function createBinaryHeadersInterceptor(
       onHeader: options?.onHeader,
       onProtocolError: options?.onProtocolError,
     },
+    statsCounter: options?.statsCounter,
   });
 }

@@ -7,6 +7,8 @@ import RedisCommandsQueue, { type SocketChunk, type CommandArguments } from '../
 import MasterQueue from './master-queue';
 import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
+import { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter } from './stats';
+import type { BinaryHeaderStatsCounter } from './stats';
 import type { EligibilityResolver } from './eligibility';
 import type { Scheduler } from './packing';
 import { createTimeoutScheduler } from './packing';
@@ -367,6 +369,7 @@ export interface QueueFactoryOptions {
     maxWaitMs: number;
     scheduler?: Scheduler;
   };
+  statsCounter?: BinaryHeaderStatsCounter;
 }
 
 // ============================================================================
@@ -381,12 +384,14 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
     resolver,
     onProtocolError,
     timer,
+    statsCounter,
   } = options;
 
-  const interceptor = (resolver || onProtocolError)
+  const interceptor = (resolver || onProtocolError || statsCounter)
     ? new BinaryHeadersInterceptor({
         outbound: resolver ? { resolver } : undefined,
         inbound: onProtocolError ? { onProtocolError: (header) => onProtocolError(header.requestId) } : undefined,
+        statsCounter,
       })
     : undefined;
 
@@ -493,3 +498,5 @@ export { ResponseHeaderEncoder } from './generated/response-header-codec';
 export { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 export type { EligibilityResolver } from './eligibility';
 export type { Scheduler } from './packing';
+export { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter } from './stats';
+export type { BinaryHeaderStatsCounter } from './stats';
