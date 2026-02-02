@@ -6,6 +6,7 @@ import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, Pu
 import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, TimeoutError } from '../errors';
 import { MonitorCallback } from '.';
 import { dbgMaintenance } from './enterprise-maintenance-manager';
+import type { BinaryHeaderStats } from '../binary-headers/stats';
 
 export interface Cancellable {
   cancel(): void;
@@ -91,6 +92,11 @@ export interface InboundInterceptor {
 export interface WireInterceptor {
   readonly outbound?: OutboundInterceptor;
   readonly inbound?: InboundInterceptor;
+  /**
+   * Returns a snapshot of interceptor statistics.
+   * Statistics tracking is optional - implementations may return empty stats.
+   */
+  stats?(): BinaryHeaderStats;
 }
 
 export type TimerFlushCallback = (encoded: SocketChunk) => void;
