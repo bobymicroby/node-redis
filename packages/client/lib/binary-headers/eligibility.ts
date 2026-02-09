@@ -226,25 +226,6 @@ export const STATIC_COMMAND_RECORDS: ReadonlyArray<CommandRecord> = [
       { name: 'REFCOUNT', keyPosition: { index: 2 } },
     ]
   },
-  {
-    name: 'CLIENT',
-    keyPosition: { keyless: true },
-    subcommands: [
-      { name: 'GETNAME', keyPosition: { keyless: true } },
-      { name: 'SETNAME', keyPosition: { keyless: true } },
-      { name: 'LIST', keyPosition: { keyless: true } },
-      { name: 'ID', keyPosition: { keyless: true } },
-    ]
-  },
-  {
-    name: 'MEMORY',
-    keyPosition: { keyless: true },
-    subcommands: [
-      { name: 'USAGE', keyPosition: { index: 2 } },
-      { name: 'DOCTOR', keyPosition: { keyless: true } },
-      { name: 'STATS', keyPosition: { keyless: true } },
-    ]
-  },
 ];
 
 export const STATIC_RESOLVER = new EligibilityResolver(buildCommandMap(STATIC_COMMAND_RECORDS));
