@@ -23,6 +23,7 @@
  */
 
 import { parseArgs } from 'node:util';
+import { build as buildHistogram, Histogram } from 'hdr-histogram-js';
 import RedisClient from '../client';
 import { RedisClientType } from '../client';
 import { BinaryHeaderStats } from './stats';
@@ -178,25 +179,25 @@ class BulkKeyGenerator {
 }
 
 // ============================================================================
-// Latency Tracking
+// Latency Tracking (using HDR Histogram for memory-efficient percentile calculation)
 // ============================================================================
 
-class LatencyHistogram {
-  #values: bigint[] = [];
-
-  record(elapsedNs: bigint): void {
-    this.#values.push(elapsedNs);
-  }
-
-  reset(): bigint[] {
-    const vals = this.#values;
-    this.#values = [];
-    return vals;
-  }
-
-  get count(): number {
-    return this.#values.length;
-  }
+/**
+ * Creates a new HDR histogram configured for latency tracking.
+ *
+ * Configuration aligned with memtier_benchmark (see run_stats_types.h):
+ * - lowestDiscernibleValue: 10 (microseconds) - LATENCY_HDR_MIN_VALUE
+ * - highestTrackableValue: 600,000,000 (600 seconds in microseconds) - LATENCY_HDR_SEC_MAX_VALUE
+ * - numberOfSignificantValueDigits: 2 (1% precision) - LATENCY_HDR_SEC_SIGDIGTS
+ *
+ * Note: memtier uses microseconds, so we convert from nanoseconds when recording.
+ */
+function createLatencyHistogram(): Histogram {
+  return buildHistogram({
+    lowestDiscernibleValue: 10,             // 10 microseconds (matches LATENCY_HDR_MIN_VALUE)
+    highestTrackableValue: 600_000_000,     // 600 seconds in µs (matches LATENCY_HDR_SEC_MAX_VALUE)
+    numberOfSignificantValueDigits: 2,      // 1% precision (matches LATENCY_HDR_SEC_SIGDIGTS)
+  });
 }
 
 interface StatsSummary {
@@ -207,40 +208,41 @@ interface StatsSummary {
   p999: number;
 }
 
-function percentile(sorted: bigint[], p: number): number {
-  if (sorted.length === 0) return 0;
-  const idx = Math.min(Math.floor(sorted.length * p), sorted.length - 1);
-  return Number(sorted[idx]);
-}
-
-function computeSummary(values: bigint[], durationSeconds: number): StatsSummary {
-  const sorted = values.slice().sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+function computeSummaryFromHistogram(histogram: Histogram, durationSeconds: number): StatsSummary {
+  // Histogram stores values in microseconds, convert back to nanoseconds for display
+  // (formatNs function expects nanoseconds)
   return {
-    ops: values.length / durationSeconds,
-    p50: percentile(sorted, 0.50),
-    p95: percentile(sorted, 0.95),
-    p99: percentile(sorted, 0.99),
-    p999: percentile(sorted, 0.999),
+    ops: histogram.totalCount / durationSeconds,
+    p50: histogram.getValueAtPercentile(50) * 1000,   // µs -> ns
+    p95: histogram.getValueAtPercentile(95) * 1000,   // µs -> ns
+    p99: histogram.getValueAtPercentile(99) * 1000,   // µs -> ns
+    p999: histogram.getValueAtPercentile(99.9) * 1000, // µs -> ns
   };
 }
 
 class MemtierStats {
-  readonly #setHist = new LatencyHistogram();
-  readonly #getHist = new LatencyHistogram();
+  // Interval histograms (reset after each interval)
+  readonly #setIntervalHist: Histogram = createLatencyHistogram();
+  readonly #getIntervalHist: Histogram = createLatencyHistogram();
+
+  // Cumulative histograms (for final summary)
+  readonly #setTotalHist: Histogram = createLatencyHistogram();
+  readonly #getTotalHist: Histogram = createLatencyHistogram();
+
   #errorCount = 0;
   #intervalErrors = 0;
 
-  // Keep all values for final summary
-  #allSetValues: bigint[] = [];
-  #allGetValues: bigint[] = [];
-
   record(isSet: boolean, elapsedNs: bigint): void {
+    // Convert from nanoseconds to microseconds to match memtier's histogram units
+    // HDR histogram uses number, so convert from bigint
+    const latencyUs = Number(elapsedNs / 1000n);
+
     if (isSet) {
-      this.#setHist.record(elapsedNs);
-      this.#allSetValues.push(elapsedNs);
+      this.#setIntervalHist.recordValue(latencyUs);
+      this.#setTotalHist.recordValue(latencyUs);
     } else {
-      this.#getHist.record(elapsedNs);
-      this.#allGetValues.push(elapsedNs);
+      this.#getIntervalHist.recordValue(latencyUs);
+      this.#getTotalHist.recordValue(latencyUs);
     }
   }
 
@@ -250,16 +252,18 @@ class MemtierStats {
   }
 
   snapshotInterval(intervalSeconds: number): { set: StatsSummary; get: StatsSummary; errors: number } {
-    const setVals = this.#setHist.reset();
-    const getVals = this.#getHist.reset();
-    const errors = this.#intervalErrors;
+    const result = {
+      set: computeSummaryFromHistogram(this.#setIntervalHist, intervalSeconds),
+      get: computeSummaryFromHistogram(this.#getIntervalHist, intervalSeconds),
+      errors: this.#intervalErrors,
+    };
+
+    // Reset interval histograms and error count
+    this.#setIntervalHist.reset();
+    this.#getIntervalHist.reset();
     this.#intervalErrors = 0;
 
-    return {
-      set: computeSummary(setVals, intervalSeconds),
-      get: computeSummary(getVals, intervalSeconds),
-      errors,
-    };
+    return result;
   }
 
   finalSummary(totalDurationSeconds: number): {
@@ -268,14 +272,15 @@ class MemtierStats {
     total: StatsSummary;
     totalErrors: number;
   } {
-    const setVals = this.#allSetValues;
-    const getVals = this.#allGetValues;
-    const allValues = [...setVals, ...getVals];
+    // Create a combined histogram for total stats
+    const totalHist = createLatencyHistogram();
+    totalHist.add(this.#setTotalHist);
+    totalHist.add(this.#getTotalHist);
 
     return {
-      set: computeSummary(setVals, totalDurationSeconds),
-      get: computeSummary(getVals, totalDurationSeconds),
-      total: computeSummary(allValues, totalDurationSeconds),
+      set: computeSummaryFromHistogram(this.#setTotalHist, totalDurationSeconds),
+      get: computeSummaryFromHistogram(this.#getTotalHist, totalDurationSeconds),
+      total: computeSummaryFromHistogram(totalHist, totalDurationSeconds),
       totalErrors: this.#errorCount,
     };
   }
@@ -392,7 +397,6 @@ function runPipelinedConnection(
     let inFlight = 0;
     let bulkResponseCount = 0;
     let resolved = false;
-    let firstBatchLogged = false;
 
     /**
      * Issue a batch of bulk-size commands using multi().execAsPipeline().
@@ -447,11 +451,6 @@ function runPipelinedConnection(
         .finally(() => {
           inFlight -= bulkSize;
           bulkResponseCount += bulkSize;
-
-          if (!firstBatchLogged && cmdIndex >= pipelineDepth) {
-            console.log(`  [conn ${connId}] pipeline filled: ${pipelineDepth} commands, bulk-size=${bulkSize}`);
-            firstBatchLogged = true;
-          }
 
           // When bulk-size responses received, issue another bulk to maintain pipeline
           if (bulkResponseCount >= bulkSize) {
