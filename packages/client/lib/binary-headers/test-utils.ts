@@ -8,7 +8,7 @@ import MasterQueue from './master-queue';
 import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 
-import type { BinaryHeaderStatsCounter } from './stats';
+import type { BinaryHeaderStatsCounter, BinaryHeaderStats } from './stats';
 import type { EligibilityResolver } from './eligibility';
 import type { Scheduler } from './packing';
 import { createTimeoutScheduler } from './packing';
@@ -285,6 +285,88 @@ export function respArray(elements: Buffer[]): Buffer {
 }
 
 // ============================================================================
+// Stats Assertion Helpers
+// ============================================================================
+
+/**
+ * Expected values for BinaryHeaderStats assertion.
+ * All fields are optional - only specified fields will be checked.
+ */
+export interface ExpectedStats {
+  totalCommandCount?: number;
+  batchedCommandCount?: number;
+  batchCount?: number;
+  ineligibleCount?: number;
+  slotMismatchFlushCount?: number;
+  maxCommandsFlushCount?: number;
+  maxPayloadFlushCount?: number;
+  timerFlushCount?: number;
+  drainFlushCount?: number;
+  // Derived metrics
+  batchRate?: number;
+  averageBatchSize?: number;
+  passthroughCount?: number;
+  ineligibleRate?: number;
+  totalFlushCount?: number;
+}
+
+/**
+ * Asserts that BinaryHeaderStats matches expected values.
+ * Only checks fields that are specified in expected.
+ */
+export function assertStats(stats: BinaryHeaderStats, expected: ExpectedStats, prefix = ''): void {
+  const p = prefix ? `${prefix}: ` : '';
+
+  // Core counters
+  if (expected.totalCommandCount !== undefined) {
+    assert.equal(stats.totalCommandCount, expected.totalCommandCount, `${p}totalCommandCount`);
+  }
+  if (expected.batchedCommandCount !== undefined) {
+    assert.equal(stats.batchedCommandCount, expected.batchedCommandCount, `${p}batchedCommandCount`);
+  }
+  if (expected.batchCount !== undefined) {
+    assert.equal(stats.batchCount, expected.batchCount, `${p}batchCount`);
+  }
+  if (expected.ineligibleCount !== undefined) {
+    assert.equal(stats.ineligibleCount, expected.ineligibleCount, `${p}ineligibleCount`);
+  }
+
+  // Flush reason counters
+  if (expected.slotMismatchFlushCount !== undefined) {
+    assert.equal(stats.slotMismatchFlushCount, expected.slotMismatchFlushCount, `${p}slotMismatchFlushCount`);
+  }
+  if (expected.maxCommandsFlushCount !== undefined) {
+    assert.equal(stats.maxCommandsFlushCount, expected.maxCommandsFlushCount, `${p}maxCommandsFlushCount`);
+  }
+  if (expected.maxPayloadFlushCount !== undefined) {
+    assert.equal(stats.maxPayloadFlushCount, expected.maxPayloadFlushCount, `${p}maxPayloadFlushCount`);
+  }
+  if (expected.timerFlushCount !== undefined) {
+    assert.equal(stats.timerFlushCount, expected.timerFlushCount, `${p}timerFlushCount`);
+  }
+  if (expected.drainFlushCount !== undefined) {
+    assert.equal(stats.drainFlushCount, expected.drainFlushCount, `${p}drainFlushCount`);
+  }
+
+  // Derived metrics
+  if (expected.batchRate !== undefined) {
+    assert.equal(stats.batchRate(), expected.batchRate, `${p}batchRate`);
+  }
+  if (expected.averageBatchSize !== undefined) {
+    assert.equal(stats.averageBatchSize(), expected.averageBatchSize, `${p}averageBatchSize`);
+  }
+  if (expected.passthroughCount !== undefined) {
+    assert.equal(stats.passthroughCount(), expected.passthroughCount, `${p}passthroughCount`);
+  }
+  if (expected.ineligibleRate !== undefined) {
+    assert.equal(stats.ineligibleRate(), expected.ineligibleRate, `${p}ineligibleRate`);
+  }
+  if (expected.totalFlushCount !== undefined) {
+    assert.equal(stats.totalFlushCount(), expected.totalFlushCount, `${p}totalFlushCount`);
+  }
+}
+
+// ============================================================================
 // Stress Test Utilities
 // ============================================================================
 
@@ -499,4 +581,4 @@ export { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 export type { EligibilityResolver } from './eligibility';
 export type { Scheduler } from './packing';
 export { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter } from './stats';
-export type { BinaryHeaderStatsCounter } from './stats';
+export type { BinaryHeaderStatsCounter, BinaryHeaderStats } from './stats';

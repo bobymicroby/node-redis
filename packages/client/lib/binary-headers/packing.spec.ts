@@ -6,6 +6,7 @@ import {
   createImmediateScheduler,
   calculatePayloadLength,
 } from './packing';
+import { FlushReason } from './stats';
 import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
 
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
@@ -159,7 +160,7 @@ describe('Packing', () => {
         const secondFlush = packer.add(['cmd5'], 3000, 4); // triggers flush (slot change)
 
         // Third batch via drain: slot 3000, 1 command
-        const thirdFlush = packer.drain();
+        const thirdFlush = packer.drain(FlushReason.DRAIN);
 
         // CRITICAL: Verify first flush header is still valid after subsequent flushes
         // Before the fix, firstFlush[0] would contain thirdFlush's header data
@@ -177,13 +178,13 @@ describe('Packing', () => {
         packer.add(['*1\r\n$4\r\nPING\r\n'], 1000, 14);
         packer.add(['*1\r\n$4\r\nPING\r\n'], 1000, 14);
 
-        const drained = packer.drain();
+        const drained = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(drained, { commandCount: 2, slot: 1000 });
         assert.equal(packer.bufferSize, 0);
       });
 
       it('drain returns null when buffer is empty', () => {
-        assert.equal(new CommandPacker().drain(), null);
+        assert.equal(new CommandPacker().drain(FlushReason.DRAIN), null);
       });
 
       it('flushes at max commands', () => {
@@ -207,7 +208,7 @@ describe('Packing', () => {
         packer.add(['resp2'], 5000, 5);
         packer.add(['resp3'], NULL_SLOT, 5);
 
-        const packed = packer.drain();
+        const packed = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(packed, { commandCount: 3, slot: 5000 });
       });
 
@@ -216,7 +217,7 @@ describe('Packing', () => {
         packer.add(['resp1'], NULL_SLOT, 5);
         packer.add(['resp2'], NULL_SLOT, 5);
 
-        const packed = packer.drain();
+        const packed = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(packed, { commandCount: 2, slot: 0 });
       });
 
@@ -227,7 +228,7 @@ describe('Packing', () => {
         packer.add(['keyless2'], NULL_SLOT, 8); // Still compatible
 
         assert.equal(packer.bufferSize, 3);
-        const packed = packer.drain();
+        const packed = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(packed, { commandCount: 3, slot: 5000 });
       });
 
@@ -238,7 +239,7 @@ describe('Packing', () => {
         packer.add(['keyed'], 3000, 5); // First non-null slot wins
 
         assert.equal(packer.bufferSize, 3);
-        const packed = packer.drain();
+        const packed = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(packed, { commandCount: 3, slot: 3000 });
       });
 
@@ -305,7 +306,7 @@ describe('Packing', () => {
         assert.equal(packer.bufferSize, 3);
 
         // Only flushes via drain or incompatible slot
-        const drained = packer.drain();
+        const drained = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(drained, { commandCount: 3, slot: 1000 });
       });
 
@@ -353,7 +354,7 @@ describe('Packing', () => {
         assert.equal(packer.bufferSize, 2);
 
         // Verify drain works and has correct total
-        const drained = packer.drain();
+        const drained = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(drained, { commandCount: 2, slot: 1000 });
       });
 
@@ -377,7 +378,7 @@ describe('Packing', () => {
         packer.add(['part1a', 'part1b'], 1000, 10);
         packer.add(['part2a'], 1000, 5);
 
-        const packed = packer.drain();
+        const packed = packer.drain(FlushReason.DRAIN);
         assert.ok(packed !== null);
         assert.equal(packed.length, 4); // header + part1a + part1b + part2a
         assert.ok(packed[0] instanceof Buffer);

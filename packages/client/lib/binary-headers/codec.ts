@@ -3,7 +3,7 @@ import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength } from './packing';
 import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
-import { disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from './stats';
+import { FlushReason, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from './stats';
 
 export type OnHeader = (header: BinaryResponseHeader) => void;
 export type OnProtocolError = (header: BinaryResponseHeader) => void;
@@ -63,7 +63,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
 
     if (slot === SLOT_INELIGIBLE) {
       this.#statsCounter.recordIneligible();
-      const pending = this.#packer.drain();
+      const pending = this.#packer.drain(FlushReason.DRAIN);
       return pending ? [pending, encoded] : [encoded];
     }
 
@@ -73,8 +73,8 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     return packed ? [packed] : [];
   }
 
-  flush(): SocketChunk | null {
-    return this.#packer.drain();
+  flush(reason: FlushReason): SocketChunk | null {
+    return this.#packer.drain(reason);
   }
 
   hasPending(): boolean {
