@@ -57,11 +57,8 @@ function createBulkKeyGenerator(
 }
 
 function nextKey(state: BulkKeyGeneratorState): string {
-  if (state.bulkSize <= 1) {
-    const keyIndex = state.keyMin + Math.floor(Math.random() * (state.keysPerSlot * state.bulkSlots));
-    return `${state.prefix}${keyIndex}`;
-  }
-
+  // Always use {slot_id}:key_suffix format for fast-header protocol (including bulk-size=1)
+  // This matches memtier's behavior where bulk key format is used regardless of bulk_size
   const posInBulk = state.commandCount % state.bulkSize;
   if (posInBulk === 0 && state.commandCount > 0) {
     state.bulkNumber++;
@@ -92,7 +89,7 @@ function collectYielded(queue: RedisCommandsQueue): Array<ReadonlyArray<unknown>
   const gen = queue.commandsToWrite();
   let next = gen.next();
   while (!next.done) {
-    results.push(next.value);
+    results.push(next.value as ReadonlyArray<unknown>);
     next = gen.next();
   }
   return results;
@@ -112,20 +109,26 @@ function parsePackedHeader(chunk: ReadonlyArray<unknown>): { commandCount: numbe
 // ============================================================================
 
 describe('BulkKeyGenerator', function () {
-  describe('bulk-size = 1 (no batching)', function () {
-    it('generates keys without hash tags', function () {
-      const keyGen = createBulkKeyGenerator('test-', 1, 16384, 1, 1000000);
+  describe('bulk-size = 1 (each command is its own bulk)', function () {
+    it('generates keys with hash tags, cycling through slots', function () {
+      const keyGen = createBulkKeyGenerator('test-', 1, 10, 0, 999, 0, 0);
 
       const keys: string[] = [];
       for (let i = 0; i < 10; i++) {
         keys.push(nextKey(keyGen));
       }
 
-      // Keys should not have hash tags when bulk-size = 1
+      // With bulk-size=1, each command is its own bulk, so slot cycles every command
+      // This matches memtier's behavior: bulk key format is used regardless of bulk_size
       for (const key of keys) {
-        assert.equal(extractSlot(key), null, `Key ${key} should not have hash tag`);
+        assert.notEqual(extractSlot(key), null, `Key ${key} should have hash tag`);
         assert(key.startsWith('test-'), `Key ${key} should have prefix`);
       }
+
+      // Verify slots cycle: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+      const slots = keys.map(extractSlot);
+      assert.deepEqual(slots, ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
+        `Slots should cycle through 0-9: ${slots.join(', ')}`);
     });
   });
 

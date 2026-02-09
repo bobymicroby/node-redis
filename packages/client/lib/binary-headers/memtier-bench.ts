@@ -157,13 +157,8 @@ class BulkKeyGenerator {
   }
 
   nextKey(): string {
-    if (this.#bulkSize <= 1) {
-      // Simple mode: no hash tags, random keys
-      const keyIndex = this.#keyMin + Math.floor(Math.random() * (this.#keysPerSlot * this.#bulkSlots));
-      return `${this.#prefix}${keyIndex}`;
-    }
-
-    // Bulk mode: use hash tags for slot grouping (matches memtier algorithm)
+    // Always use {slot_id}:key_suffix format for fast-header protocol (including bulk-size=1)
+    // This matches memtier's behavior where bulk key format is used regardless of bulk_size
     const posInBulk = this.#commandCount % this.#bulkSize;
     if (posInBulk === 0 && this.#commandCount > 0) {
       this.#bulkNumber++;

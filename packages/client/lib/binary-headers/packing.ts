@@ -92,9 +92,9 @@ export class CommandPacker {
     return null;
   }
 
-  drain(): SocketChunk | null {
+  drain(reason: FlushReason): SocketChunk | null {
     if (this.#resps.length === 0) return null;
-    return this.#flush(FlushReason.DRAIN);
+    return this.#flush(reason);
   }
 
   get bufferSize(): number {

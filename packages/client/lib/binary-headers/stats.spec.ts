@@ -436,7 +436,7 @@ describe('Binary Headers Stats', function () {
       assert.equal(stats.batchCount, 0);
 
       // Drain the buffer
-      interceptor.outbound.flush();
+      interceptor.outbound.flush(FlushReason.DRAIN);
 
       // After drain
       stats = interceptor.stats();

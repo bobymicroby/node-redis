@@ -7,6 +7,7 @@ import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, TimeoutEr
 import { MonitorCallback } from '.';
 import { dbgMaintenance } from './enterprise-maintenance-manager';
 import type { BinaryHeaderStats } from '../binary-headers/stats';
+import { FlushReason } from '../binary-headers/stats';
 
 export interface Cancellable {
   cancel(): void;
@@ -57,9 +58,10 @@ export interface OutboundInterceptor {
 
   /**
    * Force flush any pending buffered data.
+   * @param reason - Reason for the flush (for stats tracking)
    * @returns Flushed chunk, or null if nothing pending
    */
-  flush(): SocketChunk | null;
+  flush(reason: FlushReason): SocketChunk | null;
 
   /**
    * Check if there's pending buffered data.
@@ -270,7 +272,7 @@ export default class RedisCommandsQueue {
 
     this.#pendingFlush = this.#scheduler.schedule(this.#maxWaitMs, () => {
       this.#pendingFlush = null;
-      const packed = this.drainPendingOutbound();
+      const packed = this.drainPendingOutbound(FlushReason.TIMER_EXPIRED);
       if (packed !== null) {
         this.#timerFlushCallback(packed);
       }
@@ -661,7 +663,7 @@ export default class RedisCommandsQueue {
     // When a scheduler is set, the timer callback handles flushing buffered commands.
     // This allows commands to batch up to maxWaitMs before being sent.
     if (outbound !== null && this.#scheduler === null) {
-      const drained = outbound.flush();
+      const drained = outbound.flush(FlushReason.DRAIN);
       if (drained !== null) {
         yield drained;
       }
@@ -680,8 +682,8 @@ export default class RedisCommandsQueue {
     return this.#outbound?.hasPending() ?? false;
   }
 
-  drainPendingOutbound(): SocketChunk | null {
-    return this.#outbound?.flush() ?? null;
+  drainPendingOutbound(reason: FlushReason = FlushReason.DRAIN): SocketChunk | null {
+    return this.#outbound?.flush(reason) ?? null;
   }
 
   #flushWaitingForReply(err: Error): void {
