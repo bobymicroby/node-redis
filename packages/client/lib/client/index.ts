@@ -5,6 +5,26 @@ import RedisCommandsQueue, { CommandOptions } from './commands-queue';
 import { BinaryHeadersInterceptor } from '../binary-headers/codec';
 import { STATIC_RESOLVER } from '../binary-headers/eligibility';
 import { createTimeoutScheduler } from '../binary-headers/packing';
+import { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from '../binary-headers/stats';
+
+export interface BinaryHeadersOptions {
+  /**
+   * Whether binary headers protocol is enabled.
+   */
+  enabled: boolean;
+  /**
+   * Controls binary headers statistics collection.
+   * - 'noop': Use noop stats counter for zero overhead
+   * - 'enabled': Collect stats
+   */
+  'stats-collector'?: 'noop' | 'enabled';
+  /**
+   * Get a snapshot of binary headers statistics.
+   * This method is populated by the client after initialization when stats-collector is 'enabled'.
+   */
+  getStats?: () => BinaryHeaderStats;
+}
+
 import { EventEmitter } from 'node:events';
 import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';
 import { ClientClosedError, ClientOfflineError, DisconnectsClientError, WatchError } from '../errors';
@@ -197,10 +217,11 @@ export interface RedisClientOptions<
    * Binary headers reduce protocol overhead by adding a compact binary prefix
    * to commands, enabling faster routing through DMC proxies.
    *
-   * Only effective in cluster mode. When enabled, eligible commands are
-   * automatically encoded with binary headers.
-   */
-  binaryHeaders?: boolean;
+   /**
+    * Only effective in cluster mode. When enabled, eligible commands are
+    * automatically encoded with binary headers.
+    */
+   binaryHeaders?: boolean | BinaryHeadersOptions;
 };
 
 export type WithCommands<
@@ -446,7 +467,7 @@ export default class RedisClient<
     return parsed;
   }
 
-  readonly #options: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>;
+  #options: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>;
   #socket: RedisSocket;
   readonly #queue: RedisCommandsQueue;
   #selectedDB = 0;
@@ -485,6 +506,8 @@ export default class RedisClient<
   get isPubSubActive() {
     return this._self.#queue.isPubSubActive;
   }
+
+
 
   get socketEpoch() {
     return this._self.#socket.socketEpoch;
@@ -614,10 +637,27 @@ export default class RedisClient<
   }
 
   #initiateQueue(): RedisCommandsQueue {
-    if (this.#options.binaryHeaders) {
+    // Normalize binaryHeaders option: boolean true becomes { enabled: true }
+    const binaryHeadersOpts: BinaryHeadersOptions | undefined =
+      this.#options.binaryHeaders === true
+        ? { enabled: true }
+        : this.#options.binaryHeaders === false
+          ? undefined
+          : this.#options.binaryHeaders;
+
+    if (binaryHeadersOpts?.enabled) {
+      // Create stats counter based on stats-collector option (default to noop)
+      const statsCounter: BinaryHeaderStatsCounter = binaryHeadersOpts['stats-collector'] === 'enabled'
+        ? DefaultBinaryHeaderStatsCounter.create()
+        : disabledBinaryHeaderStatsCounter();
+
+      // Expose getStats method on the options for users to access stats
+      binaryHeadersOpts.getStats = () => statsCounter.snapshot();
+
       const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER },
-        inbound: { onProtocolError: (header) => this.emit('error', new Error(`Binary header protocol error: requestId=${header.requestId}`)) }
+        inbound: { onProtocolError: (header) => this.emit('error', new Error(`Binary header protocol error: requestId=${header.requestId}`)) },
+        statsCounter
       });
       const timerOptions = { maxWaitMs: 1, scheduler: createTimeoutScheduler() };
       return new RedisCommandsQueue(
@@ -637,7 +677,7 @@ export default class RedisClient<
   }
 
   #setupBinhdrFlushCallback(): void {
-    if (this.#options.binaryHeaders) {
+    if (this.#options.binaryHeaders === true || (this.#options.binaryHeaders && this.#options.binaryHeaders.enabled)) {
       this.#queue.setTimerFlushCallback(encoded => {
         this.#socket.write([encoded]);
       });

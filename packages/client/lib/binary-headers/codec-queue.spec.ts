@@ -257,10 +257,14 @@ describe('Codec Queue [codec-queue]', function () {
       });
     });
 
-    it('timer is cancelled when slot incompatibility causes flush', async function () {
+    it('timer is cancelled when slot incompatibility causes flush, new timer scheduled for remaining', async function () {
       const queue = createQueueWithTimer(50, false);
       let callbackCount = 0;
-      queue.setTimerFlushCallback(() => { callbackCount++; });
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => {
+        callbackCount++;
+        flushedData.push(encoded);
+      });
 
       // Add first command - buffered, timer scheduled
       queue.addCommand(['SET', 'key1', 'value1']);
@@ -277,11 +281,16 @@ describe('Codec Queue [codec-queue]', function () {
         commands: [['SET', 'key1', 'value1']]
       });
 
-      // Wait past the original timer
+      // Wait past the timer - a NEW timer should have been scheduled for the second command
       await delay(60);
 
-      // Timer should have been cancelled - callback should not be called
-      assert.equal(callbackCount, 0, 'Timer callback should not fire after slot-triggered flush');
+      // Timer should fire once for the second command that was left pending after slot flush
+      assert.equal(callbackCount, 1, 'Timer callback should fire for remaining buffered command');
+      assert.equal(flushedData.length, 1, 'Should have flushed data from timer');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', 'key2', 'value2']]
+      });
     });
 
     it('multiple commands buffered, timer fires with all packed together', async function () {
@@ -380,16 +389,29 @@ describe('Codec Queue [codec-queue]', function () {
     it('slot incompatibility causes flush mid-generator', function () {
       const queue = createQueueWithTimer(100, false);
 
-      // Add commands with different slots
+      // Add commands with different slots: A, B, A
       queue.addCommand(['SET', 'key1', 'value1']); // slot A
-      queue.addCommand(['SET', 'key2', 'value2']); // slot B (different)
-      queue.addCommand(['SET', 'key1', 'value3']); // slot A again
+      queue.addCommand(['SET', 'key2', 'value2']); // slot B - triggers flush of A
+      queue.addCommand(['SET', 'key1', 'value3']); // slot A - triggers flush of B
 
       const results = collectYielded(queue);
 
-      // Should have yields due to slot changes (transform returns data)
-      // Last batch stays buffered (scheduler configured, no drain at end)
-      assert.ok(results.length >= 1, 'Slot incompatibility causes yields');
+      // Should have 2 yields from slot changes:
+      // 1. A->B flushes slot A (1 cmd)
+      // 2. B->A flushes slot B (1 cmd)
+      // Last command (slot A) stays buffered for timer
+      assert.equal(results.length, 2, 'Should yield 2 batches from slot changes');
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', 'key1', 'value1']]
+      });
+      assertPackedData(results[1], {
+        commandCount: 1,
+        commands: [['SET', 'key2', 'value2']]
+      });
+
+      // Third command still pending for timer
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'key1 value3 pending for timer');
     });
   });
 
@@ -888,6 +910,48 @@ describe('Auto-pipelining behavior', function () {
 
       // Second command still pending for timer
       assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'key2 pending for timer');
+    });
+
+    it('alternating slots with scheduler: each flush reschedules timer for remaining', async function () {
+      queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 50, scheduler: createTimeoutScheduler() }
+      });
+
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => {
+        flushedData.push(encoded);
+      });
+
+      // 3 commands with alternating slots: A, B, A
+      queue.addCommand(['SET', '{slot1}key1', 'value1']); // slot A
+      queue.addCommand(['SET', '{slot2}key2', 'value2']); // slot B - triggers flush of A
+      queue.addCommand(['SET', '{slot1}key3', 'value3']); // slot A - triggers flush of B
+
+      const results = collectYielded(queue);
+
+      // Should yield 2 batches from slot changes (A flushed by B, B flushed by A)
+      assert.equal(results.length, 2, 'Should yield 2 batches from slot changes');
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', '{slot1}key1', 'value1']]
+      });
+      assertPackedData(results[1], {
+        commandCount: 1,
+        commands: [['SET', '{slot2}key2', 'value2']]
+      });
+
+      // Third command still pending for timer
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'key3 pending for timer');
+
+      // Wait for timer to flush the remaining command
+      await delay(60);
+
+      // Timer should have fired for the last command
+      assert.equal(flushedData.length, 1, 'Timer should flush remaining command');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', '{slot1}key3', 'value3']]
+      });
     });
   });
 

@@ -171,6 +171,7 @@ export default class RedisCommandsQueue {
   readonly #pubSub = new PubSub();
   readonly #outbound: OutboundInterceptor | null;
   readonly #inbound: InboundInterceptor | null;
+  readonly #wireInterceptor: WireInterceptor | undefined;
   readonly #scheduler: Scheduler | null;
   readonly #maxWaitMs: number;
   #pendingFlush: Cancellable | null = null;
@@ -227,6 +228,10 @@ export default class RedisCommandsQueue {
     return this.#pubSub.isActive;
   }
 
+  wireInterceptorStats(): BinaryHeaderStats | undefined {
+    return this.#wireInterceptor?.stats?.();
+  }
+
   constructor(
     respVersion: RespVersions,
     maxLength: number | null | undefined,
@@ -239,6 +244,7 @@ export default class RedisCommandsQueue {
     this.#onShardedChannelMoved = onShardedChannelMoved;
     this.#outbound = interceptor?.outbound ?? null;
     this.#inbound = interceptor?.inbound ?? null;
+    this.#wireInterceptor = interceptor;
     this.#scheduler = timerOptions?.scheduler ?? null;
     this.#maxWaitMs = timerOptions?.maxWaitMs ?? 0;
     this.decoder = this.#initiateDecoder();
@@ -633,6 +639,11 @@ export default class RedisCommandsQueue {
           this.#cancelPendingFlush();
           for (const output of outputs) {
             yield output;
+          }
+          // After flushing, if there's still pending data (e.g., slot mismatch added new command),
+          // schedule a new flush for the remaining buffered commands
+          if (this.#scheduler !== null && outbound.hasPending()) {
+            this.#scheduleFlush();
           }
         }
 

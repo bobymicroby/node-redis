@@ -7,7 +7,7 @@ import RedisCommandsQueue, { type SocketChunk, type CommandArguments } from '../
 import MasterQueue from './master-queue';
 import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
-import { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter } from './stats';
+
 import type { BinaryHeaderStatsCounter } from './stats';
 import type { EligibilityResolver } from './eligibility';
 import type { Scheduler } from './packing';
