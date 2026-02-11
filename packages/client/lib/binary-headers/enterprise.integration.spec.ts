@@ -9,7 +9,7 @@ const testCases = [
     host: 'redis-15723.aws-cluster-25422.cto.redislabs.com',
     port: 15723,
     password: 'test123',
-    binaryHeaders: true,
+    binaryHeaders: { enabled: true },
     expectedPing: 'PONG'
   },
   {

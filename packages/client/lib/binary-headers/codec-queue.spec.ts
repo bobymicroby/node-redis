@@ -26,20 +26,27 @@ import {
   // Assertion helpers
   assertPackedHeader,
   assertPackedData,
+  assertStats,
   // Queue factories
   createNoCodecQueue,
   createBinhdrQueue,
   createBinhdrQueueWithTimer,
   createPassthroughQueue,
+  createBinhdrQueueWithStats,
+  createBinhdrQueueWithTimerAndStats,
   forQueues,
   // Re-exports
   createTimeoutScheduler,
   createImmediateScheduler,
   STATIC_RESOLVER,
   ResponseHeaderEncoder,
+  // Scheduler utilities
+  createTrackingScheduler,
   // Types
   type TestableQueue,
   type TestableQueueWithTimer,
+  type TestableQueueWithStats,
+  type TestableQueueWithTimerAndStats,
 } from './test-utils';
 
 // ============================================================================
@@ -1970,4 +1977,462 @@ describe('Multi-frame chunking scenarios (table-driven)', function () {
       assert.equal(results.length, tc.payloads.length);
     });
   }
+});
+
+// ============================================================================
+// Stats ↔ Timer Integration Tests
+// Verifies that statistics are correctly recorded during timer-based flushing
+// ============================================================================
+
+describe('Stats-Timer Integration (table-driven)', function () {
+  let activeQueues: TestableQueueWithTimerAndStats[] = [];
+
+  afterEach(function () {
+    for (const queue of activeQueues) {
+      queue.destroy();
+    }
+    activeQueues = [];
+  });
+
+  function createQueueWithTimerAndStats(maxWaitMs: number, useImmediate = false): TestableQueueWithTimerAndStats {
+    const queue = createBinhdrQueueWithTimerAndStats({
+      timer: {
+        maxWaitMs,
+        scheduler: useImmediate ? createImmediateScheduler() : createTimeoutScheduler(),
+      },
+    });
+    activeQueues.push(queue);
+    return queue;
+  }
+
+  interface StatsTimerTestCase {
+    name: string;
+    setup: (queue: TestableQueueWithTimerAndStats) => void | Promise<void>;
+    action: (queue: TestableQueueWithTimerAndStats) => void | Promise<void>;
+    expectedStats: {
+      totalCommandCount?: number;
+      batchedCommandCount?: number;
+      batchCount?: number;
+      ineligibleCount?: number;
+      slotMismatchFlushCount?: number;
+      timerFlushCount?: number;
+      drainFlushCount?: number;
+    };
+  }
+
+  const statsTimerCases: StatsTimerTestCase[] = [
+    {
+      name: 'timer flush increments timerFlushCount',
+      setup: (queue) => {
+        queue.addCommand(['SET', 'key', 'value']);
+        collectYielded(queue); // buffer for timer
+      },
+      action: async (queue) => {
+        await delay(30); // wait for timer to fire
+      },
+      expectedStats: {
+        totalCommandCount: 1,
+        batchedCommandCount: 1,
+        batchCount: 1,
+        timerFlushCount: 1,
+        drainFlushCount: 0,
+        slotMismatchFlushCount: 0,
+      },
+    },
+    {
+      name: 'multiple timer flushes accumulate timerFlushCount',
+      setup: () => {},
+      action: async (queue) => {
+        queue.addCommand(['SET', 'k1', 'v1']);
+        collectYielded(queue);
+        await delay(30);
+
+        queue.addCommand(['SET', 'k2', 'v2']);
+        collectYielded(queue);
+        await delay(30);
+
+        queue.addCommand(['SET', 'k3', 'v3']);
+        collectYielded(queue);
+        await delay(30);
+      },
+      expectedStats: {
+        totalCommandCount: 3,
+        batchedCommandCount: 3,
+        batchCount: 3,
+        timerFlushCount: 3,
+        drainFlushCount: 0,
+      },
+    },
+    {
+      name: 'slot mismatch flush increments slotMismatchFlushCount, not timerFlushCount',
+      setup: () => {},
+      action: (queue) => {
+        queue.addCommand(['SET', '{a}key', 'v']);
+        queue.addCommand(['SET', '{b}key', 'v']); // different slot
+        collectYielded(queue);
+      },
+      expectedStats: {
+        totalCommandCount: 2,
+        batchedCommandCount: 2,
+        batchCount: 1, // slot A flushed, slot B still pending
+        slotMismatchFlushCount: 1,
+        timerFlushCount: 0,
+        drainFlushCount: 0,
+      },
+    },
+    {
+      name: 'manual drain increments drainFlushCount',
+      setup: (queue) => {
+        queue.addCommand(['SET', 'key', 'value']);
+        collectYielded(queue);
+      },
+      action: (queue) => {
+        queue.drainPendingOutbound();
+      },
+      expectedStats: {
+        totalCommandCount: 1,
+        batchedCommandCount: 1,
+        batchCount: 1,
+        drainFlushCount: 1,
+        timerFlushCount: 0,
+      },
+    },
+    {
+      name: 'batched commands in single timer flush',
+      setup: () => {},
+      action: async (queue) => {
+        queue.addCommand(['SET', 'key', 'v1']);
+        collectYielded(queue);
+        queue.addCommand(['GET', 'key']);
+        collectYielded(queue);
+        queue.addCommand(['DEL', 'key']);
+        collectYielded(queue);
+        await delay(30);
+      },
+      expectedStats: {
+        totalCommandCount: 3,
+        batchedCommandCount: 3,
+        batchCount: 1, // all 3 in one batch
+        timerFlushCount: 1,
+      },
+    },
+    {
+      name: 'slot change then timer: both flush types recorded',
+      setup: () => {},
+      action: async (queue) => {
+        queue.addCommand(['SET', '{a}k', 'v']);
+        queue.addCommand(['SET', '{b}k', 'v']); // triggers slot flush
+        collectYielded(queue);
+        await delay(30); // timer flushes {b}k
+      },
+      expectedStats: {
+        totalCommandCount: 2,
+        batchedCommandCount: 2,
+        batchCount: 2,
+        slotMismatchFlushCount: 1,
+        timerFlushCount: 1,
+        drainFlushCount: 0,
+      },
+    },
+  ];
+
+  for (const tc of statsTimerCases) {
+    it(tc.name, async function () {
+      const queue = createQueueWithTimerAndStats(15);
+      queue.setTimerFlushCallback(() => {}); // required for timer to work
+
+      await tc.setup(queue);
+      await tc.action(queue);
+
+      const stats = queue.getStats();
+      assertStats(stats, tc.expectedStats);
+    });
+  }
+
+  describe('stats without timer (drain at generator end)', function () {
+    const noTimerCases: StatsTimerTestCase[] = [
+      {
+        name: 'generator drain increments drainFlushCount',
+        setup: () => {},
+        action: (queue) => {
+          queue.addCommand(['SET', 'key', 'value']);
+          collectYielded(queue); // drains at end
+        },
+        expectedStats: {
+          totalCommandCount: 1,
+          batchedCommandCount: 1,
+          batchCount: 1,
+          drainFlushCount: 1,
+          timerFlushCount: 0,
+        },
+      },
+      {
+        name: 'multiple commands drained together',
+        setup: () => {},
+        action: (queue) => {
+          queue.addCommand(['SET', 'k1', 'v1']);
+          queue.addCommand(['GET', 'k1']);
+          queue.addCommand(['DEL', 'k1']);
+          collectYielded(queue);
+        },
+        expectedStats: {
+          totalCommandCount: 3,
+          batchedCommandCount: 3,
+          batchCount: 1,
+          drainFlushCount: 1,
+        },
+      },
+      {
+        name: 'slot change + drain at end',
+        setup: () => {},
+        action: (queue) => {
+          queue.addCommand(['SET', '{a}k', 'v']);
+          queue.addCommand(['SET', '{b}k', 'v']);
+          collectYielded(queue);
+        },
+        expectedStats: {
+          totalCommandCount: 2,
+          batchedCommandCount: 2,
+          batchCount: 2,
+          slotMismatchFlushCount: 1,
+          drainFlushCount: 1,
+        },
+      },
+    ];
+
+    for (const tc of noTimerCases) {
+      it(tc.name, function () {
+        const queue = createBinhdrQueueWithStats() as unknown as TestableQueueWithTimerAndStats;
+        tc.action(queue);
+        const stats = (queue as unknown as TestableQueueWithStats).getStats();
+        assertStats(stats, tc.expectedStats);
+      });
+    }
+  });
+});
+
+
+
+// ============================================================================
+// Timer Precision and Accumulation Tests
+// ============================================================================
+
+describe('Timer Precision and Accumulation', function () {
+  let activeQueues: TestableQueueWithTimer[] = [];
+
+  afterEach(function () {
+    for (const queue of activeQueues) {
+      queue.destroy();
+    }
+    activeQueues = [];
+  });
+
+  interface TimerPrecisionCase {
+    name: string;
+    maxWaitMs: number;
+    waitBefore: number;
+    expectFired: boolean;
+  }
+
+  const precisionCases: TimerPrecisionCase[] = [
+    { name: 'timer does not fire at 30% of maxWaitMs', maxWaitMs: 100, waitBefore: 30, expectFired: false },
+    { name: 'timer does not fire at 60% of maxWaitMs', maxWaitMs: 100, waitBefore: 60, expectFired: false },
+    { name: 'timer fires after maxWaitMs elapsed', maxWaitMs: 50, waitBefore: 70, expectFired: true },
+    { name: 'timer fires promptly with small maxWaitMs', maxWaitMs: 10, waitBefore: 25, expectFired: true },
+  ];
+
+  for (const tc of precisionCases) {
+    it(tc.name, async function () {
+      const queue = createBinhdrQueueWithTimer({ timer: { maxWaitMs: tc.maxWaitMs, scheduler: createTimeoutScheduler() } });
+      activeQueues.push(queue);
+
+      let fired = false;
+      queue.setTimerFlushCallback(() => { fired = true; });
+
+      queue.addCommand(['PING']);
+      collectYielded(queue);
+
+      await delay(tc.waitBefore);
+      assert.equal(fired, tc.expectFired, `Timer fired=${fired}, expected=${tc.expectFired}`);
+    });
+  }
+
+  it('timer accumulation: 5 cycles with stats', async function () {
+    const queue = createBinhdrQueueWithTimerAndStats({
+      timer: { maxWaitMs: 10, scheduler: createTimeoutScheduler() },
+    });
+    activeQueues.push(queue as TestableQueueWithTimer);
+    queue.setTimerFlushCallback(() => {});
+
+    for (let i = 0; i < 5; i++) {
+      queue.addCommand(['SET', `key${i}`, `value${i}`]);
+      collectYielded(queue);
+      await delay(20);
+    }
+
+    const stats = queue.getStats();
+    assertStats(stats, {
+      totalCommandCount: 5,
+      batchedCommandCount: 5,
+      batchCount: 5,
+      timerFlushCount: 5,
+    });
+  });
+});
+
+// ============================================================================
+// Stats Immutability and Isolation Tests
+// ============================================================================
+
+describe('Stats Immutability and Isolation', function () {
+  it('snapshot is immutable after creation', function () {
+    const queue = createBinhdrQueueWithStats();
+    queue.addCommand(['PING']);
+    collectYielded(queue);
+
+    const snapshot1 = queue.getStats();
+    const originalTotal = snapshot1.totalCommandCount;
+
+    // Add more commands
+    queue.addCommand(['PING']);
+    queue.addCommand(['PING']);
+    collectYielded(queue);
+
+    // Original snapshot should be unchanged
+    assert.equal(snapshot1.totalCommandCount, originalTotal, 'Snapshot should be immutable');
+
+    // New snapshot should have updated values
+    const snapshot2 = queue.getStats();
+    assert.equal(snapshot2.totalCommandCount, originalTotal + 2);
+  });
+
+  it('multiple snapshots are independent', function () {
+    const queue = createBinhdrQueueWithStats();
+
+    queue.addCommand(['PING']);
+    collectYielded(queue);
+    const s1 = queue.getStats();
+
+    queue.addCommand(['PING']);
+    collectYielded(queue);
+    const s2 = queue.getStats();
+
+    queue.addCommand(['PING']);
+    collectYielded(queue);
+    const s3 = queue.getStats();
+
+    assert.equal(s1.totalCommandCount, 1);
+    assert.equal(s2.totalCommandCount, 2);
+    assert.equal(s3.totalCommandCount, 3);
+  });
+
+  it('stats from different queues are isolated', function () {
+    const queue1 = createBinhdrQueueWithStats();
+    const queue2 = createBinhdrQueueWithStats();
+
+    queue1.addCommand(['PING']);
+    queue1.addCommand(['PING']);
+    queue1.addCommand(['PING']);
+    collectYielded(queue1);
+
+    queue2.addCommand(['PING']);
+    collectYielded(queue2);
+
+    const stats1 = queue1.getStats();
+    const stats2 = queue2.getStats();
+
+    assert.equal(stats1.totalCommandCount, 3);
+    assert.equal(stats2.totalCommandCount, 1);
+  });
+
+
+});
+
+// ============================================================================
+// Partial Generator Consumption
+// ============================================================================
+
+describe('Partial Generator Consumption', function () {
+  let activeQueues: TestableQueueWithTimer[] = [];
+
+  afterEach(function () {
+    for (const queue of activeQueues) {
+      queue.destroy();
+    }
+    activeQueues = [];
+  });
+
+  it('partial consumption with timer: exhausting generator buffers for timer', async function () {
+    const { scheduler, stats } = createTrackingScheduler();
+    const queue = createBinhdrQueueWithTimer({ timer: { maxWaitMs: 20, scheduler } });
+    activeQueues.push(queue);
+
+    const flushedData: ReadonlyArray<unknown>[] = [];
+    queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+    // Add commands that will cause slot flush
+    queue.addCommand(['SET', '{a}k1', 'v']);
+    queue.addCommand(['SET', '{b}k2', 'v']); // triggers flush of {a}k1
+
+    // Consume generator fully - slot flush yields first batch, second is buffered for timer
+    const results = collectYielded(queue);
+
+    // Should yield first batch (flushed due to slot change)
+    assert.equal(results.length, 1);
+    assertPackedHeader(results[0], { commandCount: 1 });
+
+    // Second command should be pending in codec buffer for timer
+    assert.equal(queue.hasPendingOutbound(), true);
+
+    // Wait for timer
+    await delay(30);
+
+    // Timer should have flushed the remaining command
+    assert.equal(flushedData.length, 1);
+    assertPackedHeader(flushedData[0], { commandCount: 1 });
+  });
+
+  it('generator not started: commands stay in toWrite until consumed', function () {
+    const queue = createBinhdrQueueWithTimer({ timer: { maxWaitMs: 100, scheduler: createTimeoutScheduler() } });
+    activeQueues.push(queue);
+
+    queue.addCommand(['PING']);
+    queue.addCommand(['PING']);
+
+    // Don't start generator at all
+    // Commands are in toWrite, not in codec buffer yet
+    assert.equal(queue.hasPendingOutbound(), false, 'Nothing in codec buffer');
+
+    // Now consume
+    const results = collectYielded(queue);
+    // With scheduler, generator doesn't drain at end
+    assert.equal(results.length, 0);
+    assert.equal(queue.hasPendingOutbound(), true, 'Now in codec buffer');
+  });
+
+  it('multiple partial consumptions accumulate correctly', async function () {
+    const queue = createBinhdrQueueWithTimerAndStats({
+      timer: { maxWaitMs: 100, scheduler: createTimeoutScheduler() },
+    });
+    activeQueues.push(queue as TestableQueueWithTimer);
+
+    // First batch: add and partial consume
+    queue.addCommand(['SET', '{a}k1', 'v']);
+    queue.addCommand(['SET', '{b}k2', 'v']); // triggers flush
+
+    const gen1 = queue.commandsToWrite();
+    gen1.next(); // consume flushed batch
+    // Don't exhaust gen1
+
+    // Second batch: add more
+    queue.addCommand(['SET', '{c}k3', 'v']); // triggers flush of {b}k2
+
+    const gen2 = queue.commandsToWrite();
+    gen2.next(); // consume flushed batch
+
+    // Stats should reflect all operations
+    const stats = queue.getStats();
+    assert.equal(stats.totalCommandCount, 3);
+    assert.equal(stats.slotMismatchFlushCount, 2);
+  });
 });
