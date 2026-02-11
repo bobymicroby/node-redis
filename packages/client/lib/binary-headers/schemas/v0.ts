@@ -14,7 +14,7 @@ export const BinaryHeadersProtocolV0 = protocol(
       fixed('designator', 'uint8', 0, 0x80),
       field('length', 'uint32', 1, { endian: 'big', min: 0, max: 0x7FFFFFFF }),
       field('commandCount', 'uint8', 5, { min: 1, max: 127 }),
-      field('slot', 'uint16', 6, { endian: 'big', min: 0, max: 0xFFFF }),
+      field('slot', 'uint16', 6, { endian: 'big', min: 0, max: 0x3FFF, nullValue: 0xFFFF }),
       field('clientIdx', 'uint16', 8, { endian: 'big', min: 0, max: 0xFFFF }),
     ], 'Request header sent from client to server (v0 format)'),
 
