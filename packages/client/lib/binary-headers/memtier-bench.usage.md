@@ -2,9 +2,20 @@
 
 A memtier_benchmark-compatible load testing tool for node-redis.
 
+## Setup
+
+```bash
+# Clone, install, and build (run once)
+git clone https://github.com/redis/node-redis.git
+cd node-redis
+npm install
+npm run build   # Generates binary header codecs and compiles TypeScript
+```
+
 ## Quick Start
 
 ```bash
+# Must run from project root (node-redis/)
 npx ts-node packages/client/lib/binary-headers/memtier-bench.ts \
   -s <host> -p <port> -a <password> \
   -t 4 -c 10 --test-time 30 --mode all

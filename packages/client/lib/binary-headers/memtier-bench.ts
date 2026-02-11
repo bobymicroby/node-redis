@@ -159,6 +159,18 @@ interface IntervalStatsMessage {
   errors: number;
 }
 
+interface BinaryHeaderStatsData {
+  totalCommandCount: number;
+  batchedCommandCount: number;
+  batchCount: number;
+  ineligibleCount: number;
+  slotMismatchFlushCount: number;
+  maxCommandsFlushCount: number;
+  maxPayloadFlushCount: number;
+  timerFlushCount: number;
+  drainFlushCount: number;
+}
+
 interface FinalStatsMessage {
   type: 'final-stats';
   workerId: number;
@@ -166,6 +178,7 @@ interface FinalStatsMessage {
   set: { count: number; p50: number; p95: number; p99: number; p999: number };
   get: { count: number; p50: number; p95: number; p99: number; p999: number };
   totalErrors: number;
+  binaryHeaderStats?: BinaryHeaderStatsData;
 }
 
 interface WorkerReadyMessage {
@@ -737,17 +750,98 @@ function printFinalSummary(
   }
 }
 
+function formatCount(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(2) + 'K';
+  return n.toString();
+}
+
 function printBinaryHeaderStats(bhStats: any): void {
+  const batchRate = bhStats.batchRate() * 100;
+  const avgBatchSize = bhStats.averageBatchSize();
+  const totalFlushes = bhStats.slotMismatchFlushCount + bhStats.maxCommandsFlushCount +
+    bhStats.maxPayloadFlushCount + bhStats.timerFlushCount + bhStats.drainFlushCount;
+  const passthroughCount = bhStats.totalCommandCount - bhStats.batchedCommandCount;
+  const ineligibleRate = bhStats.totalCommandCount === 0
+    ? 0
+    : (bhStats.ineligibleCount / bhStats.totalCommandCount) * 100;
+
+  console.log('\n' + '─'.repeat(70));
+  console.log('BINARY HEADERS STATS');
+  console.log('─'.repeat(70));
+
+  // Commands summary
+  console.log('Commands:');
   console.log(
-    `\nBinary Header Stats:  ` +
-    `batchRate=${(bhStats.batchRate() * 100).toFixed(1)}%  ` +
-    `avgBatchSize=${bhStats.averageBatchSize().toFixed(1)}  ` +
-    `batches=${bhStats.batchCount}  ` +
-    `flushReasons: slot=${bhStats.slotMismatchFlushCount} ` +
-    `max-cmd=${bhStats.maxCommandsFlushCount} ` +
-    `max-payload=${bhStats.maxPayloadFlushCount} ` +
-    `timer=${bhStats.timerFlushCount} ` +
-    `drain=${bhStats.drainFlushCount}`
+    '  Total'.padEnd(20) +
+    formatCount(bhStats.totalCommandCount).padStart(12) +
+    '    ' +
+    'Batched'.padEnd(16) +
+    formatCount(bhStats.batchedCommandCount).padStart(12)
+  );
+  console.log(
+    '  Passthrough'.padEnd(20) +
+    formatCount(passthroughCount).padStart(12) +
+    '    ' +
+    'Ineligible'.padEnd(16) +
+    formatCount(bhStats.ineligibleCount).padStart(12)
+  );
+
+  // Batching efficiency
+  console.log('\nBatching Efficiency:');
+  console.log(
+    '  Batch Rate'.padEnd(20) +
+    `${batchRate.toFixed(1)}%`.padStart(12) +
+    '    ' +
+    'Avg Batch Size'.padEnd(16) +
+    avgBatchSize.toFixed(2).padStart(12)
+  );
+  console.log(
+    '  Total Batches'.padEnd(20) +
+    formatCount(bhStats.batchCount).padStart(12) +
+    '    ' +
+    'Ineligible Rate'.padEnd(16) +
+    `${ineligibleRate.toFixed(1)}%`.padStart(12)
+  );
+
+  // Flush reasons breakdown
+  console.log('\nFlush Reasons:');
+  console.log(
+    '  Reason'.padEnd(20) +
+    'Count'.padStart(12) +
+    '    ' +
+    'Percentage'.padStart(12)
+  );
+
+  const flushReasons = [
+    { name: 'Slot Mismatch', count: bhStats.slotMismatchFlushCount },
+    { name: 'Max Commands', count: bhStats.maxCommandsFlushCount },
+    { name: 'Max Payload', count: bhStats.maxPayloadFlushCount },
+    { name: 'Timer Expired', count: bhStats.timerFlushCount },
+    { name: 'Drain', count: bhStats.drainFlushCount },
+  ];
+
+  for (const reason of flushReasons) {
+    const pct = totalFlushes === 0 ? 0 : (reason.count / totalFlushes) * 100;
+    console.log(
+      `  ${reason.name}`.padEnd(20) +
+      formatCount(reason.count).padStart(12) +
+      '    ' +
+      `${pct.toFixed(1)}%`.padStart(12)
+    );
+  }
+
+  console.log(
+    '  ─'.padEnd(20) +
+    '─'.repeat(12) +
+    '    ' +
+    '─'.repeat(12)
+  );
+  console.log(
+    '  Total Flushes'.padEnd(20) +
+    formatCount(totalFlushes).padStart(12) +
+    '    ' +
+    '100.0%'.padStart(12)
   );
 }
 
@@ -876,7 +970,8 @@ async function runMode(
   if (binaryHeaders) {
     let aggregated: typeof BinaryHeaderStatsClass | undefined;
     for (const c of clients) {
-      const s = (c.client as any).binaryHeaderStats;
+      const clientOptions = (c.client as any).options;
+      const s = clientOptions?.binaryHeaders?.getStats?.();
       if (s) {
         aggregated = aggregated ? aggregated.plus(s) : s;
       }
@@ -1012,6 +1107,32 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
   const totalDurationS = (Date.now() - startTime) / 1000;
   const summary = stats.finalSummary(totalDurationS);
 
+  // Collect binary header stats if enabled
+  let binaryHeaderStatsData: BinaryHeaderStatsData | undefined;
+  if (binaryHeaders) {
+    let aggregated: typeof BinaryHeaderStatsClass | undefined;
+    for (const c of clients) {
+      const clientOptions = (c.client as any).options;
+      const s = clientOptions?.binaryHeaders?.getStats?.();
+      if (s) {
+        aggregated = aggregated ? aggregated.plus(s) : s;
+      }
+    }
+    if (aggregated) {
+      binaryHeaderStatsData = {
+        totalCommandCount: aggregated.totalCommandCount,
+        batchedCommandCount: aggregated.batchedCommandCount,
+        batchCount: aggregated.batchCount,
+        ineligibleCount: aggregated.ineligibleCount,
+        slotMismatchFlushCount: aggregated.slotMismatchFlushCount,
+        maxCommandsFlushCount: aggregated.maxCommandsFlushCount,
+        maxPayloadFlushCount: aggregated.maxPayloadFlushCount,
+        timerFlushCount: aggregated.timerFlushCount,
+        drainFlushCount: aggregated.drainFlushCount,
+      };
+    }
+  }
+
   const finalMsg: FinalStatsMessage = {
     type: 'final-stats',
     workerId,
@@ -1031,6 +1152,7 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
       p999: summary.get.p999,
     },
     totalErrors: summary.totalErrors,
+    binaryHeaderStats: binaryHeaderStatsData,
   };
   process.send!(finalMsg);
 
@@ -1301,6 +1423,41 @@ async function runModeMultiProcess(
   };
 
   printFinalSummary(summary);
+
+  // Aggregate and print binary header stats if available
+  if (binaryHeaders && BinaryHeaderStatsClass) {
+    let aggregatedBhStats: BinaryHeaderStatsData | undefined;
+    for (const stat of finalStats.values()) {
+      if (stat.binaryHeaderStats) {
+        if (!aggregatedBhStats) {
+          aggregatedBhStats = { ...stat.binaryHeaderStats };
+        } else {
+          aggregatedBhStats.totalCommandCount += stat.binaryHeaderStats.totalCommandCount;
+          aggregatedBhStats.batchedCommandCount += stat.binaryHeaderStats.batchedCommandCount;
+          aggregatedBhStats.batchCount += stat.binaryHeaderStats.batchCount;
+          aggregatedBhStats.ineligibleCount += stat.binaryHeaderStats.ineligibleCount;
+          aggregatedBhStats.slotMismatchFlushCount += stat.binaryHeaderStats.slotMismatchFlushCount;
+          aggregatedBhStats.maxCommandsFlushCount += stat.binaryHeaderStats.maxCommandsFlushCount;
+          aggregatedBhStats.maxPayloadFlushCount += stat.binaryHeaderStats.maxPayloadFlushCount;
+          aggregatedBhStats.timerFlushCount += stat.binaryHeaderStats.timerFlushCount;
+          aggregatedBhStats.drainFlushCount += stat.binaryHeaderStats.drainFlushCount;
+        }
+      }
+    }
+    if (aggregatedBhStats) {
+      // Create a stats-like object with the methods printBinaryHeaderStats expects
+      const statsObj = {
+        ...aggregatedBhStats,
+        batchRate: () => aggregatedBhStats!.totalCommandCount === 0
+          ? 1.0
+          : aggregatedBhStats!.batchedCommandCount / aggregatedBhStats!.totalCommandCount,
+        averageBatchSize: () => aggregatedBhStats!.batchCount === 0
+          ? 0.0
+          : aggregatedBhStats!.batchedCommandCount / aggregatedBhStats!.batchCount,
+      };
+      printBinaryHeaderStats(statsObj);
+    }
+  }
 
   return { mode, summary };
 }

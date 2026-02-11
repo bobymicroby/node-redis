@@ -15,6 +15,8 @@
     "test-single": "TS_NODE_PROJECT='./packages/test-utils/tsconfig.json' mocha --require ts-node/register/transpile-only ",
     "cleanup": "rm -rf junit-results",
     "test": "npm run cleanup && npm run test -ws --if-present",
+    "generate:binhdr": "npm run generate:binhdr --workspace=@redis/client",
+    "prebuild": "npm run generate:binhdr",
     "build": "tsc --build",
     "documentation": "typedoc --entryPointStrategy packages --entryPoints ./packages/client ./packages/bloom ./packages/json ./packages/search ./packages/time-series ./packages/entraid ./packages/redis --out ./documentation",
     "gh-pages": "gh-pages -d ./documentation -e ./documentation -u 'documentation-bot <documentation@bot>'",
