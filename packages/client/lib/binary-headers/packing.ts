@@ -52,19 +52,15 @@ export function calculatePayloadLength(resp: SocketChunk): number {
  * Batches commands into binary header frames for efficient proxy communication.
  */
 export class CommandPacker {
-  readonly #maxWaitMs: number | null;
   readonly #statsCounter: BinaryHeaderStatsCounter;
   readonly #resps: Array<SocketChunk> = [];
 
   #resolvedSlot: number = NULL_SLOT;
   #totalPayloadLength: number = 0;
-  #bufferStartTime: number | null = null;
 
   constructor(
-    maxWaitMs: number | null = null,
     statsCounter?: BinaryHeaderStatsCounter
   ) {
-    this.#maxWaitMs = maxWaitMs;
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
   }
 
@@ -102,11 +98,6 @@ export class CommandPacker {
   }
 
   #getFlushReason(count: number, slot: number, payloadLength: number): FlushReason | null {
-    if (this.#maxWaitMs !== null && this.#bufferStartTime !== null) {
-      if ((performance.now() - this.#bufferStartTime) >= this.#maxWaitMs) {
-        return FlushReason.TIMER_EXPIRED;
-      }
-    }
     if (count >= MAX_COMMAND_COUNT) {
       return FlushReason.MAX_COMMANDS;
     }
@@ -122,9 +113,6 @@ export class CommandPacker {
   #pushFirst(resp: SocketChunk, slot: number, payloadLength: number): void {
     this.#resps.push(resp);
     this.#totalPayloadLength = payloadLength;
-    if (this.#maxWaitMs !== null) {
-      this.#bufferStartTime = performance.now();
-    }
     if (slot !== NULL_SLOT) {
       this.#resolvedSlot = slot;
     }
@@ -174,6 +162,5 @@ export class CommandPacker {
     this.#resps.length = 0;
     this.#resolvedSlot = NULL_SLOT;
     this.#totalPayloadLength = 0;
-    this.#bufferStartTime = null;
   }
 }

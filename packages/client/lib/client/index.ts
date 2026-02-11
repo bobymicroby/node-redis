@@ -1,17 +1,39 @@
 import COMMANDS from '../commands';
 import RedisSocket, { RedisSocketOptions } from './socket';
 import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
-import RedisCommandsQueue, { CommandOptions } from './commands-queue';
+import RedisCommandsQueue, { CommandOptions, type Scheduler } from './commands-queue';
 import { BinaryHeadersInterceptor } from '../binary-headers/codec';
 import { STATIC_RESOLVER } from '../binary-headers/eligibility';
-import { createTimeoutScheduler } from '../binary-headers/packing';
 import { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from '../binary-headers/stats';
+
+/**
+ * Timer configuration for binary headers batching.
+ * When provided, commands are flushed after maxWaitTime elapses.
+ */
+export interface BinaryHeadersTimerConfig {
+  /**
+   * Maximum time in milliseconds to wait before flushing buffered commands.
+   * When commands are batched, this ensures they are sent even if no new commands arrive.
+   */
+  maxWaitTime: number;
+  /**
+   * Scheduler implementation for timer-based flushing.
+   * Use `createTimeoutScheduler()` from '@redis/client' for the default implementation.
+   */
+  scheduler: Scheduler;
+}
 
 export interface BinaryHeadersOptions {
   /**
    * Whether binary headers protocol is enabled.
    */
   enabled: boolean;
+  /**
+   * Timer configuration for flushing buffered commands.
+   * If provided, both maxWaitTime and scheduler are required.
+   * If not provided, commands are only flushed on slot change, max commands, or max payload size.
+   */
+  timer?: BinaryHeadersTimerConfig;
   /**
    * Controls binary headers statistics collection.
    * - 'noop': Use noop stats counter for zero overhead
@@ -659,7 +681,9 @@ export default class RedisClient<
         inbound: { onProtocolError: (header) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${header.clientIdx}`)) },
         statsCounter
       });
-      const timerOptions = { maxWaitMs: 1, scheduler: createTimeoutScheduler() };
+      const timerOptions = binaryHeadersOpts.timer
+        ? { maxWaitMs: binaryHeadersOpts.timer.maxWaitTime, scheduler: binaryHeadersOpts.timer.scheduler }
+        : undefined;
       return new RedisCommandsQueue(
         this.#options.RESP ?? 2,
         this.#options.commandsQueueMaxLength,
@@ -677,7 +701,8 @@ export default class RedisClient<
   }
 
   #setupBinhdrFlushCallback(): void {
-    if (this.#options.binaryHeaders === true || (this.#options.binaryHeaders && this.#options.binaryHeaders.enabled)) {
+    const binaryHeadersOpts = this.#options.binaryHeaders;
+    if (binaryHeadersOpts && typeof binaryHeadersOpts === 'object' && binaryHeadersOpts.enabled && binaryHeadersOpts.timer) {
       this.#queue.setTimerFlushCallback(encoded => {
         this.#socket.write([encoded]);
       });
