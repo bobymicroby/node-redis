@@ -4,9 +4,16 @@
  * Replicates memtier_benchmark behavior:
  *   - pipeline: Number of commands "in flight" (sent, waiting for response)
  *   - bulk-size: Number of commands grouped under one binary header (for fast-headers mode)
+ *   - threads (-t): Number of parallel child processes (for memtier CLI compatibility)
  *
  * Unlike batching with Promise.all(), true pipelining maintains a constant
  * number of in-flight commands by issuing a new command each time a response arrives.
+ *
+ * Multi-Process Architecture:
+ *   Node.js is single-threaded, so to match memtier's -t (threads) behavior, we use
+ *   child processes instead. Each "thread" is actually a separate Node.js process
+ *   with its own event loop, similar to how memtier uses pthreads with libevent.
+ *   The -t flag is named for memtier CLI compatibility.
  *
  * Modes:
  *   1. current      - node-redis client without binary headers
@@ -19,24 +26,80 @@
  * Examples:
  *   --mode current --test-time 5
  *   --mode fast-headers --pipeline 10
- *   --mode all --pipeline 10 -c 4 --test-time 30
+ *   --mode all --pipeline 10 -c 4 -t 4 --test-time 30
  */
 
 import { parseArgs } from 'node:util';
+import { fork, ChildProcess } from 'node:child_process';
 import { build as buildHistogram, Histogram } from 'hdr-histogram-js';
 import RedisClient from '../client';
 import { RedisClientType } from '../client';
 import { BinaryHeaderStats } from './stats';
 
 // ============================================================================
+// IPC Message Types for Multi-Process Support
+// ============================================================================
+
+interface WorkerConfig {
+  type: 'config';
+  workerId: number;
+  mode: ModeName;
+  config: BenchConfig;
+}
+
+interface IntervalStatsMessage {
+  type: 'interval-stats';
+  workerId: number;
+  intervalSec: number;
+  set: { count: number; p50: number; p99: number };
+  get: { count: number; p50: number; p99: number };
+  errors: number;
+}
+
+interface FinalStatsMessage {
+  type: 'final-stats';
+  workerId: number;
+  durationSeconds: number;
+  set: { count: number; p50: number; p95: number; p99: number; p999: number };
+  get: { count: number; p50: number; p95: number; p99: number; p999: number };
+  totalErrors: number;
+}
+
+interface WorkerReadyMessage {
+  type: 'ready';
+  workerId: number;
+}
+
+interface WorkerErrorMessage {
+  type: 'error';
+  workerId: number;
+  message: string;
+}
+
+interface StartMessage {
+  type: 'start';
+}
+
+interface StopMessage {
+  type: 'stop';
+}
+
+type ParentToWorkerMessage = WorkerConfig | StartMessage | StopMessage;
+type WorkerToParentMessage = WorkerReadyMessage | IntervalStatsMessage | FinalStatsMessage | WorkerErrorMessage;
+
+// Check if running as a worker process
+const isWorkerProcess = process.env.MEMTIER_WORKER === '1';
+
+// ============================================================================
 // CLI Argument Parsing
 // ============================================================================
 
-type ModeName = 'current' | 'fast-headers';
+type ModeName = 'fast-headers-off' | 'fast-headers-on';
 
 interface BenchConfig {
   host: string;
   port: number;
+  threads: number;
   connections: number;
   ratioSet: number;
   ratioGet: number;
@@ -48,8 +111,11 @@ interface BenchConfig {
   keyMaximum: number;
   keyPrefix: string;
   testTime: number;
-  mode: 'current' | 'fast-headers' | 'all';
+  mode: 'fast-headers-off' | 'fast-headers-on' | 'all';
   interval: number;
+  hideHistogram: boolean;
+  username?: string;
+  password?: string;
 }
 
 function parseConfig(): BenchConfig {
@@ -57,6 +123,8 @@ function parseConfig(): BenchConfig {
     options: {
       host: { type: 'string', short: 's', default: '127.0.0.1' },
       port: { type: 'string', short: 'p', default: '6379' },
+      // Named 'threads' for memtier CLI compatibility, but uses child processes in Node.js
+      threads: { type: 'string', short: 't', default: '1' },
       connections: { type: 'string', short: 'c', default: '4' },
       ratio: { type: 'string', default: '1:1' },
       'data-size': { type: 'string', short: 'd', default: '32' },
@@ -69,6 +137,9 @@ function parseConfig(): BenchConfig {
       'test-time': { type: 'string', default: '60' },
       mode: { type: 'string', default: 'all' },
       interval: { type: 'string', default: '1' },
+      'hide-histogram': { type: 'boolean', default: false },
+      username: { type: 'string', short: 'u' },
+      password: { type: 'string', short: 'a' },
     },
     strict: true,
   });
@@ -80,6 +151,7 @@ function parseConfig(): BenchConfig {
   const config: BenchConfig = {
     host: values.host as string,
     port: parseInt(values.port as string, 10),
+    threads: parseInt(values.threads as string, 10),
     connections: parseInt(values.connections as string, 10),
     ratioSet,
     ratioGet,
@@ -93,11 +165,17 @@ function parseConfig(): BenchConfig {
     testTime: parseInt(values['test-time'] as string, 10),
     mode: values.mode as BenchConfig['mode'],
     interval: parseInt(values.interval as string, 10),
+    hideHistogram: values['hide-histogram'] as boolean,
+    username: values.username as string | undefined,
+    password: values.password as string | undefined,
   };
 
   // Validation
-  if (!['current', 'fast-headers', 'all'].includes(config.mode)) {
-    throw new Error(`Invalid mode: ${config.mode}. Must be current, fast-headers, or all`);
+  if (!['fast-headers-off', 'fast-headers-on', 'all'].includes(config.mode)) {
+    throw new Error(`Invalid mode: ${config.mode}. Must be fast-headers-off, fast-headers-on, or all`);
+  }
+  if (config.threads < 1) {
+    throw new Error(`threads (-t) must be >= 1 (note: uses child processes for parallelism)`);
   }
   if (config.pipeline < 1) {
     throw new Error(`pipeline must be >= 1`);
@@ -301,7 +379,9 @@ interface BenchClient {
 async function createBenchClient(
   host: string,
   port: number,
-  binaryHeaders: boolean
+  binaryHeaders: boolean,
+  username?: string,
+  password?: string
 ): Promise<BenchClient> {
   const client = RedisClient.create({
     socket: {
@@ -314,6 +394,8 @@ async function createBenchClient(
     commandOptions: {
       timeout: 30000,
     },
+    ...(username ? { username } : {}),
+    ...(password ? { password } : {}),
     ...(binaryHeaders ? { binaryHeaders: { enabled: true, 'stats-collector': 'enabled' } } : {}),
   });
 
@@ -597,7 +679,7 @@ async function runMode(
   mode: ModeName,
   config: BenchConfig
 ): Promise<ModeResult | null> {
-  const binaryHeaders = mode === 'fast-headers';
+  const binaryHeaders = mode === 'fast-headers-on';
 
   console.log(`\n${'═'.repeat(70)}`);
   console.log(`  MODE: ${mode}${binaryHeaders ? ' (binary headers enabled)' : ''}`);
@@ -612,7 +694,7 @@ async function runMode(
   const clients: BenchClient[] = [];
   try {
     for (let i = 0; i < config.connections; i++) {
-      const client = await createBenchClient(config.host, config.port, binaryHeaders);
+      const client = await createBenchClient(config.host, config.port, binaryHeaders, config.username, config.password);
       clients.push(client);
     }
   } catch (err) {
@@ -711,6 +793,408 @@ async function runMode(
 }
 
 // ============================================================================
+// Worker Process Logic
+// ============================================================================
+
+async function runWorker(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let workerConfig: WorkerConfig | null = null;
+
+    process.on('message', async (msg: ParentToWorkerMessage) => {
+      if (msg.type === 'config') {
+        workerConfig = msg;
+        // Signal ready
+        const readyMsg: WorkerReadyMessage = { type: 'ready', workerId: msg.workerId };
+        process.send!(readyMsg);
+      } else if (msg.type === 'start' && workerConfig) {
+        try {
+          await runWorkerBenchmark(workerConfig);
+          resolve();
+        } catch (err) {
+          const errorMsg: WorkerErrorMessage = {
+            type: 'error',
+            workerId: workerConfig.workerId,
+            message: (err as Error).message,
+          };
+          process.send!(errorMsg);
+          reject(err);
+        }
+      } else if (msg.type === 'stop') {
+        resolve();
+      }
+    });
+  });
+}
+
+async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
+  const { workerId, mode, config } = workerConfig;
+  const binaryHeaders = mode === 'fast-headers-on';
+
+  // Create connections for this worker
+  const clients: BenchClient[] = [];
+  try {
+    for (let i = 0; i < config.connections; i++) {
+      const client = await createBenchClient(
+        config.host,
+        config.port,
+        binaryHeaders,
+        config.username,
+        config.password
+      );
+      clients.push(client);
+    }
+  } catch (err) {
+    throw new Error(`Worker ${workerId}: Failed to create connections: ${(err as Error).message}`);
+  }
+
+  const stats = new MemtierStats();
+  const value = 'x'.repeat(config.dataSize);
+  const ac = new AbortController();
+
+  // Start connection loops
+  const loopPromises = clients.map((benchClient, i) => {
+    const keyGen = new BulkKeyGenerator(
+      config.keyPrefix,
+      config.bulkSize,
+      config.bulkSlots,
+      config.keyMinimum,
+      config.keyMaximum
+    );
+    return runPipelinedConnection(
+      benchClient.client,
+      keyGen,
+      value,
+      config.pipeline,
+      config.bulkSize,
+      config.ratioSet,
+      config.ratioGet,
+      stats,
+      ac.signal,
+      i
+    );
+  });
+
+  // Periodic stats reporting to parent
+  const startTime = Date.now();
+  let intervalCount = 0;
+
+  const intervalTimer = setInterval(() => {
+    intervalCount++;
+    const snapshot = stats.snapshotInterval(config.interval);
+    const msg: IntervalStatsMessage = {
+      type: 'interval-stats',
+      workerId,
+      intervalSec: intervalCount * config.interval,
+      set: { count: snapshot.set.ops * config.interval, p50: snapshot.set.p50, p99: snapshot.set.p99 },
+      get: { count: snapshot.get.ops * config.interval, p50: snapshot.get.p50, p99: snapshot.get.p99 },
+      errors: snapshot.errors,
+    };
+    process.send!(msg);
+  }, config.interval * 1000);
+
+  // Wait for test duration
+  await new Promise<void>((resolve) =>
+    setTimeout(() => resolve(), config.testTime * 1000)
+  );
+
+  // Stop loops
+  ac.abort();
+  await Promise.allSettled(loopPromises);
+  clearInterval(intervalTimer);
+
+  // Send final stats
+  const totalDurationS = (Date.now() - startTime) / 1000;
+  const summary = stats.finalSummary(totalDurationS);
+
+  const finalMsg: FinalStatsMessage = {
+    type: 'final-stats',
+    workerId,
+    durationSeconds: totalDurationS,
+    set: {
+      count: summary.set.ops * totalDurationS,
+      p50: summary.set.p50,
+      p95: summary.set.p95,
+      p99: summary.set.p99,
+      p999: summary.set.p999,
+    },
+    get: {
+      count: summary.get.ops * totalDurationS,
+      p50: summary.get.p50,
+      p95: summary.get.p95,
+      p99: summary.get.p99,
+      p999: summary.get.p999,
+    },
+    totalErrors: summary.totalErrors,
+  };
+  process.send!(finalMsg);
+
+  // Cleanup
+  for (const client of clients) {
+    try {
+      await client.disconnect();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// ============================================================================
+// Multi-Process Orchestration (Main Process)
+// ============================================================================
+
+interface AggregatedStats {
+  setCount: number;
+  getCount: number;
+  setP50Sum: number;
+  setP95Sum: number;
+  setP99Sum: number;
+  setP999Sum: number;
+  getP50Sum: number;
+  getP95Sum: number;
+  getP99Sum: number;
+  getP999Sum: number;
+  totalErrors: number;
+  workerCount: number;
+}
+
+async function runModeMultiProcess(
+  mode: ModeName,
+  config: BenchConfig
+): Promise<ModeResult | null> {
+  const binaryHeaders = mode === 'fast-headers-on';
+  const numWorkers = config.threads;
+
+  console.log(`\n${'═'.repeat(70)}`);
+  console.log(`  MODE: ${mode}${binaryHeaders ? ' (binary headers enabled)' : ''}`);
+  console.log(`  Threads (-t): ${numWorkers} child processes (memtier-compatible parallelism)`);
+  console.log(`  Connections per thread (-c): ${config.connections}`);
+  console.log(`  Total connections: ${numWorkers * config.connections}`);
+  console.log(`  Pipeline depth: ${config.pipeline} commands in flight`);
+  if (config.bulkSize > 1) {
+    console.log(`  Bulk size: ${config.bulkSize} commands per binary header`);
+  }
+  console.log(`${'═'.repeat(70)}`);
+
+  // Spawn worker child processes (equivalent to memtier's pthreads)
+  console.log(`Spawning ${numWorkers} child processes (memtier -t equivalent)...`);
+
+  // Increase max listeners to avoid warnings when spawning many workers
+  process.stderr.setMaxListeners(numWorkers + 10);
+  process.stdout.setMaxListeners(numWorkers + 10);
+
+  const workers: ChildProcess[] = [];
+  const workerReady: Promise<void>[] = [];
+
+  for (let i = 0; i < numWorkers; i++) {
+    const worker = fork(__filename, [], {
+      env: { ...process.env, MEMTIER_WORKER: '1' },
+      // Use 'inherit' for stdio to avoid piping issues with many workers
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    });
+
+    workers.push(worker);
+
+    // Wait for worker ready
+    workerReady.push(
+      new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error(`Worker ${i} timed out`)), 30000);
+
+        worker.on('message', (msg: WorkerToParentMessage) => {
+          if (msg.type === 'ready' && msg.workerId === i) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+
+        worker.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+
+        worker.on('exit', (code) => {
+          if (code !== 0) {
+            clearTimeout(timeout);
+            reject(new Error(`Worker ${i} exited with code ${code}`));
+          }
+        });
+      })
+    );
+
+    // Send config to worker
+    const configMsg: WorkerConfig = {
+      type: 'config',
+      workerId: i,
+      mode,
+      config,
+    };
+    worker.send(configMsg);
+  }
+
+  // Wait for all workers to be ready
+  try {
+    await Promise.all(workerReady);
+  } catch (err) {
+    console.error(`\n  FAILED to initialize workers: ${(err as Error).message}`);
+    console.error(`  Skipping this mode.\n`);
+    for (const w of workers) {
+      w.kill();
+    }
+    return null;
+  }
+
+  console.log(`All ${numWorkers} child processes ready. Starting benchmark...`);
+
+  // Collect interval stats from workers
+  const intervalStats: Map<number, IntervalStatsMessage[]> = new Map();
+  const finalStats: Map<number, FinalStatsMessage> = new Map();
+
+  for (let i = 0; i < numWorkers; i++) {
+    intervalStats.set(i, []);
+  }
+
+  // Setup message handlers for stats
+  for (const worker of workers) {
+    worker.on('message', (msg: WorkerToParentMessage) => {
+      if (msg.type === 'interval-stats') {
+        intervalStats.get(msg.workerId)?.push(msg);
+
+        // Print aggregated interval stats when all workers have reported
+        const currentInterval = msg.intervalSec;
+        const allReported = Array.from(intervalStats.values()).every(
+          (arr) => arr.some((s) => s.intervalSec === currentInterval)
+        );
+
+        if (allReported && !config.hideHistogram) {
+          // Aggregate stats from all workers for this interval
+          let setOps = 0, getOps = 0, errors = 0;
+          let setP50Sum = 0, setP99Sum = 0, getP50Sum = 0, getP99Sum = 0;
+
+          for (const arr of intervalStats.values()) {
+            const stat = arr.find((s) => s.intervalSec === currentInterval);
+            if (stat) {
+              setOps += stat.set.count;
+              getOps += stat.get.count;
+              errors += stat.errors;
+              setP50Sum += stat.set.p50;
+              setP99Sum += stat.set.p99;
+              getP50Sum += stat.get.p50;
+              getP99Sum += stat.get.p99;
+            }
+          }
+
+          const snapshot = {
+            set: {
+              ops: setOps / config.interval,
+              p50: setP50Sum / numWorkers,
+              p95: 0,
+              p99: setP99Sum / numWorkers,
+              p999: 0,
+            },
+            get: {
+              ops: getOps / config.interval,
+              p50: getP50Sum / numWorkers,
+              p95: 0,
+              p99: getP99Sum / numWorkers,
+              p999: 0,
+            },
+            errors,
+          };
+          printIntervalStats(currentInterval, snapshot);
+        }
+      } else if (msg.type === 'final-stats') {
+        finalStats.set(msg.workerId, msg);
+      } else if (msg.type === 'error') {
+        console.error(`Worker ${msg.workerId} error: ${msg.message}`);
+      }
+    });
+  }
+
+  // Signal all workers to start
+  const startMsg: StartMessage = { type: 'start' };
+  for (const worker of workers) {
+    worker.send(startMsg);
+  }
+
+  // Wait for all workers to finish
+  await Promise.all(
+    workers.map(
+      (worker) =>
+        new Promise<void>((resolve) => {
+          worker.on('exit', () => resolve());
+        })
+    )
+  );
+
+  console.log(`\nAll child processes finished.`);
+
+  // Aggregate final stats
+  if (finalStats.size === 0) {
+    console.error('No final stats received from workers');
+    return null;
+  }
+
+  let totalDuration = 0;
+  const agg: AggregatedStats = {
+    setCount: 0,
+    getCount: 0,
+    setP50Sum: 0,
+    setP95Sum: 0,
+    setP99Sum: 0,
+    setP999Sum: 0,
+    getP50Sum: 0,
+    getP95Sum: 0,
+    getP99Sum: 0,
+    getP999Sum: 0,
+    totalErrors: 0,
+    workerCount: finalStats.size,
+  };
+
+  for (const stat of finalStats.values()) {
+    totalDuration = Math.max(totalDuration, stat.durationSeconds);
+    agg.setCount += stat.set.count;
+    agg.getCount += stat.get.count;
+    agg.setP50Sum += stat.set.p50;
+    agg.setP95Sum += stat.set.p95;
+    agg.setP99Sum += stat.set.p99;
+    agg.setP999Sum += stat.set.p999;
+    agg.getP50Sum += stat.get.p50;
+    agg.getP95Sum += stat.get.p95;
+    agg.getP99Sum += stat.get.p99;
+    agg.getP999Sum += stat.get.p999;
+    agg.totalErrors += stat.totalErrors;
+  }
+
+  const summary = {
+    set: {
+      ops: agg.setCount / totalDuration,
+      p50: agg.setP50Sum / agg.workerCount,
+      p95: agg.setP95Sum / agg.workerCount,
+      p99: agg.setP99Sum / agg.workerCount,
+      p999: agg.setP999Sum / agg.workerCount,
+    },
+    get: {
+      ops: agg.getCount / totalDuration,
+      p50: agg.getP50Sum / agg.workerCount,
+      p95: agg.getP95Sum / agg.workerCount,
+      p99: agg.getP99Sum / agg.workerCount,
+      p999: agg.getP999Sum / agg.workerCount,
+    },
+    total: {
+      ops: (agg.setCount + agg.getCount) / totalDuration,
+      p50: (agg.setP50Sum + agg.getP50Sum) / (agg.workerCount * 2),
+      p95: (agg.setP95Sum + agg.getP95Sum) / (agg.workerCount * 2),
+      p99: (agg.setP99Sum + agg.getP99Sum) / (agg.workerCount * 2),
+      p999: (agg.setP999Sum + agg.getP999Sum) / (agg.workerCount * 2),
+    },
+    totalErrors: agg.totalErrors,
+  };
+
+  printFinalSummary(summary);
+
+  return { mode, summary };
+}
+
+// ============================================================================
 // Main Orchestrator
 // ============================================================================
 
@@ -721,7 +1205,9 @@ async function main(): Promise<void> {
   console.log('  Memtier-like Benchmark for node-redis');
   console.log('═══════════════════════════════════════════════════════════════════');
   console.log(`Host: ${config.host}:${config.port}`);
-  console.log(`Connections: ${config.connections}`);
+  console.log(`Threads (-t): ${config.threads} child processes (memtier-compatible)`);
+  console.log(`Connections per thread (-c): ${config.connections}`);
+  console.log(`Total connections: ${config.threads * config.connections}`);
   console.log(`Ratio (SET:GET): ${config.ratioSet}:${config.ratioGet}`);
   console.log(`Data size: ${config.dataSize} bytes`);
   console.log(`Pipeline: ${config.pipeline} (commands in flight per connection)`);
@@ -733,16 +1219,22 @@ async function main(): Promise<void> {
   console.log(`Test time: ${config.testTime}s`);
   console.log(`Mode: ${config.mode}`);
   console.log(`Interval: ${config.interval}s`);
+  if (config.hideHistogram) {
+    console.log(`Hide histogram: true`);
+  }
 
   const modes: ModeName[] =
     config.mode === 'all'
-      ? ['current', 'fast-headers']
+      ? ['fast-headers-off', 'fast-headers-on']
       : [config.mode as ModeName];
 
   const results: ModeResult[] = [];
 
   for (const mode of modes) {
-    const result = await runMode(mode, config);
+    // Use multi-process mode if threads > 1, otherwise single-process
+    const result = config.threads > 1
+      ? await runModeMultiProcess(mode, config)
+      : await runMode(mode, config);
     if (result) results.push(result);
   }
 
@@ -754,7 +1246,19 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+// Entry point: detect if running as worker or main process
+if (isWorkerProcess) {
+  runWorker()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error('Worker fatal error:', err);
+      process.exit(1);
+    });
+} else {
+  main().catch((err) => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+  });
+}
