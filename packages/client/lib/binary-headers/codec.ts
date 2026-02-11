@@ -10,7 +10,6 @@ export type OnProtocolError = (header: BinaryResponseHeader) => void;
 
 export interface BinaryHeadersOutboundOptions {
   readonly resolver?: EligibilityResolver;
-  readonly maxWaitMs?: number;
 }
 
 export interface BinaryHeadersInboundOptions {
@@ -53,7 +52,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   ) {
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
     this.#resolver = options.resolver ?? NOOP_RESOLVER;
-    this.#packer = new CommandPacker(options.maxWaitMs ?? null, this.#statsCounter);
+    this.#packer = new CommandPacker(this.#statsCounter);
   }
 
   intercept(encoded: SocketChunk, args: CommandArguments): SocketChunks {
@@ -210,7 +209,6 @@ export class BinaryHeadersInterceptor implements WireInterceptor {
 export function createBinaryHeadersInterceptor(
   resolver: EligibilityResolver,
   options?: {
-    maxWaitMs?: number;
     onHeader?: OnHeader;
     onProtocolError?: OnProtocolError;
     statsCounter?: BinaryHeaderStatsCounter;
@@ -219,7 +217,6 @@ export function createBinaryHeadersInterceptor(
   return new BinaryHeadersInterceptor({
     outbound: {
       resolver,
-      maxWaitMs: options?.maxWaitMs,
     },
     inbound: {
       onHeader: options?.onHeader,
