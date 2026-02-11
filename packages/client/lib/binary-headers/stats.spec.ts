@@ -8,6 +8,7 @@ import {
 } from './stats';
 import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
+import { assertStats, type ExpectedStats } from './test-utils';
 
 describe('Binary Headers Stats', function () {
   // ==========================================================================
@@ -515,4 +516,360 @@ describe('Binary Headers Stats', function () {
       assert.ok(ineligibleRate >= 0 && ineligibleRate <= 1, `ineligibleRate ${ineligibleRate} out of bounds`);
     });
   });
+});
+
+// ============================================================================
+// BinaryHeaderStats Immutability Tests
+// ============================================================================
+
+describe('BinaryHeaderStats Immutability (table-driven)', function () {
+  interface ImmutabilityTestCase {
+    name: string;
+    createStats: () => BinaryHeaderStats;
+    expectedValues: ExpectedStats;
+  }
+
+  const immutabilityCases: ImmutabilityTestCase[] = [
+    {
+      name: 'stats created via of() are immutable',
+      createStats: () => BinaryHeaderStats.of(10, 8, 2, 1, 1, 0, 0, 1, 0),
+      expectedValues: {
+        totalCommandCount: 10,
+        batchedCommandCount: 8,
+        batchCount: 2,
+        ineligibleCount: 1,
+        slotMismatchFlushCount: 1,
+        timerFlushCount: 1,
+      },
+    },
+    {
+      name: 'stats created via empty() are immutable',
+      createStats: () => BinaryHeaderStats.empty(),
+      expectedValues: {
+        totalCommandCount: 0,
+        batchedCommandCount: 0,
+        batchCount: 0,
+        ineligibleCount: 0,
+      },
+    },
+    {
+      name: 'stats created via plus() are immutable',
+      createStats: () => {
+        const a = BinaryHeaderStats.of(5, 4, 1, 1, 1, 0, 0, 0, 0);
+        const b = BinaryHeaderStats.of(5, 4, 1, 0, 0, 0, 0, 1, 0);
+        return a.plus(b);
+      },
+      expectedValues: {
+        totalCommandCount: 10,
+        batchedCommandCount: 8,
+        batchCount: 2,
+        ineligibleCount: 1,
+        slotMismatchFlushCount: 1,
+        timerFlushCount: 1,
+      },
+    },
+    {
+      name: 'stats created via minus() are immutable',
+      createStats: () => {
+        const a = BinaryHeaderStats.of(100, 80, 10, 20, 3, 2, 1, 4, 0);
+        const b = BinaryHeaderStats.of(50, 40, 5, 10, 1, 1, 1, 2, 0);
+        return a.minus(b);
+      },
+      expectedValues: {
+        totalCommandCount: 50,
+        batchedCommandCount: 40,
+        batchCount: 5,
+        ineligibleCount: 10,
+        slotMismatchFlushCount: 2,
+        timerFlushCount: 2,
+      },
+    },
+  ];
+
+  for (const tc of immutabilityCases) {
+    it(tc.name, function () {
+      const stats = tc.createStats();
+
+      // Verify expected values
+      assertStats(stats, tc.expectedValues);
+
+      // Attempt operations that might mutate (if object were mutable)
+      // This verifies the object is truly immutable by checking values don't change
+      const originalTotal = stats.totalCommandCount;
+      const originalBatched = stats.batchedCommandCount;
+
+      // Perform arithmetic operations (should return new objects, not mutate)
+      const plusResult = stats.plus(BinaryHeaderStats.of(100, 100, 10, 0, 0, 0, 0, 0, 0));
+      const minusResult = stats.minus(BinaryHeaderStats.of(1, 1, 1, 0, 0, 0, 0, 0, 0));
+
+      // Original should be unchanged
+      assert.equal(stats.totalCommandCount, originalTotal, 'totalCommandCount mutated');
+      assert.equal(stats.batchedCommandCount, originalBatched, 'batchedCommandCount mutated');
+
+      // Results should be different objects
+      assert.notStrictEqual(plusResult, stats, 'plus() should return new object');
+      assert.notStrictEqual(minusResult, stats, 'minus() should return new object');
+    });
+  }
+
+  it('empty() singleton is not affected by arithmetic operations', function () {
+    const empty1 = BinaryHeaderStats.empty();
+    const other = BinaryHeaderStats.of(10, 8, 2, 1, 1, 0, 0, 1, 0);
+
+    // Perform operations
+    empty1.plus(other);
+    empty1.minus(other);
+
+    // empty() should still be all zeros
+    const empty2 = BinaryHeaderStats.empty();
+    assert.strictEqual(empty1, empty2, 'empty() should return same singleton');
+    assert.equal(empty1.totalCommandCount, 0);
+    assert.equal(empty1.batchedCommandCount, 0);
+  });
+});
+
+// ============================================================================
+// DefaultBinaryHeaderStatsCounter Stress Tests (table-driven)
+// ============================================================================
+
+describe('DefaultBinaryHeaderStatsCounter Stress (table-driven)', function () {
+  interface StressTestCase {
+    name: string;
+    operations: number;
+    action: (counter: DefaultBinaryHeaderStatsCounter) => void;
+    verify: (stats: BinaryHeaderStats) => void;
+  }
+
+  const stressCases: StressTestCase[] = [
+    {
+      name: 'high volume recordCommand()',
+      operations: 10000,
+      action: (counter) => {
+        for (let i = 0; i < 10000; i++) {
+          counter.recordCommand();
+        }
+      },
+      verify: (stats) => {
+        assert.equal(stats.totalCommandCount, 10000);
+      },
+    },
+    {
+      name: 'high volume mixed operations',
+      operations: 5000,
+      action: (counter) => {
+        for (let i = 0; i < 1000; i++) {
+          counter.recordCommand();
+          counter.recordBatchedCommand();
+          if (i % 10 === 0) counter.recordFlush(FlushReason.SLOT_MISMATCH);
+          if (i % 50 === 0) counter.recordFlush(FlushReason.TIMER_EXPIRED);
+          if (i % 100 === 0) counter.recordIneligible();
+        }
+      },
+      verify: (stats) => {
+        assert.equal(stats.totalCommandCount, 1000);
+        assert.equal(stats.batchedCommandCount, 1000);
+        assert.equal(stats.slotMismatchFlushCount, 100); // i % 10 === 0: 0,10,20...990
+        assert.equal(stats.timerFlushCount, 20); // i % 50 === 0: 0,50,100...950
+        assert.equal(stats.ineligibleCount, 10); // i % 100 === 0: 0,100,200...900
+        assert.equal(stats.batchCount, 120); // 100 slot + 20 timer
+      },
+    },
+    {
+      name: 'rapid snapshot calls do not affect counter',
+      operations: 1000,
+      action: (counter) => {
+        for (let i = 0; i < 100; i++) {
+          counter.recordCommand();
+          counter.snapshot(); // snapshot after each
+          counter.recordBatchedCommand();
+          counter.snapshot();
+        }
+      },
+      verify: (stats) => {
+        assert.equal(stats.totalCommandCount, 100);
+        assert.equal(stats.batchedCommandCount, 100);
+      },
+    },
+  ];
+
+  for (const tc of stressCases) {
+    it(tc.name, function () {
+      const counter = DefaultBinaryHeaderStatsCounter.create();
+      tc.action(counter);
+      tc.verify(counter.snapshot());
+    });
+  }
+});
+
+// ============================================================================
+// Flush Reason Consistency (table-driven)
+// ============================================================================
+
+describe('Flush Reason Consistency (table-driven)', function () {
+  interface FlushConsistencyCase {
+    name: string;
+    flushReasons: FlushReason[];
+    expectedTotalFlushCount: number;
+  }
+
+  const flushConsistencyCases: FlushConsistencyCase[] = [
+    {
+      name: 'all SLOT_MISMATCH',
+      flushReasons: [FlushReason.SLOT_MISMATCH, FlushReason.SLOT_MISMATCH, FlushReason.SLOT_MISMATCH],
+      expectedTotalFlushCount: 3,
+    },
+    {
+      name: 'all TIMER_EXPIRED',
+      flushReasons: [FlushReason.TIMER_EXPIRED, FlushReason.TIMER_EXPIRED],
+      expectedTotalFlushCount: 2,
+    },
+    {
+      name: 'mixed flush reasons',
+      flushReasons: [
+        FlushReason.SLOT_MISMATCH,
+        FlushReason.MAX_COMMANDS,
+        FlushReason.MAX_PAYLOAD,
+        FlushReason.TIMER_EXPIRED,
+        FlushReason.DRAIN,
+      ],
+      expectedTotalFlushCount: 5,
+    },
+    {
+      name: 'repeated mixed pattern',
+      flushReasons: [
+        FlushReason.SLOT_MISMATCH,
+        FlushReason.TIMER_EXPIRED,
+        FlushReason.SLOT_MISMATCH,
+        FlushReason.TIMER_EXPIRED,
+        FlushReason.DRAIN,
+        FlushReason.DRAIN,
+      ],
+      expectedTotalFlushCount: 6,
+    },
+  ];
+
+  for (const tc of flushConsistencyCases) {
+    it(tc.name, function () {
+      const counter = DefaultBinaryHeaderStatsCounter.create();
+
+      for (const reason of tc.flushReasons) {
+        counter.recordFlush(reason);
+      }
+
+      const stats = counter.snapshot();
+
+      // Verify totalFlushCount
+      assert.equal(stats.totalFlushCount(), tc.expectedTotalFlushCount);
+
+      // Verify sum of individual flush counts equals totalFlushCount
+      const sumOfFlushCounts = stats.slotMismatchFlushCount +
+                               stats.maxCommandsFlushCount +
+                               stats.maxPayloadFlushCount +
+                               stats.timerFlushCount +
+                               stats.drainFlushCount;
+      assert.equal(sumOfFlushCounts, tc.expectedTotalFlushCount, 'Sum of individual flush counts should equal totalFlushCount');
+
+      // Verify batchCount equals totalFlushCount
+      assert.equal(stats.batchCount, tc.expectedTotalFlushCount, 'batchCount should equal totalFlushCount');
+    });
+  }
+});
+
+// ============================================================================
+// Stats Arithmetic Comprehensive Tests
+// ============================================================================
+
+describe('Stats Arithmetic Comprehensive (table-driven)', function () {
+  interface ArithmeticTestCase {
+    name: string;
+    a: BinaryHeaderStats;
+    b: BinaryHeaderStats;
+    operation: 'plus' | 'minus';
+    expected: ExpectedStats;
+  }
+
+  const arithmeticCases: ArithmeticTestCase[] = [
+    {
+      name: 'plus: basic addition',
+      a: BinaryHeaderStats.of(10, 8, 2, 1, 1, 0, 0, 1, 0),
+      b: BinaryHeaderStats.of(20, 16, 4, 2, 2, 1, 0, 1, 0),
+      operation: 'plus',
+      expected: {
+        totalCommandCount: 30,
+        batchedCommandCount: 24,
+        batchCount: 6,
+        ineligibleCount: 3,
+        slotMismatchFlushCount: 3,
+        maxCommandsFlushCount: 1,
+        maxPayloadFlushCount: 0,
+        timerFlushCount: 2,
+        drainFlushCount: 0,
+      },
+    },
+    {
+      name: 'plus: with empty',
+      a: BinaryHeaderStats.of(100, 80, 10, 20, 5, 3, 2, 0, 0),
+      b: BinaryHeaderStats.empty(),
+      operation: 'plus',
+      expected: {
+        totalCommandCount: 100,
+        batchedCommandCount: 80,
+        batchCount: 10,
+        ineligibleCount: 20,
+        slotMismatchFlushCount: 5,
+      },
+    },
+    {
+      name: 'minus: basic subtraction',
+      a: BinaryHeaderStats.of(100, 80, 10, 20, 5, 3, 2, 0, 0),
+      b: BinaryHeaderStats.of(30, 25, 3, 5, 1, 1, 1, 0, 0),
+      operation: 'minus',
+      expected: {
+        totalCommandCount: 70,
+        batchedCommandCount: 55,
+        batchCount: 7,
+        ineligibleCount: 15,
+        slotMismatchFlushCount: 4,
+        maxCommandsFlushCount: 2,
+        maxPayloadFlushCount: 1,
+      },
+    },
+    {
+      name: 'minus: clamps to zero',
+      a: BinaryHeaderStats.of(10, 8, 2, 1, 1, 0, 0, 0, 0),
+      b: BinaryHeaderStats.of(100, 80, 10, 20, 5, 3, 2, 0, 0),
+      operation: 'minus',
+      expected: {
+        totalCommandCount: 0,
+        batchedCommandCount: 0,
+        batchCount: 0,
+        ineligibleCount: 0,
+        slotMismatchFlushCount: 0,
+        maxCommandsFlushCount: 0,
+        maxPayloadFlushCount: 0,
+      },
+    },
+    {
+      name: 'minus: partial clamp',
+      a: BinaryHeaderStats.of(50, 40, 5, 10, 3, 2, 0, 0, 0),
+      b: BinaryHeaderStats.of(30, 60, 3, 5, 1, 1, 5, 0, 0),
+      operation: 'minus',
+      expected: {
+        totalCommandCount: 20,
+        batchedCommandCount: 0, // clamped: 40 - 60 = -20 -> 0
+        batchCount: 2,
+        ineligibleCount: 5,
+        slotMismatchFlushCount: 2,
+        maxCommandsFlushCount: 1,
+        maxPayloadFlushCount: 0, // clamped: 0 - 5 = -5 -> 0
+      },
+    },
+  ];
+
+  for (const tc of arithmeticCases) {
+    it(tc.name, function () {
+      const result = tc.operation === 'plus' ? tc.a.plus(tc.b) : tc.a.minus(tc.b);
+      assertStats(result, tc.expected);
+    });
+  }
 });

@@ -73,7 +73,7 @@ describe('Binary Headers Abort and Timeout', function () {
   async function createConnectedClient(): Promise<RedisClientType> {
     client = createClient({
       socket: { host: 'localhost', port },
-      binaryHeaders: true,
+      binaryHeaders: { enabled: true },
       disableClientInfo: true,
     });
     client.on('error', () => {});

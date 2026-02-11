@@ -9,6 +9,7 @@ import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 
 import type { BinaryHeaderStatsCounter, BinaryHeaderStats } from './stats';
+import { FlushReason, DefaultBinaryHeaderStatsCounter } from './stats';
 import type { EligibilityResolver } from './eligibility';
 import type { Scheduler } from './packing';
 import { createTimeoutScheduler } from './packing';
@@ -407,6 +408,7 @@ export interface TestableQueueWithTimer extends TestableQueue {
   destroy(): void;
   readonly maxWaitMs: number;
   hasPendingOutbound(): boolean;
+  drainPendingOutbound(): SocketChunk | null;
 }
 
 /**
@@ -580,5 +582,117 @@ export { ResponseHeaderEncoder } from './generated/response-header-codec';
 export { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 export type { EligibilityResolver } from './eligibility';
 export type { Scheduler } from './packing';
-export { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter } from './stats';
+export { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter, FlushReason } from './stats';
 export type { BinaryHeaderStatsCounter, BinaryHeaderStats } from './stats';
+
+// ============================================================================
+// Stats + Timer Integration Helpers
+// ============================================================================
+
+/**
+ * Queue with stats tracking enabled.
+ */
+export interface TestableQueueWithStats extends TestableQueue {
+  getStats(): BinaryHeaderStats;
+}
+
+/**
+ * Queue with both stats and timer support.
+ */
+export interface TestableQueueWithTimerAndStats extends TestableQueueWithTimer {
+  getStats(): BinaryHeaderStats;
+}
+
+/**
+ * Creates a queue with binary headers and stats tracking.
+ */
+export function createBinhdrQueueWithStats(options: Omit<QueueFactoryOptions, 'statsCounter'> = {}): TestableQueueWithStats {
+  const statsCounter = DefaultBinaryHeaderStatsCounter.create();
+  const queue = createCodecQueue({
+    ...options,
+    resolver: options.resolver ?? STATIC_RESOLVER,
+    statsCounter,
+  });
+  return Object.assign(queue, {
+    getStats: () => statsCounter.snapshot(),
+  });
+}
+
+/**
+ * Creates a queue with binary headers, timer, and stats tracking.
+ */
+export function createBinhdrQueueWithTimerAndStats(options: Omit<QueueFactoryOptions, 'statsCounter'> = {}): TestableQueueWithTimerAndStats {
+  const statsCounter = DefaultBinaryHeaderStatsCounter.create();
+  const queue = createCodecQueueWithTimer({
+    ...options,
+    resolver: options.resolver ?? STATIC_RESOLVER,
+    statsCounter,
+  });
+  return Object.assign(queue, {
+    getStats: () => statsCounter.snapshot(),
+  });
+}
+
+/**
+ * Scheduler stats for tracking schedule/cancel calls.
+ */
+export interface SchedulerStats {
+  scheduleCount: number;
+  cancelCount: number;
+  lastDelayMs: number | null;
+}
+
+/**
+ * Creates a scheduler that tracks calls for testing.
+ */
+export function createTrackingScheduler(): { scheduler: Scheduler; stats: SchedulerStats } {
+  const stats: SchedulerStats = {
+    scheduleCount: 0,
+    cancelCount: 0,
+    lastDelayMs: null,
+  };
+
+  const scheduler: Scheduler = {
+    schedule(delayMs: number, task: () => void) {
+      stats.scheduleCount++;
+      stats.lastDelayMs = delayMs;
+      const id = setTimeout(task, delayMs);
+      return {
+        cancel: () => {
+          stats.cancelCount++;
+          clearTimeout(id);
+        },
+      };
+    },
+  };
+
+  return { scheduler, stats };
+}
+
+/**
+ * Creates a scheduler that throws on schedule (for error handling tests).
+ */
+export function createThrowingScheduler(errorMessage: string = 'Scheduler error'): Scheduler {
+  return {
+    schedule(_delayMs: number, _task: () => void) {
+      throw new Error(errorMessage);
+    },
+  };
+}
+
+/**
+ * Creates a scheduler that throws on cancel (for error handling tests).
+ */
+export function createThrowingCancelScheduler(errorMessage: string = 'Cancel error'): Scheduler {
+  return {
+    schedule(delayMs: number, task: () => void) {
+      const id = setTimeout(task, delayMs);
+      return {
+        cancel: () => {
+          clearTimeout(id);
+          throw new Error(errorMessage);
+        },
+      };
+    },
+  };
+}
