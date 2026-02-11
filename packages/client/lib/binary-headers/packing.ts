@@ -142,11 +142,12 @@ export class CommandPacker {
     const count = this.#resps.length;
     this.#statsCounter.recordFlush(reason);
 
+    // v0 signature: allocateAndEncode(length, commandCount, slot, clientIdx)
     const header = RequestHeaderEncoder.allocateAndEncode(
-      toWireSlot(this.#resolvedSlot),
       this.#totalPayloadLength,
       count,
-      0
+      toWireSlot(this.#resolvedSlot),
+      0  // clientIdx - not used in current implementation
     );
 
     let totalParts = 1;

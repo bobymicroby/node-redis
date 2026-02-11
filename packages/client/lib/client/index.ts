@@ -656,7 +656,7 @@ export default class RedisClient<
 
       const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER },
-        inbound: { onProtocolError: (header) => this.emit('error', new Error(`Binary header protocol error: requestId=${header.requestId}`)) },
+        inbound: { onProtocolError: (header) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${header.clientIdx}`)) },
         statsCounter
       });
       const timerOptions = { maxWaitMs: 1, scheduler: createTimeoutScheduler() };

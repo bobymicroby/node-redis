@@ -46,11 +46,11 @@ export function createBinhdrResponse(respPayload: string): Buffer {
 export function createBinhdrFrame(
   payload: Buffer,
   commandCount: number = 1,
-  requestId: number = 0,
+  clientIdx: number = 0,
   protocolError: boolean = false
 ): Buffer {
   return Buffer.concat([
-    ResponseHeaderEncoder.allocateAndEncode(payload.length, commandCount, protocolError, requestId),
+    ResponseHeaderEncoder.allocateAndEncode(payload.length, commandCount, protocolError, clientIdx),
     payload
   ]);
 }
@@ -472,7 +472,7 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
   const interceptor = (resolver || onProtocolError || statsCounter)
     ? new BinaryHeadersInterceptor({
         outbound: resolver ? { resolver } : undefined,
-        inbound: onProtocolError ? { onProtocolError: (header) => onProtocolError(header.requestId) } : undefined,
+        inbound: onProtocolError ? { onProtocolError: (header) => onProtocolError(header.clientIdx) } : undefined,
         statsCounter,
       })
     : undefined;

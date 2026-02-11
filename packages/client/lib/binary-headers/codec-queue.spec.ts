@@ -598,7 +598,7 @@ describe('Codec Queue [codec-queue]', function () {
       const errors: number[] = [];
       const interceptor = new BinaryHeadersInterceptor({
         outbound: { resolver: STATIC_RESOLVER },
-        inbound: { onProtocolError: (header) => errors.push(header.requestId) }
+        inbound: { onProtocolError: (header) => errors.push(header.clientIdx) }
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
 
