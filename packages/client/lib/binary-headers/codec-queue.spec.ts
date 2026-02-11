@@ -415,6 +415,354 @@ describe('Codec Queue [codec-queue]', function () {
     });
   });
 
+  describe('timer-based flushing (negative & edge cases)', function () {
+    let activeQueues: TestableQueueWithTimer[] = [];
+
+    afterEach(function () {
+      for (const queue of activeQueues) {
+        queue.destroy();
+      }
+      activeQueues = [];
+    });
+
+    function createQueueWithTimer(maxWaitMs: number, useImmediate: boolean = false): TestableQueueWithTimer {
+      const queue = createBinhdrQueueWithTimer({
+        timer: {
+          maxWaitMs,
+          scheduler: useImmediate ? createImmediateScheduler() : createTimeoutScheduler(),
+        },
+      });
+      activeQueues.push(queue);
+      return queue;
+    }
+
+    it('double destroy does not throw', function () {
+      const queue = createQueueWithTimer(100);
+      queue.addCommand(['PING']);
+      collectYielded(queue); // buffer command
+
+      queue.destroy();
+      assert.doesNotThrow(() => queue.destroy());
+    });
+
+    it('manual drainPendingOutbound before timer fires prevents double-flush', async function () {
+      const queue = createQueueWithTimer(30);
+      let callbackCount = 0;
+      queue.setTimerFlushCallback(() => { callbackCount++; });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue); // buffer command, timer scheduled
+
+      // Manually drain before timer fires
+      const drained = (queue as RedisCommandsQueue).drainPendingOutbound();
+      assert.ok(drained !== null, 'Manual drain should return data');
+      assertPackedData(drained, {
+        commandCount: 1,
+        commands: [['SET', 'key', 'value']]
+      });
+
+      // Wait past the timer - it should fire but find nothing to flush
+      await delay(50);
+      assert.equal(callbackCount, 0, 'Timer callback should NOT fire when buffer already drained');
+    });
+
+    it('setTimerFlushCallback replaced mid-flight: new callback receives data', async function () {
+      const queue = createQueueWithTimer(15);
+      let oldCalled = false;
+      queue.setTimerFlushCallback(() => { oldCalled = true; });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue); // timer scheduled
+
+      // Replace callback before timer fires
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+      await delay(25);
+      assert.equal(oldCalled, false, 'Old callback should not be called');
+      assert.equal(flushedData.length, 1, 'New callback should receive the data');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', 'key', 'value']]
+      });
+    });
+
+    it('setTimerFlushCallback after destroy: callback is not invoked', async function () {
+      const queue = createQueueWithTimer(15);
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue); // timer scheduled
+
+      queue.destroy(); // cancels timer, sets callback to noop
+
+      // Try to set a new callback after destroy
+      let called = false;
+      queue.setTimerFlushCallback(() => { called = true; });
+
+      await delay(25);
+      // Timer was cancelled by destroy, so even the new callback shouldn't fire
+      assert.equal(called, false, 'Callback set after destroy should not fire');
+    });
+
+    it('commands added after destroy are silently lost (timer is noop)', async function () {
+      const queue = createQueueWithTimer(15);
+      let callbackCount = 0;
+      queue.setTimerFlushCallback(() => { callbackCount++; });
+
+      queue.destroy();
+
+      // Add command after destroy
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue); // This schedules a NEW timer
+
+      await delay(25);
+      // Timer fires, but callback was reset to noop by destroy
+      assert.equal(callbackCount, 0, 'Callback should be noop after destroy');
+    });
+
+    it('maxWaitMs of 0 still triggers timer asynchronously', async function () {
+      const queue = createQueueWithTimer(0);
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+
+      // Even with 0ms, setTimeout(fn, 0) is async - data shouldn't be available synchronously
+      assert.equal(flushedData.length, 0, 'Not flushed synchronously');
+
+      await delay(5);
+      assert.equal(flushedData.length, 1, 'Flushed after event loop turn');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', 'key', 'value']]
+      });
+    });
+
+    it('rapid add/destroy/add cycle: first batch lost, second batch also lost', async function () {
+      const queue = createQueueWithTimer(15);
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+      // First batch
+      queue.addCommand(['SET', 'k1', 'v1']);
+      collectYielded(queue);
+
+      // Destroy cancels timer + resets callback to noop
+      queue.destroy();
+
+      // Second batch after destroy
+      queue.addCommand(['SET', 'k2', 'v2']);
+      collectYielded(queue); // schedules new timer, but callback is noop
+
+      await delay(25);
+      // Neither batch should produce callback invocations
+      assert.equal(flushedData.length, 0, 'No callbacks after destroy');
+    });
+
+    it('multiple generators in sequence maintain consistent timer state', async function () {
+      const queue = createQueueWithTimer(30);
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+      // First generator: buffer command, timer scheduled
+      queue.addCommand(['SET', 'key', 'v1']);
+      const results1 = collectYielded(queue);
+      assert.equal(results1.length, 0, 'First gen: buffered for timer');
+
+      // Second generator with no new commands: should yield nothing
+      const results2 = collectYielded(queue);
+      assert.equal(results2.length, 0, 'Second gen: nothing new to yield');
+
+      // Timer should still fire for the first command
+      await delay(40);
+      assert.equal(flushedData.length, 1, 'Timer fires once for buffered command');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', 'key', 'v1']]
+      });
+    });
+
+    it('timer does not re-schedule itself after firing', async function () {
+      const queue = createQueueWithTimer(10);
+      let callbackCount = 0;
+      queue.setTimerFlushCallback(() => { callbackCount++; });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+
+      // Wait for timer to fire
+      await delay(20);
+      assert.equal(callbackCount, 1, 'Timer fires once');
+
+      // Wait another full interval - should NOT fire again
+      await delay(20);
+      assert.equal(callbackCount, 1, 'Timer does not re-fire');
+    });
+
+    it('hasPendingOutbound is false after timer fires', async function () {
+      const queue = createQueueWithTimer(10);
+      queue.setTimerFlushCallback(() => {});
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+      assert.equal(queue.hasPendingOutbound(), true, 'Pending before timer');
+
+      await delay(20);
+      assert.equal(queue.hasPendingOutbound(), false, 'Not pending after timer fires');
+    });
+
+    it('destroy between addCommand and commandsToWrite prevents timer scheduling', async function () {
+      const queue = createQueueWithTimer(15);
+      let callbackCount = 0;
+      queue.setTimerFlushCallback(() => { callbackCount++; });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      // Don't consume generator - command is in toWrite, not in codec buffer
+      // Timer is NOT yet scheduled (scheduled during generator consumption)
+      queue.destroy();
+
+      // Now consume - timer gets scheduled but callback is noop
+      collectYielded(queue);
+
+      await delay(25);
+      assert.equal(callbackCount, 0, 'Callback should not fire after destroy');
+    });
+
+    it('slot flush mid-generator cancels existing timer and schedules new one', async function () {
+      const queue = createQueueWithTimer(50);
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+      // Add two commands: first gets buffered, timer scheduled
+      queue.addCommand(['SET', 'key1', 'v1']);
+      collectYielded(queue);
+
+      // Wait 30ms (timer at 50ms hasn't fired yet)
+      await delay(30);
+      assert.equal(flushedData.length, 0, 'Timer not yet fired');
+
+      // Add different-slot command - flushes first, cancels old timer, schedules new
+      queue.addCommand(['SET', 'key2', 'v2']);
+      const results = collectYielded(queue);
+      assert.equal(results.length, 1, 'Slot change flushed first command via generator');
+
+      // If old timer was NOT cancelled, it would fire ~20ms from now (50-30)
+      // New timer for key2 should fire at 50ms from now
+      await delay(25);
+      assert.equal(flushedData.length, 0, 'Old timer was cancelled, new timer not yet due');
+
+      // Wait for new timer
+      await delay(30);
+      assert.equal(flushedData.length, 1, 'New timer fires for key2');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', 'key2', 'v2']]
+      });
+    });
+
+    it('custom scheduler that fires synchronously: callback invoked before delay', function () {
+      // A scheduler that calls the callback immediately (synchronously)
+      const syncScheduler = {
+        schedule(_delayMs: number, task: () => void) {
+          task(); // fire immediately
+          return { cancel: () => {} };
+        }
+      };
+
+      const interceptor = new BinaryHeadersInterceptor({
+        outbound: { resolver: STATIC_RESOLVER }
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor, {
+        maxWaitMs: 1000,
+        scheduler: syncScheduler,
+      });
+      activeQueues.push(queue as unknown as TestableQueueWithTimer);
+
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+
+      // With synchronous scheduler, callback fires during generator consumption
+      assert.equal(flushedData.length, 1, 'Synchronous scheduler fires immediately');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', 'key', 'value']]
+      });
+    });
+
+    it('scheduler cancel is called exactly once on destroy', function () {
+      let cancelCount = 0;
+      const countingScheduler = {
+        schedule(delayMs: number, task: () => void) {
+          const id = setTimeout(task, delayMs);
+          return {
+            cancel: () => {
+              cancelCount++;
+              clearTimeout(id);
+            }
+          };
+        }
+      };
+
+      const interceptor = new BinaryHeadersInterceptor({
+        outbound: { resolver: STATIC_RESOLVER }
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor, {
+        maxWaitMs: 100,
+        scheduler: countingScheduler,
+      });
+      activeQueues.push(queue as unknown as TestableQueueWithTimer);
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue); // schedules timer
+
+      assert.equal(cancelCount, 0, 'Not cancelled yet');
+      queue.destroy();
+      assert.equal(cancelCount, 1, 'Cancelled exactly once');
+      queue.destroy(); // double destroy
+      assert.equal(cancelCount, 1, 'Not cancelled again on double destroy');
+    });
+
+    it('scheduler cancel is called on slot-change flush', function () {
+      let cancelCount = 0;
+      const countingScheduler = {
+        schedule(delayMs: number, task: () => void) {
+          const id = setTimeout(task, delayMs);
+          return {
+            cancel: () => {
+              cancelCount++;
+              clearTimeout(id);
+            }
+          };
+        }
+      };
+
+      const interceptor = new BinaryHeadersInterceptor({
+        outbound: { resolver: STATIC_RESOLVER }
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor, {
+        maxWaitMs: 100,
+        scheduler: countingScheduler,
+      });
+      activeQueues.push(queue as unknown as TestableQueueWithTimer);
+
+      // First command buffers + schedules timer
+      queue.addCommand(['SET', 'key1', 'v1']);
+      collectYielded(queue);
+      assert.equal(cancelCount, 0, 'Timer scheduled');
+
+      // Different slot triggers flush -> cancels timer -> schedules new timer
+      queue.addCommand(['SET', 'key2', 'v2']);
+      collectYielded(queue);
+      assert.equal(cancelCount, 1, 'Old timer cancelled on slot-change flush');
+
+      queue.destroy();
+      assert.equal(cancelCount, 2, 'New timer cancelled on destroy');
+    });
+  });
+
   describe('integration with existing components', function () {
     it('works with STATIC_RESOLVER for slot-based batching', function () {
       const queue = createBinhdrQueue();
