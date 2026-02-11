@@ -35,6 +35,7 @@ import { build as buildHistogram, Histogram } from 'hdr-histogram-js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { createTimeoutScheduler } from './packing';
 
 // Dynamic client import - will be set at runtime based on --npm-client-version
 let RedisClient: any;
@@ -233,6 +234,11 @@ interface BenchConfig {
   username?: string;
   password?: string;
   npmClientVersion?: string;
+  // Binary headers options
+  binaryHeadersTimerDisabled?: boolean;
+  binaryHeadersMaxWaitTime?: number;
+  binaryHeadersMaxCommandCount?: number;
+  binaryHeadersMaxPayloadLength?: number;
 }
 
 function parseConfig(): BenchConfig {
@@ -258,6 +264,11 @@ function parseConfig(): BenchConfig {
       username: { type: 'string', short: 'u' },
       password: { type: 'string', short: 'a' },
       'npm-client-version': { type: 'string' },
+      // Binary headers options
+      'bh-timer-disabled': { type: 'boolean', default: false },
+      'bh-max-wait-time': { type: 'string' },
+      'bh-max-command-count': { type: 'string' },
+      'bh-max-payload-length': { type: 'string' },
     },
     strict: true,
   });
@@ -287,6 +298,11 @@ function parseConfig(): BenchConfig {
     username: values.username as string | undefined,
     password: values.password as string | undefined,
     npmClientVersion: values['npm-client-version'] as string | undefined,
+    // Binary headers options (undefined means use defaults)
+    binaryHeadersTimerDisabled: values['bh-timer-disabled'] as boolean,
+    binaryHeadersMaxWaitTime: values['bh-max-wait-time'] ? parseInt(values['bh-max-wait-time'] as string, 10) : undefined,
+    binaryHeadersMaxCommandCount: values['bh-max-command-count'] ? parseInt(values['bh-max-command-count'] as string, 10) : undefined,
+    binaryHeadersMaxPayloadLength: values['bh-max-payload-length'] ? parseInt(values['bh-max-payload-length'] as string, 10) : undefined,
   };
 
   // Validation
@@ -495,12 +511,20 @@ interface BenchClient {
   disconnect(): Promise<void>;
 }
 
+interface BinaryHeadersClientOptions {
+  timerDisabled?: boolean;
+  maxWaitTime?: number;
+  maxCommandCount?: number;
+  maxPayloadLength?: number;
+}
+
 async function createBenchClient(
   host: string,
   port: number,
   binaryHeaders: boolean,
   username?: string,
-  password?: string
+  password?: string,
+  bhOptions?: BinaryHeadersClientOptions
 ): Promise<BenchClient> {
   const client = RedisClient.create({
     socket: {
@@ -515,7 +539,15 @@ async function createBenchClient(
     },
     ...(username ? { username } : {}),
     ...(password ? { password } : {}),
-    ...(binaryHeaders ? { binaryHeaders: { enabled: true, 'stats-collector': 'enabled' } } : {}),
+    ...(binaryHeaders ? {
+      binaryHeaders: {
+        enabled: true,
+        'stats-collector': 'enabled',
+        ...(bhOptions?.maxCommandCount !== undefined ? { maxCommandCount: bhOptions.maxCommandCount } : {}),
+        ...(bhOptions?.maxPayloadLength !== undefined ? { maxPayloadLength: bhOptions.maxPayloadLength } : {}),
+        ...(bhOptions?.timerDisabled ? { timer: false } : bhOptions?.maxWaitTime !== undefined ? { timer: { maxWaitTime: bhOptions.maxWaitTime, scheduler: createTimeoutScheduler() } } : {}),
+      }
+    } : {}),
   });
 
   client.on('error', () => {
@@ -894,7 +926,19 @@ async function runMode(
   const clients: BenchClient[] = [];
   try {
     for (let i = 0; i < config.connections; i++) {
-      const client = await createBenchClient(config.host, config.port, binaryHeaders, config.username, config.password);
+      const client = await createBenchClient(
+        config.host,
+        config.port,
+        binaryHeaders,
+        config.username,
+        config.password,
+        {
+          timerDisabled: config.binaryHeadersTimerDisabled,
+          maxWaitTime: config.binaryHeadersMaxWaitTime,
+          maxCommandCount: config.binaryHeadersMaxCommandCount,
+          maxPayloadLength: config.binaryHeadersMaxPayloadLength,
+        }
+      );
       clients.push(client);
     }
   } catch (err) {
@@ -1040,7 +1084,13 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
         config.port,
         binaryHeaders,
         config.username,
-        config.password
+        config.password,
+        {
+          timerDisabled: config.binaryHeadersTimerDisabled,
+          maxWaitTime: config.binaryHeadersMaxWaitTime,
+          maxCommandCount: config.binaryHeadersMaxCommandCount,
+          maxPayloadLength: config.binaryHeadersMaxPayloadLength,
+        }
       );
       clients.push(client);
     }

@@ -4,7 +4,10 @@ import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsP
 import RedisCommandsQueue, { CommandOptions, type Scheduler } from './commands-queue';
 import { BinaryHeadersInterceptor } from '../binary-headers/codec';
 import { STATIC_RESOLVER } from '../binary-headers/eligibility';
+import { createTimeoutScheduler } from '../binary-headers/packing';
 import { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from '../binary-headers/stats';
+
+const DEFAULT_MAX_WAIT_TIME_MS = 1;
 
 /**
  * Timer configuration for binary headers batching.
@@ -30,10 +33,23 @@ export interface BinaryHeadersOptions {
   enabled: boolean;
   /**
    * Timer configuration for flushing buffered commands.
-   * If provided, both maxWaitTime and scheduler are required.
-   * If not provided, commands are only flushed on slot change, max commands, or max payload size.
+   * - undefined (default): timer enabled with 1ms maxWaitTime using createTimeoutScheduler()
+   * - { maxWaitTime, scheduler }: custom timer configuration
+   * - false: explicitly disable timer-based flushing
    */
-  timer?: BinaryHeadersTimerConfig;
+  timer?: BinaryHeadersTimerConfig | false;
+  /**
+   * Maximum number of commands to batch before flushing.
+   * Must be between 1 and RequestHeaderEncoder.commandCountMaxValue().
+   * Default: RequestHeaderEncoder.commandCountMaxValue()
+   */
+  maxCommandCount?: number;
+  /**
+   * Maximum payload length in bytes before flushing.
+   * Must be between 1 and RequestHeaderEncoder.lengthMaxValue().
+   * Default: RequestHeaderEncoder.lengthMaxValue()
+   */
+  maxPayloadLength?: number;
   /**
    * Controls binary headers statistics collection.
    * - 'noop': Use noop stats counter for zero overhead
@@ -677,13 +693,19 @@ export default class RedisClient<
       binaryHeadersOpts.getStats = () => statsCounter.snapshot();
 
       const interceptor = new BinaryHeadersInterceptor({
-        outbound: { resolver: STATIC_RESOLVER },
+        outbound: {
+          resolver: STATIC_RESOLVER,
+          maxCommandCount: binaryHeadersOpts.maxCommandCount,
+          maxPayloadLength: binaryHeadersOpts.maxPayloadLength,
+        },
         inbound: { onProtocolError: (header) => this.emit('error', new Error(`Binary header protocol error: clientIdx=${header.clientIdx}`)) },
         statsCounter
       });
-      const timerOptions = binaryHeadersOpts.timer
-        ? { maxWaitMs: binaryHeadersOpts.timer.maxWaitTime, scheduler: binaryHeadersOpts.timer.scheduler }
-        : undefined;
+      const timerOptions = binaryHeadersOpts.timer === false
+        ? undefined
+        : binaryHeadersOpts.timer
+          ? { maxWaitMs: binaryHeadersOpts.timer.maxWaitTime, scheduler: binaryHeadersOpts.timer.scheduler }
+          : { maxWaitMs: DEFAULT_MAX_WAIT_TIME_MS, scheduler: createTimeoutScheduler() };
       return new RedisCommandsQueue(
         this.#options.RESP ?? 2,
         this.#options.commandsQueueMaxLength,
@@ -702,7 +724,7 @@ export default class RedisClient<
 
   #setupBinhdrFlushCallback(): void {
     const binaryHeadersOpts = this.#options.binaryHeaders;
-    if (binaryHeadersOpts && typeof binaryHeadersOpts === 'object' && binaryHeadersOpts.enabled && binaryHeadersOpts.timer) {
+    if (binaryHeadersOpts && typeof binaryHeadersOpts === 'object' && binaryHeadersOpts.enabled && binaryHeadersOpts.timer !== false) {
       this.#queue.setTimerFlushCallback(encoded => {
         this.#socket.write([encoded]);
       });

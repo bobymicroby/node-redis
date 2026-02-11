@@ -13,6 +13,7 @@
     "prebuild": "npm run generate:binhdr",
     "pretest": "npm run generate:binhdr",
     "test": "nyc -r text-summary -r lcov mocha -r tsx './lib/**/*.spec.ts'",
+    "memtier-bench": "node dist/lib/binary-headers/memtier-bench.js",
     "release": "release-it"
   },
   "dependencies": {

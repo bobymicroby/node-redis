@@ -1,7 +1,7 @@
 import type { OutboundInterceptor, InboundInterceptor, WireInterceptor, SocketChunk, SocketChunks, CommandArguments } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
-import { CommandPacker, calculatePayloadLength } from './packing';
+import { CommandPacker, calculatePayloadLength, type CommandPackerOptions } from './packing';
 import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
 import { FlushReason, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from './stats';
 
@@ -10,6 +10,18 @@ export type OnProtocolError = (header: BinaryResponseHeader) => void;
 
 export interface BinaryHeadersOutboundOptions {
   readonly resolver?: EligibilityResolver;
+  /**
+   * Maximum number of commands to batch before flushing.
+   * Must be between 1 and RequestHeaderEncoder.commandCountMaxValue().
+   * Default: RequestHeaderEncoder.commandCountMaxValue()
+   */
+  readonly maxCommandCount?: number;
+  /**
+   * Maximum payload length in bytes before flushing.
+   * Must be between 1 and RequestHeaderEncoder.lengthMaxValue().
+   * Default: RequestHeaderEncoder.lengthMaxValue()
+   */
+  readonly maxPayloadLength?: number;
 }
 
 export interface BinaryHeadersInboundOptions {
@@ -52,7 +64,11 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   ) {
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
     this.#resolver = options.resolver ?? NOOP_RESOLVER;
-    this.#packer = new CommandPacker(this.#statsCounter);
+    const packerOptions: CommandPackerOptions = {
+      maxCommandCount: options.maxCommandCount,
+      maxPayloadLength: options.maxPayloadLength,
+    };
+    this.#packer = new CommandPacker(this.#statsCounter, packerOptions);
   }
 
   intercept(encoded: SocketChunk, args: CommandArguments): SocketChunks {
