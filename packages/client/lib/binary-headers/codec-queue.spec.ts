@@ -761,6 +761,55 @@ describe('Codec Queue [codec-queue]', function () {
       queue.destroy();
       assert.equal(cancelCount, 2, 'New timer cancelled on destroy');
     });
+
+    it('timer callback never fires when timer is NOT configured', async function () {
+      const queue = createBinhdrQueue(); // No timer config
+      let callbackCalled = false;
+      (queue as RedisCommandsQueue).setTimerFlushCallback(() => { callbackCalled = true; });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+
+      await delay(50);
+
+      assert.equal(callbackCalled, false, 'Callback should never fire without timer config');
+    });
+
+    it('timer does NOT fire before maxWaitMs elapses', async function () {
+      const queue = createQueueWithTimer(100);
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      collectYielded(queue);
+
+      await delay(30);
+      assert.equal(flushedData.length, 0, 'Timer should NOT have fired yet at 30ms');
+
+      await delay(30);
+      assert.equal(flushedData.length, 0, 'Timer should NOT have fired yet at 60ms');
+
+      await delay(50);
+      assert.equal(flushedData.length, 1, 'Timer should fire after 100ms');
+    });
+
+    it('commands are flushed via drain when no timer configured, not via callback', async function () {
+      const queue = createBinhdrQueue(); // No timer config
+      let callbackCalled = false;
+      (queue as RedisCommandsQueue).setTimerFlushCallback(() => { callbackCalled = true; });
+
+      queue.addCommand(['SET', 'key', 'value']);
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 1, 'Command should be drained at end of generator');
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', 'key', 'value']]
+      });
+
+      await delay(20);
+      assert.equal(callbackCalled, false, 'Callback should never be invoked without timer');
+    });
   });
 
   describe('integration with existing components', function () {

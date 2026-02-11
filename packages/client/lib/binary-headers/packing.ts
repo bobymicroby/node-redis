@@ -9,8 +9,25 @@ import type { BinaryHeaderStatsCounter } from './stats';
 export type { Cancellable, Scheduler };
 
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
-const MAX_COMMAND_COUNT = RequestHeaderEncoder.commandCountMaxValue();
-const MAX_PAYLOAD_LENGTH = RequestHeaderEncoder.lengthMaxValue();
+
+/**
+ * Options for CommandPacker flush thresholds.
+ */
+export interface CommandPackerOptions {
+  /**
+   * Maximum number of commands per batch before triggering a flush.
+   * Must be >= 1 and <= RequestHeaderEncoder.commandCountMaxValue().
+   * Defaults to RequestHeaderEncoder.commandCountMaxValue().
+   */
+  maxCommandCount?: number;
+
+  /**
+   * Maximum payload length in bytes before triggering a flush.
+   * Must be >= 1 and <= RequestHeaderEncoder.lengthMaxValue().
+   * Defaults to RequestHeaderEncoder.lengthMaxValue().
+   */
+  maxPayloadLength?: number;
+}
 
 export function createTimeoutScheduler(): Scheduler {
   return {
@@ -53,15 +70,32 @@ export function calculatePayloadLength(resp: SocketChunk): number {
  */
 export class CommandPacker {
   readonly #statsCounter: BinaryHeaderStatsCounter;
+  readonly #maxCommandCount: number;
+  readonly #maxPayloadLength: number;
   readonly #resps: Array<SocketChunk> = [];
 
   #resolvedSlot: number = NULL_SLOT;
   #totalPayloadLength: number = 0;
 
   constructor(
-    statsCounter?: BinaryHeaderStatsCounter
+    statsCounter?: BinaryHeaderStatsCounter,
+    options?: CommandPackerOptions
   ) {
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
+
+    const codecMaxCommandCount = RequestHeaderEncoder.commandCountMaxValue();
+    const codecMaxPayloadLength = RequestHeaderEncoder.lengthMaxValue();
+
+    this.#maxCommandCount = options?.maxCommandCount ?? codecMaxCommandCount;
+    this.#maxPayloadLength = options?.maxPayloadLength ?? codecMaxPayloadLength;
+
+    // Validate bounds
+    if (this.#maxCommandCount < 1 || this.#maxCommandCount > codecMaxCommandCount) {
+      throw new Error(`maxCommandCount must be between 1 and ${codecMaxCommandCount}, got ${this.#maxCommandCount}`);
+    }
+    if (this.#maxPayloadLength < 1 || this.#maxPayloadLength > codecMaxPayloadLength) {
+      throw new Error(`maxPayloadLength must be between 1 and ${codecMaxPayloadLength}, got ${this.#maxPayloadLength}`);
+    }
   }
 
   add(
@@ -98,13 +132,13 @@ export class CommandPacker {
   }
 
   #getFlushReason(count: number, slot: number, payloadLength: number): FlushReason | null {
-    if (count >= MAX_COMMAND_COUNT) {
+    if (count >= this.#maxCommandCount) {
       return FlushReason.MAX_COMMANDS;
     }
     if (!areSlotsCompatible(this.#resolvedSlot, slot)) {
       return FlushReason.SLOT_MISMATCH;
     }
-    if (this.#totalPayloadLength + payloadLength > MAX_PAYLOAD_LENGTH) {
+    if (this.#totalPayloadLength + payloadLength > this.#maxPayloadLength) {
       return FlushReason.MAX_PAYLOAD;
     }
     return null;

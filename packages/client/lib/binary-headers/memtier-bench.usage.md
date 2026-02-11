@@ -66,6 +66,31 @@ npx ts-node memtier-bench.ts -s localhost -p 6379 \
   -t 50 -c 4 --pipeline 10 --test-time 60 --mode all
 ```
 
+## CPU Profiling with 0x
+
+To generate flamegraphs for debugging performance, use [0x](https://github.com/davidmarkclements/0x):
+
+```bash
+# Install 0x globally (one-time)
+npm install -g 0x
+
+# Profile fast-headers-off (baseline)
+0x -- npx ts-node packages/client/lib/binary-headers/memtier-bench.ts \
+  -s localhost -p 6379 --test-time 10 --mode fast-headers-off
+
+# Profile fast-headers-on
+0x -- npx ts-node packages/client/lib/binary-headers/memtier-bench.ts \
+  -s localhost -p 6379 --test-time 10 --mode fast-headers-on
+```
+
+This generates a folder like `./12345.0x/` with an interactive HTML flamegraph.
+Open `flamegraph.html` in your browser to analyze CPU hotspots.
+
+**Tips for reading flamegraphs:**
+- Width = time spent (wider = more time)
+- Look for tall stacks unique to `fast-headers-on`
+- Search for `packing`, `binary`, `header`, `encoder` to find binary headers code
+
 ## Notes
 
 - `-t` uses **child processes** (not threads) for parallelism — named for memtier CLI compatibility
