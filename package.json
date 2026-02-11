@@ -14,6 +14,8 @@
   "scripts": {
     "test-single": "TS_NODE_PROJECT='./packages/test-utils/tsconfig.json' mocha --require ts-node/register/transpile-only ",
     "test": "npm run test -ws --if-present",
+    "generate:binhdr": "npm run generate:binhdr --workspace=@redis/client",
+    "prebuild": "npm run generate:binhdr",
     "build": "tsc --build",
     "documentation": "typedoc --out ./documentation",
     "gh-pages": "gh-pages -d ./documentation -e ./documentation -u 'documentation-bot <documentation@bot>'",
