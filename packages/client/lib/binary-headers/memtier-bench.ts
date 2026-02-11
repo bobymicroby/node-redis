@@ -30,11 +30,114 @@
  */
 
 import { parseArgs } from 'node:util';
-import { fork, ChildProcess } from 'node:child_process';
+import { fork, ChildProcess, execSync } from 'node:child_process';
 import { build as buildHistogram, Histogram } from 'hdr-histogram-js';
-import RedisClient from '../client';
-import { RedisClientType } from '../client';
-import { BinaryHeaderStats } from './stats';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+
+// Dynamic client import - will be set at runtime based on --npm-client-version
+let RedisClient: any;
+let BinaryHeaderStatsClass: any;
+
+// Type alias for Redis client
+type AnyRedisClient = any;
+
+// Cache directory for npm client versions
+const NPM_CACHE_DIR = path.join(os.homedir(), '.cache', 'memtier-bench');
+
+/**
+ * Initialize Redis client - either from local source or npm package
+ */
+function initializeRedisClient(npmVersion?: string): void {
+  if (!npmVersion) {
+    // Use local source with require (works with ts-node)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const localClient = require('../client');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const localStats = require('./stats');
+    RedisClient = localClient.default;
+    BinaryHeaderStatsClass = localStats.BinaryHeaderStats;
+    return;
+  }
+
+  // Use npm version
+  const versionDir = path.join(NPM_CACHE_DIR, npmVersion);
+  const packageDir = path.join(versionDir, 'node_modules', '@redis', 'client');
+
+  // Check if already installed
+  if (!fs.existsSync(path.join(packageDir, 'package.json'))) {
+    console.log(`Installing @redis/client@${npmVersion}...`);
+
+    // Create cache directory
+    fs.mkdirSync(versionDir, { recursive: true });
+
+    // Create minimal package.json
+    fs.writeFileSync(
+      path.join(versionDir, 'package.json'),
+      JSON.stringify({ name: 'memtier-bench-cache', version: '1.0.0', private: true }, null, 2)
+    );
+
+    // Install the specific version
+    try {
+      execSync(`npm install @redis/client@${npmVersion}`, {
+        cwd: versionDir,
+        stdio: 'inherit',
+      });
+    } catch (err) {
+      throw new Error(`Failed to install @redis/client@${npmVersion}: ${(err as Error).message}`);
+    }
+
+    console.log(`Installed @redis/client@${npmVersion}`);
+  } else {
+    console.log(`Using cached @redis/client@${npmVersion}`);
+  }
+
+  // Verify the installed version matches what we requested
+  const installedPackageJson = JSON.parse(
+    fs.readFileSync(path.join(packageDir, 'package.json'), 'utf-8')
+  );
+  const installedVersion = installedPackageJson.version;
+  if (installedVersion !== npmVersion) {
+    throw new Error(
+      `Version mismatch: requested @redis/client@${npmVersion} but found @${installedVersion}. ` +
+      `Try deleting cache: rm -rf ~/.cache/memtier-bench/${npmVersion}`
+    );
+  }
+  console.log(`Verified @redis/client version: ${installedVersion}`);
+
+  // Dynamic require from the installed package
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const clientPath = path.join(packageDir, 'dist', 'lib', 'client', 'index.js');
+  const clientModule = require(clientPath);
+  RedisClient = clientModule.default;
+
+  // Note: BinaryHeaderStatsClass may not exist in older versions
+  try {
+    const statsPath = path.join(packageDir, 'dist', 'lib', 'binary-headers', 'stats.js');
+    if (fs.existsSync(statsPath)) {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const statsModule = require(statsPath);
+      BinaryHeaderStatsClass = statsModule.BinaryHeaderStats;
+    }
+  } catch {
+    // BinaryHeaderStatsClass not available in this version
+    BinaryHeaderStatsClass = null;
+  }
+}
+
+/**
+ * Cleanup npm client cache
+ */
+function cleanupNpmCache(npmVersion?: string): void {
+  if (!npmVersion) return;
+
+  const versionDir = path.join(NPM_CACHE_DIR, npmVersion);
+  if (fs.existsSync(versionDir)) {
+    console.log(`Cleaning up cached @redis/client@${npmVersion}...`);
+    fs.rmSync(versionDir, { recursive: true, force: true });
+  }
+}
 
 // ============================================================================
 // IPC Message Types for Multi-Process Support
@@ -116,6 +219,7 @@ interface BenchConfig {
   hideHistogram: boolean;
   username?: string;
   password?: string;
+  npmClientVersion?: string;
 }
 
 function parseConfig(): BenchConfig {
@@ -140,6 +244,7 @@ function parseConfig(): BenchConfig {
       'hide-histogram': { type: 'boolean', default: false },
       username: { type: 'string', short: 'u' },
       password: { type: 'string', short: 'a' },
+      'npm-client-version': { type: 'string' },
     },
     strict: true,
   });
@@ -168,6 +273,7 @@ function parseConfig(): BenchConfig {
     hideHistogram: values['hide-histogram'] as boolean,
     username: values.username as string | undefined,
     password: values.password as string | undefined,
+    npmClientVersion: values['npm-client-version'] as string | undefined,
   };
 
   // Validation
@@ -368,7 +474,7 @@ class MemtierStats {
 // Client Wrapper
 // ============================================================================
 
-type AnyRedisClient = RedisClientType<any, any, any, any, any>;
+// AnyRedisClient is defined at the top of the file
 
 interface BenchClient {
   readonly client: AnyRedisClient;
@@ -631,7 +737,7 @@ function printFinalSummary(
   }
 }
 
-function printBinaryHeaderStats(bhStats: BinaryHeaderStats): void {
+function printBinaryHeaderStats(bhStats: any): void {
   console.log(
     `\nBinary Header Stats:  ` +
     `batchRate=${(bhStats.batchRate() * 100).toFixed(1)}%  ` +
@@ -768,7 +874,7 @@ async function runMode(
 
   // Report binary header stats for fast-headers mode
   if (binaryHeaders) {
-    let aggregated: BinaryHeaderStats | undefined;
+    let aggregated: typeof BinaryHeaderStatsClass | undefined;
     for (const c of clients) {
       const s = (c.client as any).binaryHeaderStats;
       if (s) {
@@ -987,7 +1093,12 @@ async function runModeMultiProcess(
 
   for (let i = 0; i < numWorkers; i++) {
     const worker = fork(__filename, [], {
-      env: { ...process.env, MEMTIER_WORKER: '1' },
+      env: {
+        ...process.env,
+        MEMTIER_WORKER: '1',
+        // Pass npm version to worker if set
+        ...(config.npmClientVersion ? { MEMTIER_NPM_VERSION: config.npmClientVersion } : {}),
+      },
       // Use 'inherit' for stdio to avoid piping issues with many workers
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     });
@@ -1201,10 +1312,18 @@ async function runModeMultiProcess(
 async function main(): Promise<void> {
   const config = parseConfig();
 
+  // Initialize Redis client (local or npm version)
+  initializeRedisClient(config.npmClientVersion);
+
   console.log('═══════════════════════════════════════════════════════════════════');
   console.log('  Memtier-like Benchmark for node-redis');
   console.log('═══════════════════════════════════════════════════════════════════');
   console.log(`Host: ${config.host}:${config.port}`);
+  if (config.npmClientVersion) {
+    console.log(`Client: @redis/client@${config.npmClientVersion} (npm)`);
+  } else {
+    console.log(`Client: local source (../client)`);
+  }
   console.log(`Threads (-t): ${config.threads} child processes (memtier-compatible)`);
   console.log(`Connections per thread (-c): ${config.connections}`);
   console.log(`Total connections: ${config.threads * config.connections}`);
@@ -1242,12 +1361,18 @@ async function main(): Promise<void> {
     printComparison(results);
   }
 
+  // Cleanup npm cache if used
+  cleanupNpmCache(config.npmClientVersion);
+
   console.log('\nDone.');
   process.exit(0);
 }
 
 // Entry point: detect if running as worker or main process
 if (isWorkerProcess) {
+  // Worker process: get npm version from env if set
+  const workerNpmVersion = process.env.MEMTIER_NPM_VERSION || undefined;
+  initializeRedisClient(workerNpmVersion);
   runWorker()
     .then(() => {
       process.exit(0);
