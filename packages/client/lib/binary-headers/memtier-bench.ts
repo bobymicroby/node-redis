@@ -131,21 +131,57 @@ function extractFunctionTimes(profile: inspector.Profiler.Profile): Map<string, 
 function mergeProfiles(profiles: inspector.Profiler.Profile[]): inspector.Profiler.Profile {
   if (profiles.length === 1) return profiles[0];
 
-  // Merge all samples and timeDeltas
-  const merged: inspector.Profiler.Profile = {
-    nodes: profiles[0].nodes,
-    startTime: Math.min(...profiles.map(p => p.startTime)),
-    endTime: Math.max(...profiles.map(p => p.endTime)),
-    samples: [],
-    timeDeltas: [],
-  };
+  // We can't simply concatenate samples because each profile has its own node IDs.
+  // Instead, we need to extract function times from each profile separately and then
+  // create a synthetic merged profile with unified node IDs.
 
-  for (const p of profiles) {
-    merged.samples!.push(...(p.samples || []));
-    merged.timeDeltas!.push(...(p.timeDeltas || []));
+  // First, extract and aggregate times from all profiles
+  const aggregatedTimes = new Map<string, FunctionTime>();
+
+  for (const profile of profiles) {
+    const times = extractFunctionTimes(profile);
+    for (const [key, fn] of times) {
+      const existing = aggregatedTimes.get(key);
+      if (existing) {
+        existing.selfTime += fn.selfTime;
+      } else {
+        aggregatedTimes.set(key, { ...fn });
+      }
+    }
   }
 
-  return merged;
+  // Create synthetic nodes with new unified IDs
+  const nodes: inspector.Profiler.ProfileNode[] = [];
+  const samples: number[] = [];
+  const timeDeltas: number[] = [];
+
+  let nodeId = 1;
+  for (const [, fn] of aggregatedTimes) {
+    nodes.push({
+      id: nodeId,
+      callFrame: {
+        functionName: fn.name,
+        scriptId: '0',
+        url: fn.url,
+        lineNumber: fn.line,
+        columnNumber: 0,
+      },
+      hitCount: 1,
+      children: [],
+    });
+    // Add a single sample with the total time for this function
+    samples.push(nodeId);
+    timeDeltas.push(fn.selfTime);
+    nodeId++;
+  }
+
+  return {
+    nodes,
+    startTime: Math.min(...profiles.map(p => p.startTime)),
+    endTime: Math.max(...profiles.map(p => p.endTime)),
+    samples,
+    timeDeltas,
+  };
 }
 
 function compareProfiles(
