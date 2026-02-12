@@ -35,7 +35,162 @@ import { build as buildHistogram, Histogram } from 'hdr-histogram-js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import * as inspector from 'node:inspector';
 import { createTimeoutScheduler } from './packing';
+
+// CPU Profiler - saves .cpuprofile with custom names
+let profilerSession: inspector.Session | null = null;
+let currentProfileMode: string | null = null;
+
+function startCpuProfiler(modeName: string): void {
+  profilerSession = new inspector.Session();
+  profilerSession.connect();
+  profilerSession.post('Profiler.enable');
+  profilerSession.post('Profiler.start');
+  currentProfileMode = modeName;
+}
+
+interface ProfileResult {
+  path: string;
+  profile: inspector.Profiler.Profile;
+}
+
+function stopCpuProfiler(): Promise<ProfileResult | null> {
+  return new Promise((resolve) => {
+    if (!profilerSession || !currentProfileMode) {
+      resolve(null);
+      return;
+    }
+    const modeName = currentProfileMode;
+    profilerSession.post('Profiler.stop', (err, { profile }) => {
+      if (err) {
+        console.error('Failed to stop profiler:', err);
+        resolve(null);
+        return;
+      }
+      profilerSession!.disconnect();
+      profilerSession = null;
+      currentProfileMode = null;
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const tmpDir = path.resolve(__dirname, '..', '..', 'tmp');
+      fs.mkdirSync(tmpDir, { recursive: true });
+      const filename = `memtier-${modeName}-${timestamp}.cpuprofile`;
+      const fullPath = path.join(tmpDir, filename);
+      fs.writeFileSync(fullPath, JSON.stringify(profile));
+      resolve({ path: fullPath, profile });
+    });
+  });
+}
+
+interface FunctionTime {
+  name: string;
+  url: string;
+  line: number;
+  selfTime: number;
+}
+
+function extractFunctionTimes(profile: inspector.Profiler.Profile): Map<string, FunctionTime> {
+  const result = new Map<string, FunctionTime>();
+  const samples = profile.samples || [];
+  const timeDeltas = profile.timeDeltas || [];
+  const nodeMap = new Map<number, inspector.Profiler.ProfileNode>();
+
+  for (const node of profile.nodes) {
+    nodeMap.set(node.id, node);
+  }
+
+  for (let i = 0; i < samples.length; i++) {
+    const nodeId = samples[i];
+    const delta = timeDeltas[i] || 0;
+    const node = nodeMap.get(nodeId);
+    if (!node) continue;
+
+    const cf = node.callFrame;
+    const key = `${cf.functionName || '(anonymous)'}@${cf.url}:${cf.lineNumber}`;
+
+    const existing = result.get(key);
+    if (existing) {
+      existing.selfTime += delta;
+    } else {
+      result.set(key, {
+        name: cf.functionName || '(anonymous)',
+        url: cf.url || '(native)',
+        line: cf.lineNumber,
+        selfTime: delta,
+      });
+    }
+  }
+
+  return result;
+}
+
+function compareProfiles(
+  offProfile: inspector.Profiler.Profile,
+  onProfile: inspector.Profiler.Profile
+): void {
+  const offTimes = extractFunctionTimes(offProfile);
+  const onTimes = extractFunctionTimes(onProfile);
+
+  // Calculate total active time (excluding idle)
+  let offTotal = 0;
+  let onTotal = 0;
+  for (const [key, fn] of offTimes) {
+    if (!key.includes('(idle)')) offTotal += fn.selfTime;
+  }
+  for (const [key, fn] of onTimes) {
+    if (!key.includes('(idle)')) onTotal += fn.selfTime;
+  }
+
+  // Find functions that are slower in "on" mode
+  const diffs: Array<{ key: string; fn: FunctionTime; offTime: number; onTime: number; diff: number }> = [];
+
+  for (const [key, onFn] of onTimes) {
+    if (key.includes('(idle)') || key.includes('(garbage collector)')) continue;
+    const offFn = offTimes.get(key);
+    const offTime = offFn?.selfTime || 0;
+    const diff = onFn.selfTime - offTime;
+    if (diff > 0) {
+      diffs.push({ key, fn: onFn, offTime, onTime: onFn.selfTime, diff });
+    }
+  }
+
+  // Sort by diff descending
+  diffs.sort((a, b) => b.diff - a.diff);
+
+  console.log('\n' + '═'.repeat(100));
+  console.log('  PROFILE COMPARISON: Where fast-headers-on spends MORE time than fast-headers-off');
+  console.log('═'.repeat(100));
+  console.log(
+    'Diff (μs)'.padStart(12) +
+    'ON (μs)'.padStart(12) +
+    'OFF (μs)'.padStart(12) +
+    '  Function'.padEnd(35) +
+    '  Location'
+  );
+  console.log('-'.repeat(100));
+
+  const top = diffs.slice(0, 25);
+  for (const { fn, offTime, onTime, diff } of top) {
+    const shortUrl = fn.url
+      .replace(/.*node_modules\//, '')
+      .replace(/.*dist\//, '')
+      .replace(/.*lib\//, '');
+    const location = `${shortUrl}:${fn.line}`;
+
+    console.log(
+      `+${(diff / 1000).toFixed(1)}ms`.padStart(12) +
+      (onTime / 1000).toFixed(1).padStart(11) + 'ms' +
+      (offTime / 1000).toFixed(1).padStart(11) + 'ms' +
+      ('  ' + fn.name).slice(0, 35).padEnd(35) +
+      '  ' + location.slice(0, 40)
+    );
+  }
+
+  console.log('-'.repeat(100));
+  console.log(`Total active time: OFF=${(offTotal / 1000).toFixed(1)}ms, ON=${(onTotal / 1000).toFixed(1)}ms, diff=+${((onTotal - offTotal) / 1000).toFixed(1)}ms`);
+  console.log('═'.repeat(100));
+}
 
 // Dynamic client import - will be set at runtime based on --npm-client-version
 let RedisClient: any;
@@ -213,7 +368,12 @@ const isWorkerProcess = process.env.MEMTIER_WORKER === '1';
 
 type ModeName = 'fast-headers-off' | 'fast-headers-on';
 
+// Store profiles for comparison
+const collectedProfiles = new Map<string, inspector.Profiler.Profile>();
+const collectedProfilePaths: string[] = [];
+
 interface BenchConfig {
+  profile: boolean;
   host: string;
   port: number;
   threads: number;
@@ -261,6 +421,7 @@ function parseConfig(): BenchConfig {
       mode: { type: 'string', default: 'all' },
       interval: { type: 'string', default: '1' },
       'hide-histogram': { type: 'boolean', default: false },
+      'profile': { type: 'boolean', default: false },
       username: { type: 'string', short: 'u' },
       password: { type: 'string', short: 'a' },
       'npm-client-version': { type: 'string' },
@@ -278,6 +439,7 @@ function parseConfig(): BenchConfig {
   const ratioGet = parseInt(ratioGetStr, 10);
 
   const config: BenchConfig = {
+    profile: values.profile as boolean,
     host: values.host as string,
     port: parseInt(values.port as string, 10),
     threads: parseInt(values.threads as string, 10),
@@ -1075,6 +1237,11 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
   const { workerId, mode, config } = workerConfig;
   const binaryHeaders = mode === 'fast-headers-on';
 
+  // Start profiler for this worker if enabled
+  if (config.profile) {
+    startCpuProfiler(`${mode}-worker${workerId}`);
+  }
+
   // Create connections for this worker
   const clients: BenchClient[] = [];
   try {
@@ -1205,6 +1372,14 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
     binaryHeaderStats: binaryHeaderStatsData,
   };
   process.send!(finalMsg);
+
+  // Stop profiler and save profile
+  if (config.profile) {
+    const result = await stopCpuProfiler();
+    if (result) {
+      console.log(`[Worker ${workerId}] CPU profile: file://${result.path}`);
+    }
+  }
 
   // Cleanup
   for (const client of clients) {
@@ -1557,15 +1732,44 @@ async function main(): Promise<void> {
   const results: ModeResult[] = [];
 
   for (const mode of modes) {
+    if (config.profile) {
+      startCpuProfiler(mode);
+    }
+
     // Use multi-process mode if threads > 1, otherwise single-process
     const result = config.threads > 1
       ? await runModeMultiProcess(mode, config)
       : await runMode(mode, config);
     if (result) results.push(result);
+
+    if (config.profile) {
+      const result = await stopCpuProfiler();
+      if (result) {
+        collectedProfiles.set(mode, result.profile);
+        collectedProfilePaths.push(result.path);
+      }
+    }
   }
 
   if (results.length > 1) {
     printComparison(results);
+  }
+
+  // Compare profiles if we have both modes
+  if (config.profile && collectedProfiles.has('fast-headers-off') && collectedProfiles.has('fast-headers-on')) {
+    compareProfiles(
+      collectedProfiles.get('fast-headers-off')!,
+      collectedProfiles.get('fast-headers-on')!
+    );
+  }
+
+  // Clean up profile files
+  for (const profilePath of collectedProfilePaths) {
+    try {
+      fs.unlinkSync(profilePath);
+    } catch {
+      // ignore
+    }
   }
 
   // Cleanup npm cache if used

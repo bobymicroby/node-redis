@@ -9,7 +9,7 @@ import { BinaryHeadersInterceptor } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 
 import type { BinaryHeaderStatsCounter, BinaryHeaderStats } from './stats';
-import { FlushReason, DefaultBinaryHeaderStatsCounter } from './stats';
+import { DefaultBinaryHeaderStatsCounter } from './stats';
 import type { EligibilityResolver } from './eligibility';
 import type { Scheduler } from './packing';
 import { createTimeoutScheduler } from './packing';
