@@ -609,11 +609,27 @@ export default class RedisCommandsQueue {
     const outbound = this.#outbound;
     let toSend = this.#toWrite.shift();
     let explicitPipeline = false;
+    let currentChainId: symbol | undefined = undefined;
     while (toSend) {
       // Track if we're processing an explicit pipeline (all commands share same chainId)
       if (toSend.chainId !== undefined) {
         explicitPipeline = true;
       }
+
+      // Flush on chainId boundary: when transitioning between different chains
+      // or from a chain to no-chain (auto-pipelining). This ensures each explicit
+      // pipeline's commands are batched together without relying on slot mismatch.
+      if (outbound !== null && outbound.hasPending()) {
+        const chainChanged = currentChainId !== undefined && toSend.chainId !== currentChainId;
+        if (chainChanged) {
+          this.#cancelPendingFlush();
+          const drained = outbound.flush(FlushReason.DRAIN);
+          if (drained !== null) {
+            yield drained;
+          }
+        }
+      }
+      currentChainId = toSend.chainId;
       const args = toSend.args;
       let encoded: ReadonlyArray<RedisArgument>
       try {
