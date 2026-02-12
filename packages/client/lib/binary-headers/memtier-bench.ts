@@ -225,7 +225,8 @@ function mergeProfiles(profiles: inspector.Profiler.Profile[]): inspector.Profil
 
 function compareProfiles(
   offProfile: inspector.Profiler.Profile,
-  onProfile: inspector.Profiler.Profile
+  onProfile: inspector.Profiler.Profile,
+  npmClientVersion?: string
 ): void {
   const offTimes = extractFunctionTimes(offProfile);
   const onTimes = extractFunctionTimes(onProfile);
@@ -240,35 +241,59 @@ function compareProfiles(
     if (!key.includes('(idle)')) onTotal += fn.selfTime;
   }
 
-  // Find functions that are slower in "on" mode
-  const diffs: Array<{ key: string; fn: FunctionTime; offTime: number; onTime: number; diff: number }> = [];
+  // Collect all functions from both profiles
+  const allKeys = new Set<string>();
+  for (const key of onTimes.keys()) allKeys.add(key);
+  for (const key of offTimes.keys()) allKeys.add(key);
 
-  for (const [key, onFn] of onTimes) {
+  // Build diffs for all functions
+  const diffs: Array<{
+    fn: FunctionTime;
+    offTime: number | null;
+    onTime: number | null;
+    diff: number;
+  }> = [];
+
+  for (const key of allKeys) {
     if (key.includes('(idle)') || key.includes('(garbage collector)')) continue;
+
+    const onFn = onTimes.get(key);
     const offFn = offTimes.get(key);
-    const offTime = offFn?.selfTime || 0;
-    const diff = onFn.selfTime - offTime;
-    if (diff > 0) {
-      diffs.push({ key, fn: onFn, offTime, onTime: onFn.selfTime, diff });
-    }
+
+    const onTime = onFn?.selfTime ?? null;
+    const offTime = offFn?.selfTime ?? null;
+
+    // Calculate diff (treat null as 0 for calculation)
+    const diff = (onTime ?? 0) - (offTime ?? 0);
+
+    // Skip negligible diffs
+    if (Math.abs(diff) < 100) continue; // Less than 0.1ms
+
+    const fn = onFn || offFn!;
+    diffs.push({ fn, offTime, onTime, diff });
   }
 
-  // Sort by diff descending
-  diffs.sort((a, b) => b.diff - a.diff);
+  // Sort by absolute diff descending
+  diffs.sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+
+  // Labels
+  const offLabel = npmClientVersion ? `baseline (npm ${npmClientVersion})` : 'binary headers OFF';
+  const onLabel = npmClientVersion ? 'binary headers (dev)' : 'binary headers ON';
 
   console.log('\n' + '═'.repeat(100));
-  console.log('  PROFILE COMPARISON: Where fast-headers-on spends MORE time than fast-headers-off');
+  console.log('  PROFILE COMPARISON');
+  console.log(`  OFF: ${offLabel}  |  ON: ${onLabel}`);
   console.log('═'.repeat(100));
   console.log(
-    'Diff (μs)'.padStart(12) +
-    'ON (μs)'.padStart(12) +
-    'OFF (μs)'.padStart(12) +
+    'Diff'.padStart(12) +
+    'ON'.padStart(12) +
+    'OFF'.padStart(12) +
     '  Function'.padEnd(35) +
     '  Location'
   );
   console.log('-'.repeat(100));
 
-  const top = diffs.slice(0, 25);
+  const top = diffs.slice(0, 30);
   for (const { fn, offTime, onTime, diff } of top) {
     const shortUrl = fn.url
       .replace(/.*node_modules\//, '')
@@ -276,19 +301,42 @@ function compareProfiles(
       .replace(/.*lib\//, '');
     const location = `${shortUrl}:${fn.line}`;
 
+    // Format diff with sign
+    const diffSign = diff >= 0 ? '+' : '';
+    const diffStr = `${diffSign}${(diff / 1000).toFixed(1)}ms`.padStart(12);
+
+    // Format ON time
+    const onStr = ((onTime ?? 0) / 1000).toFixed(1).padStart(9) + 'ms';
+
+    // Format OFF time
+    const offStr = ((offTime ?? 0) / 1000).toFixed(1).padStart(9) + 'ms';
+
     console.log(
-      `+${(diff / 1000).toFixed(1)}ms`.padStart(12) +
-      (onTime / 1000).toFixed(1).padStart(11) + 'ms' +
-      (offTime / 1000).toFixed(1).padStart(11) + 'ms' +
+      diffStr +
+      onStr +
+      offStr +
       ('  ' + fn.name).slice(0, 35).padEnd(35) +
       '  ' + location.slice(0, 40)
     );
   }
 
+  if (diffs.length > 30) {
+    console.log(`  ... and ${diffs.length - 30} more functions with smaller differences`);
+  }
+
+  // Summary
   console.log('-'.repeat(100));
+  console.log('CPU Time Summary:');
+  console.log(`  ${offLabel}:`.padEnd(35) + `${(offTotal / 1000).toFixed(1)}ms`);
+  console.log(`  ${onLabel}:`.padEnd(35) + `${(onTotal / 1000).toFixed(1)}ms`);
+
   const totalDiff = (onTotal - offTotal) / 1000;
   const diffSign = totalDiff >= 0 ? '+' : '';
-  console.log(`Total active time: OFF=${(offTotal / 1000).toFixed(1)}ms, ON=${(onTotal / 1000).toFixed(1)}ms, diff=${diffSign}${totalDiff.toFixed(1)}ms`);
+  const pctDiff = offTotal > 0 ? ((onTotal - offTotal) / offTotal * 100) : 0;
+  const pctSign = pctDiff >= 0 ? '+' : '';
+
+  console.log('  ' + '─'.repeat(50));
+  console.log(`  Difference:`.padEnd(35) + `${diffSign}${totalDiff.toFixed(1)}ms (${pctSign}${pctDiff.toFixed(1)}%)`);
   console.log('═'.repeat(100));
 }
 
@@ -1903,7 +1951,7 @@ async function main(): Promise<void> {
     }
 
     if (offProfile && onProfile) {
-      compareProfiles(offProfile, onProfile);
+      compareProfiles(offProfile, onProfile, config.npmClientVersion);
     }
   }
 
