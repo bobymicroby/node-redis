@@ -55,7 +55,7 @@ interface ProfileResult {
   profile: inspector.Profiler.Profile;
 }
 
-function stopCpuProfiler(): Promise<ProfileResult | null> {
+function stopCpuProfiler(saveToFile: boolean = true): Promise<ProfileResult | null> {
   return new Promise((resolve) => {
     if (!profilerSession || !currentProfileMode) {
       resolve(null);
@@ -72,12 +72,15 @@ function stopCpuProfiler(): Promise<ProfileResult | null> {
       profilerSession = null;
       currentProfileMode = null;
 
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      const tmpDir = path.resolve(__dirname, '..', '..', 'tmp');
-      fs.mkdirSync(tmpDir, { recursive: true });
-      const filename = `memtier-${modeName}-${timestamp}.cpuprofile`;
-      const fullPath = path.join(tmpDir, filename);
-      fs.writeFileSync(fullPath, JSON.stringify(profile));
+      let fullPath = '';
+      if (saveToFile) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const tmpDir = path.resolve(__dirname, '..', '..', 'tmp');
+        fs.mkdirSync(tmpDir, { recursive: true });
+        const filename = `memtier-${modeName}-${timestamp}.cpuprofile`;
+        fullPath = path.join(tmpDir, filename);
+        fs.writeFileSync(fullPath, JSON.stringify(profile));
+      }
       resolve({ path: fullPath, profile });
     });
   });
@@ -123,6 +126,26 @@ function extractFunctionTimes(profile: inspector.Profiler.Profile): Map<string, 
   }
 
   return result;
+}
+
+function mergeProfiles(profiles: inspector.Profiler.Profile[]): inspector.Profiler.Profile {
+  if (profiles.length === 1) return profiles[0];
+
+  // Merge all samples and timeDeltas
+  const merged: inspector.Profiler.Profile = {
+    nodes: profiles[0].nodes,
+    startTime: Math.min(...profiles.map(p => p.startTime)),
+    endTime: Math.max(...profiles.map(p => p.endTime)),
+    samples: [],
+    timeDeltas: [],
+  };
+
+  for (const p of profiles) {
+    merged.samples!.push(...(p.samples || []));
+    merged.timeDeltas!.push(...(p.timeDeltas || []));
+  }
+
+  return merged;
 }
 
 function compareProfiles(
@@ -335,6 +358,7 @@ interface FinalStatsMessage {
   get: { count: number; p50: number; p95: number; p99: number; p999: number };
   totalErrors: number;
   binaryHeaderStats?: BinaryHeaderStatsData;
+  profileData?: string; // JSON-serialized inspector.Profiler.Profile
 }
 
 interface WorkerReadyMessage {
@@ -358,6 +382,9 @@ interface StopMessage {
 
 type ParentToWorkerMessage = WorkerConfig | StartMessage | StopMessage;
 type WorkerToParentMessage = WorkerReadyMessage | IntervalStatsMessage | FinalStatsMessage | WorkerErrorMessage;
+
+// Store worker profiles for aggregation
+const workerProfiles = new Map<string, inspector.Profiler.Profile[]>();
 
 // Check if running as a worker process
 const isWorkerProcess = process.env.MEMTIER_WORKER === '1';
@@ -1239,7 +1266,7 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
 
   // Start profiler for this worker if enabled
   if (config.profile) {
-    startCpuProfiler(`${mode}-worker${workerId}`);
+    startCpuProfiler(mode);
   }
 
   // Create connections for this worker
@@ -1350,6 +1377,15 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
     }
   }
 
+  // Stop profiler and include profile data in final message
+  let profileData: string | undefined;
+  if (config.profile) {
+    const result = await stopCpuProfiler(false); // Don't save to file, send to parent
+    if (result) {
+      profileData = JSON.stringify(result.profile);
+    }
+  }
+
   const finalMsg: FinalStatsMessage = {
     type: 'final-stats',
     workerId,
@@ -1370,16 +1406,9 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
     },
     totalErrors: summary.totalErrors,
     binaryHeaderStats: binaryHeaderStatsData,
+    profileData,
   };
   process.send!(finalMsg);
-
-  // Stop profiler and save profile
-  if (config.profile) {
-    const result = await stopCpuProfiler();
-    if (result) {
-      console.log(`[Worker ${workerId}] CPU profile: file://${result.path}`);
-    }
-  }
 
   // Cleanup
   for (const client of clients) {
@@ -1561,6 +1590,12 @@ async function runModeMultiProcess(
         }
       } else if (msg.type === 'final-stats') {
         finalStats.set(msg.workerId, msg);
+        // Collect profile data from workers
+        if (msg.profileData) {
+          const profiles = workerProfiles.get(mode) || [];
+          profiles.push(JSON.parse(msg.profileData));
+          workerProfiles.set(mode, profiles);
+        }
       } else if (msg.type === 'error') {
         console.error(`Worker ${msg.workerId} error: ${msg.message}`);
       }
@@ -1755,12 +1790,27 @@ async function main(): Promise<void> {
     printComparison(results);
   }
 
-  // Compare profiles if we have both modes
-  if (config.profile && collectedProfiles.has('fast-headers-off') && collectedProfiles.has('fast-headers-on')) {
-    compareProfiles(
-      collectedProfiles.get('fast-headers-off')!,
-      collectedProfiles.get('fast-headers-on')!
-    );
+  // Compare profiles if we have both modes (use worker profiles if available, otherwise main process)
+  if (config.profile) {
+    let offProfile: inspector.Profiler.Profile | undefined;
+    let onProfile: inspector.Profiler.Profile | undefined;
+
+    // Prefer worker profiles (multi-process mode)
+    if (workerProfiles.has('fast-headers-off') && workerProfiles.get('fast-headers-off')!.length > 0) {
+      offProfile = mergeProfiles(workerProfiles.get('fast-headers-off')!);
+    } else if (collectedProfiles.has('fast-headers-off')) {
+      offProfile = collectedProfiles.get('fast-headers-off');
+    }
+
+    if (workerProfiles.has('fast-headers-on') && workerProfiles.get('fast-headers-on')!.length > 0) {
+      onProfile = mergeProfiles(workerProfiles.get('fast-headers-on')!);
+    } else if (collectedProfiles.has('fast-headers-on')) {
+      onProfile = collectedProfiles.get('fast-headers-on');
+    }
+
+    if (offProfile && onProfile) {
+      compareProfiles(offProfile, onProfile);
+    }
   }
 
   // Clean up profile files
