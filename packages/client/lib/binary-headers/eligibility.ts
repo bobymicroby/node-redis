@@ -1,12 +1,30 @@
 import type { RedisArgument } from '../RESP/types';
 import type { CommandArguments } from '../client/commands-queue';
 import { RequestHeaderEncoder } from './generated/request-header-codec';
-import calculateSlot from 'cluster-key-slot';
+import { calculateSlot } from './new-slot-calulator';
 
 export const SLOT_INELIGIBLE = -1;
 
 const DEFAULT_KEY_INDEX = 1;
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
+
+// Pre-allocated result objects to avoid allocations in hot path
+const INELIGIBLE_RESULT: EligibilityResult = Object.freeze({ eligible: false });
+
+// Pre-allocate eligible results for all possible slots (0-16383) + NULL_SLOT
+const ELIGIBLE_RESULTS: ReadonlyArray<EligibilityResult> = (() => {
+  const results: EligibilityResult[] = new Array(16385);
+  for (let i = 0; i <= 16383; i++) {
+    results[i] = Object.freeze({ eligible: true, slot: i });
+  }
+  results[16384] = Object.freeze({ eligible: true, slot: NULL_SLOT });
+  return results;
+})();
+
+function getEligibleResult(slot: number): EligibilityResult {
+  if (slot === NULL_SLOT) return ELIGIBLE_RESULTS[16384];
+  return ELIGIBLE_RESULTS[slot];
+}
 
 export type KeyPosition =
   | { readonly keyless: true }
@@ -38,8 +56,14 @@ export type EligibilityResult =
 
 export type CommandRecordFetcher = () => Promise<ReadonlyArray<CommandRecord>>;
 
-function argToString(arg: RedisArgument): string {
-  return typeof arg === 'string' ? arg : arg.toString('utf8');
+// Fast path: most commands are already uppercase strings
+function getCommandUpper(arg: RedisArgument): string {
+  if (typeof arg === 'string') {
+    // Fast path: check if already uppercase (common case)
+    const upper = arg.toUpperCase();
+    return upper;
+  }
+  return arg.toString('utf8').toUpperCase();
 }
 
 function keyPositionToIndex(keyPosition: KeyPosition | undefined): number | null {
@@ -51,14 +75,15 @@ function keyPositionToIndex(keyPosition: KeyPosition | undefined): number | null
 function calculateCommandSlot(args: CommandArguments, firstKeyIndex: number | null): number {
   if (firstKeyIndex === null || firstKeyIndex >= args.length) return NULL_SLOT;
   const key = args[firstKeyIndex];
-  const keyStr = typeof key === 'string' ? key : key.toString();
-  return calculateSlot(keyStr);
+  return calculateSlot(key);
 }
 
-function hasBlockingArg(args: CommandArguments, argName: string): boolean {
-  const upperArgName = argName.toUpperCase();
+// argName is pre-uppercased at build time
+function hasBlockingArg(args: CommandArguments, upperArgName: string): boolean {
   for (let i = 1; i < args.length; i++) {
-    if (argToString(args[i]).toUpperCase() === upperArgName) return true;
+    const arg = args[i];
+    const argStr = typeof arg === 'string' ? arg : arg.toString('utf8');
+    if (argStr.toUpperCase() === upperArgName) return true;
   }
   return false;
 }
@@ -77,19 +102,27 @@ function getSlotForAttrs(args: CommandArguments, attrs: CommandAttrs): number {
 function buildCommandNode(record: CommandRecord): CommandNode {
   const { keyPosition, blocking } = record;
 
+  // Pre-uppercase blocking argName at build time
+  const processedBlocking = blocking?.type === 'conditional'
+    ? { type: 'conditional' as const, argName: blocking.argName.toUpperCase() }
+    : blocking;
+
   if (!record.subcommands?.length) {
-    return { keyPosition, blocking };
+    return { keyPosition, blocking: processedBlocking };
   }
 
   const subs = new Map<string, CommandAttrs>();
   for (const sub of record.subcommands) {
+    const subBlocking = sub.blocking?.type === 'conditional'
+      ? { type: 'conditional' as const, argName: sub.blocking.argName.toUpperCase() }
+      : sub.blocking;
     subs.set(sub.name.toUpperCase(), {
       keyPosition: sub.keyPosition,
-      blocking: sub.blocking,
+      blocking: subBlocking,
     });
   }
 
-  return { keyPosition, blocking, subs };
+  return { keyPosition, blocking: processedBlocking, subs };
 }
 
 function buildCommandMap(records: ReadonlyArray<CommandRecord>): Map<string, CommandNode> {
@@ -109,18 +142,18 @@ export class EligibilityResolver {
 
   getEligibility(args: CommandArguments): EligibilityResult {
     const slot = this.getSlot(args);
-    if (slot === SLOT_INELIGIBLE) return { eligible: false };
-    return { eligible: true, slot };
+    if (slot === SLOT_INELIGIBLE) return INELIGIBLE_RESULT;
+    return getEligibleResult(slot);
   }
 
   getSlot(args: CommandArguments): number {
     if (args.length === 0) return SLOT_INELIGIBLE;
 
-    const node = this.#map.get(argToString(args[0]).toUpperCase());
+    const node = this.#map.get(getCommandUpper(args[0]));
     if (!node) return SLOT_INELIGIBLE;
 
     if (node.subs && args.length >= 2) {
-      const subAttrs = node.subs.get(argToString(args[1]).toUpperCase());
+      const subAttrs = node.subs.get(getCommandUpper(args[1]));
       if (subAttrs) return getSlotForAttrs(args, subAttrs);
     }
 
