@@ -2436,3 +2436,528 @@ describe('Partial Generator Consumption', function () {
     assert.equal(stats.slotMismatchFlushCount, 2);
   });
 });
+
+// ============================================================================
+// Explicit Pipeline Behavior (chainId detection)
+// ============================================================================
+
+describe('Explicit Pipeline Behavior (chainId)', function () {
+  /**
+   * These tests verify the optimization for explicit pipelines (execAsPipeline).
+   * When commands have a chainId set, they are part of an explicit pipeline
+   * and should flush immediately without waiting for timer.
+   */
+
+  describe('explicit pipeline detection via chainId', function () {
+    it('commands with chainId flush immediately even with scheduler', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // Add commands with chainId (simulating execAsPipeline)
+      // Use same-slot keys (hash tag format) to ensure batching
+      queue.addCommand(['SET', '{slot}key1', 'value1'], { chainId });
+      queue.addCommand(['SET', '{slot}key2', 'value2'], { chainId });
+
+      const results = collectYielded(queue);
+
+      // Should yield immediately (not wait for timer)
+      assert.equal(results.length, 1, 'Should yield 1 batch immediately');
+      assertPackedData(results[0], {
+        commandCount: 2,
+        commands: [['SET', '{slot}key1', 'value1'], ['SET', '{slot}key2', 'value2']]
+      });
+
+      // Timer should NOT have been scheduled for explicit pipeline
+      assert.equal(schedulerStats.scheduleCount, 0, 'Timer should not be scheduled for explicit pipeline');
+
+      queue.destroy();
+    });
+
+    it('commands without chainId wait for timer (auto-pipelining)', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      // Add commands without chainId (auto-pipelining)
+      // Use same-slot keys to ensure they batch together
+      queue.addCommand(['SET', '{slot}key1', 'value1']);
+      queue.addCommand(['SET', '{slot}key2', 'value2']);
+
+      const results = collectYielded(queue);
+
+      // Should NOT yield (timer handles it)
+      assert.equal(results.length, 0, 'Should not yield - timer handles it');
+
+      // Timer should have been scheduled
+      assert.equal(schedulerStats.scheduleCount, 1, 'Timer should be scheduled for auto-pipelining');
+
+      // Commands should be pending
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'Commands should be pending');
+
+      queue.destroy();
+    });
+
+    it('mixed chainId and non-chainId commands: chainId commands flush, others wait', async function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 50, scheduler }
+      });
+
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((data) => flushedData.push(data));
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // First: auto-pipelining command (no chainId)
+      // Use different slot than explicit pipeline to avoid slot mismatch flush
+      queue.addCommand(['SET', '{auto}key1', 'value1']);
+      collectYielded(queue); // Process - should buffer for timer
+
+      // Second: explicit pipeline commands (with chainId)
+      // Use same slot within explicit pipeline, but different from auto command
+      queue.addCommand(['SET', '{explicit}key1', 'value1'], { chainId });
+      queue.addCommand(['SET', '{explicit}key2', 'value2'], { chainId });
+      const results = collectYielded(queue);
+
+      // Explicit pipeline should flush immediately (2 outputs: auto flushed by slot change + explicit batch)
+      // Note: The auto command gets flushed when explicit commands with different slot arrive
+      assert.equal(results.length, 2, 'Should yield 2 batches (auto flushed by slot change, then explicit)');
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', '{auto}key1', 'value1']]
+      });
+      assertPackedData(results[1], {
+        commandCount: 2,
+        commands: [['SET', '{explicit}key1', 'value1'], ['SET', '{explicit}key2', 'value2']]
+      });
+
+      // Nothing should be pending after explicit pipeline
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), false, 'Nothing should be pending');
+
+      queue.destroy();
+    });
+
+    it('same-slot auto and explicit commands: auto waits, explicit flushes all', async function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 50, scheduler }
+      });
+
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((data) => flushedData.push(data));
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // First: auto-pipelining command (no chainId)
+      queue.addCommand(['SET', '{same}auto1', 'value1']);
+      collectYielded(queue); // Process - should buffer for timer
+
+      // Second: explicit pipeline commands (with chainId) - SAME SLOT
+      queue.addCommand(['SET', '{same}explicit1', 'value1'], { chainId });
+      queue.addCommand(['SET', '{same}explicit2', 'value2'], { chainId });
+      const results = collectYielded(queue);
+
+      // Explicit pipeline has chainId, so everything flushes (including the buffered auto command)
+      assert.equal(results.length, 1, 'All same-slot commands should flush together');
+      assertPackedData(results[0], {
+        commandCount: 3,
+        commands: [
+          ['SET', '{same}auto1', 'value1'],
+          ['SET', '{same}explicit1', 'value1'],
+          ['SET', '{same}explicit2', 'value2']
+        ]
+      });
+
+      // Nothing pending
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), false, 'Nothing should be pending');
+
+      // Timer was scheduled for auto command, but cancelled when explicit pipeline flushed
+      assert.equal(schedulerStats.cancelCount, 1, 'Timer should have been cancelled');
+
+      queue.destroy();
+    });
+  });
+
+  describe('explicit pipeline with slot changes', function () {
+    it('slot change mid-pipeline flushes first batch, rest flushes at end', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // Commands with different slots
+      queue.addCommand(['SET', '{slot1}key1', 'value1'], { chainId });
+      queue.addCommand(['SET', '{slot2}key2', 'value2'], { chainId }); // Triggers flush of slot1
+      queue.addCommand(['SET', '{slot2}key3', 'value3'], { chainId });
+
+      const results = collectYielded(queue);
+
+      // Should yield 2 batches: slot1 flushed by slot change, slot2 flushed at end
+      assert.equal(results.length, 2, 'Should yield 2 batches');
+
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', '{slot1}key1', 'value1']]
+      });
+      assertPackedData(results[1], {
+        commandCount: 2,
+        commands: [['SET', '{slot2}key2', 'value2'], ['SET', '{slot2}key3', 'value3']]
+      });
+
+      // No timer should be scheduled for explicit pipeline
+      assert.equal(schedulerStats.scheduleCount, 0, 'Timer should not be scheduled');
+
+      // Nothing pending
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), false, 'Nothing should be pending');
+
+      queue.destroy();
+    });
+
+    it('multiple slot changes in explicit pipeline all flush without timer', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // Alternating slots: A, B, C
+      queue.addCommand(['SET', '{a}k1', 'v1'], { chainId });
+      queue.addCommand(['SET', '{b}k2', 'v2'], { chainId }); // Flush A
+      queue.addCommand(['SET', '{c}k3', 'v3'], { chainId }); // Flush B
+
+      const results = collectYielded(queue);
+
+      // Should yield 3 batches
+      assert.equal(results.length, 3, 'Should yield 3 batches');
+      assertPackedData(results[0], { commandCount: 1, commands: [['SET', '{a}k1', 'v1']] });
+      assertPackedData(results[1], { commandCount: 1, commands: [['SET', '{b}k2', 'v2']] });
+      assertPackedData(results[2], { commandCount: 1, commands: [['SET', '{c}k3', 'v3']] });
+
+      // No timer scheduled
+      assert.equal(schedulerStats.scheduleCount, 0, 'No timer for explicit pipeline');
+
+      queue.destroy();
+    });
+  });
+
+  describe('explicit pipeline edge cases', function () {
+    it('single command with chainId flushes immediately', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      queue.addCommand(['PING'], { chainId });
+
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 1, 'Single command should flush');
+      assertPackedData(results[0], { commandCount: 1, commands: [['PING']] });
+      assert.equal(schedulerStats.scheduleCount, 0, 'No timer for explicit pipeline');
+
+      queue.destroy();
+    });
+
+    it('empty explicit pipeline yields nothing', function () {
+      const { scheduler } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      // No commands added
+      const results = collectYielded(queue);
+
+      assert.equal(results.length, 0, 'Empty pipeline yields nothing');
+
+      queue.destroy();
+    });
+
+    it('different chainIds are still treated as explicit pipelines', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId1 = Symbol('Pipeline 1');
+      const chainId2 = Symbol('Pipeline 2');
+
+      // Two separate explicit pipelines - use same slot
+      queue.addCommand(['SET', '{slot}k1', 'v1'], { chainId: chainId1 });
+      queue.addCommand(['SET', '{slot}k2', 'v2'], { chainId: chainId2 });
+
+      const results = collectYielded(queue);
+
+      // Both should flush (both have chainId, so explicitPipeline = true)
+      assert.equal(results.length, 1, 'All commands with any chainId should flush');
+      assertPackedData(results[0], {
+        commandCount: 2,
+        commands: [['SET', '{slot}k1', 'v1'], ['SET', '{slot}k2', 'v2']]
+      });
+
+      assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
+
+      queue.destroy();
+    });
+
+    it('ineligible command in explicit pipeline still passes through', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      queue.addCommand(['SET', 'k1', 'v1'], { chainId });
+      queue.addCommand(['UNKNOWNCMD', 'arg'], { chainId }); // Ineligible - triggers flush
+      queue.addCommand(['SET', 'k2', 'v2'], { chainId });
+
+      const results = collectYielded(queue);
+
+      // Should yield 3: batch1, ineligible passthrough, batch2
+      assert.equal(results.length, 3, 'Should yield 3 outputs');
+
+      assertPackedData(results[0], { commandCount: 1, commands: [['SET', 'k1', 'v1']] });
+
+      // Ineligible passes through as raw RESP
+      const parsedIneligible = parseRespCommands((results[1] as string[]).join(''));
+      assert.deepEqual(parsedIneligible, [['UNKNOWNCMD', 'arg']]);
+
+      assertPackedData(results[2], { commandCount: 1, commands: [['SET', 'k2', 'v2']] });
+
+      assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
+
+      queue.destroy();
+    });
+  });
+
+  describe('explicit pipeline stats', function () {
+    it('stats correctly track explicit pipeline flushes as DRAIN', function () {
+      const queue = createBinhdrQueueWithTimerAndStats({
+        timer: { maxWaitMs: 100, scheduler: createTimeoutScheduler() }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // Use same-slot keys
+      queue.addCommand(['SET', '{slot}k1', 'v1'], { chainId });
+      queue.addCommand(['SET', '{slot}k2', 'v2'], { chainId });
+      queue.addCommand(['SET', '{slot}k3', 'v3'], { chainId });
+
+      collectYielded(queue);
+
+      const stats = queue.getStats();
+
+      assert.equal(stats.totalCommandCount, 3, 'totalCommandCount');
+      assert.equal(stats.batchedCommandCount, 3, 'batchedCommandCount');
+      assert.equal(stats.batchCount, 1, 'batchCount');
+      assert.equal(stats.drainFlushCount, 1, 'drainFlushCount - explicit pipeline uses DRAIN');
+      assert.equal(stats.timerFlushCount, 0, 'timerFlushCount - no timer used');
+
+      queue.destroy();
+    });
+
+    it('slot change in explicit pipeline records SLOT_MISMATCH then DRAIN', function () {
+      const queue = createBinhdrQueueWithTimerAndStats({
+        timer: { maxWaitMs: 100, scheduler: createTimeoutScheduler() }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      queue.addCommand(['SET', '{a}k1', 'v1'], { chainId });
+      queue.addCommand(['SET', '{b}k2', 'v2'], { chainId }); // Slot change
+
+      collectYielded(queue);
+
+      const stats = queue.getStats();
+
+      assert.equal(stats.totalCommandCount, 2, 'totalCommandCount');
+      assert.equal(stats.batchCount, 2, 'batchCount');
+      assert.equal(stats.slotMismatchFlushCount, 1, 'slotMismatchFlushCount');
+      assert.equal(stats.drainFlushCount, 1, 'drainFlushCount');
+      assert.equal(stats.timerFlushCount, 0, 'timerFlushCount');
+
+      queue.destroy();
+    });
+  });
+
+  describe('timer creation verification', function () {
+    it('explicit pipeline: scheduler.schedule is never called', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // Add multiple commands with chainId
+      queue.addCommand(['SET', '{slot}k1', 'v1'], { chainId });
+      queue.addCommand(['SET', '{slot}k2', 'v2'], { chainId });
+      queue.addCommand(['SET', '{slot}k3', 'v3'], { chainId });
+
+      collectYielded(queue);
+
+      // Verify no timer was ever scheduled
+      assert.equal(schedulerStats.scheduleCount, 0, 'scheduler.schedule should never be called');
+      assert.equal(schedulerStats.cancelCount, 0, 'scheduler.cancel should never be called');
+      assert.equal(schedulerStats.lastDelayMs, null, 'no delay should be recorded');
+
+      queue.destroy();
+    });
+
+    it('auto-pipelining: scheduler.schedule IS called', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      // Add commands without chainId (auto-pipelining)
+      queue.addCommand(['SET', '{slot}k1', 'v1']);
+      queue.addCommand(['SET', '{slot}k2', 'v2']);
+
+      collectYielded(queue);
+
+      // Verify timer WAS scheduled for auto-pipelining
+      assert.equal(schedulerStats.scheduleCount, 1, 'scheduler.schedule should be called once');
+      assert.equal(schedulerStats.lastDelayMs, 100, 'delay should match maxWaitMs');
+
+      queue.destroy();
+    });
+
+    it('explicit pipeline with slot changes: no timer scheduled between flushes', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // Multiple slot changes
+      queue.addCommand(['SET', '{a}k1', 'v1'], { chainId });
+      queue.addCommand(['SET', '{b}k2', 'v2'], { chainId }); // Slot change
+      queue.addCommand(['SET', '{c}k3', 'v3'], { chainId }); // Slot change
+      queue.addCommand(['SET', '{c}k4', 'v4'], { chainId }); // Same slot
+
+      collectYielded(queue);
+
+      // Even with slot changes, no timer should be scheduled for explicit pipeline
+      assert.equal(schedulerStats.scheduleCount, 0, 'no timer scheduled despite slot changes');
+      assert.equal(schedulerStats.cancelCount, 0, 'no timer to cancel');
+
+      queue.destroy();
+    });
+
+    it('auto-pipelining with slot changes: timer scheduled for remaining', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      // No chainId - auto-pipelining
+      queue.addCommand(['SET', '{a}k1', 'v1']);
+      queue.addCommand(['SET', '{b}k2', 'v2']); // Slot change triggers flush, schedules new timer
+
+      collectYielded(queue);
+
+      // Timer should be scheduled for the remaining command after slot flush
+      assert.equal(schedulerStats.scheduleCount, 2, 'timer scheduled twice (initial + after slot flush)');
+
+      queue.destroy();
+    });
+
+    it('explicit pipeline after auto command: cancels pending timer', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // First: auto-pipelining command
+      queue.addCommand(['SET', '{slot}auto', 'v1']);
+      collectYielded(queue); // Timer scheduled
+
+      assert.equal(schedulerStats.scheduleCount, 1, 'timer scheduled for auto command');
+
+      // Second: explicit pipeline command (same slot)
+      queue.addCommand(['SET', '{slot}explicit', 'v2'], { chainId });
+      collectYielded(queue); // Should cancel timer and flush
+
+      // Timer should have been cancelled
+      assert.equal(schedulerStats.cancelCount, 1, 'timer cancelled when explicit pipeline flushes');
+
+      queue.destroy();
+    });
+
+    it('multiple explicit pipelines in sequence: no timers created', function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 100, scheduler }
+      });
+
+      const chainId1 = Symbol('Pipeline 1');
+      const chainId2 = Symbol('Pipeline 2');
+
+      // First explicit pipeline
+      queue.addCommand(['SET', '{slot}k1', 'v1'], { chainId: chainId1 });
+      queue.addCommand(['SET', '{slot}k2', 'v2'], { chainId: chainId1 });
+      collectYielded(queue);
+
+      // Second explicit pipeline
+      queue.addCommand(['SET', '{slot}k3', 'v3'], { chainId: chainId2 });
+      queue.addCommand(['SET', '{slot}k4', 'v4'], { chainId: chainId2 });
+      collectYielded(queue);
+
+      // No timers should have been created
+      assert.equal(schedulerStats.scheduleCount, 0, 'no timers for explicit pipelines');
+      assert.equal(schedulerStats.cancelCount, 0, 'nothing to cancel');
+
+      queue.destroy();
+    });
+
+    it('interleaved auto and explicit: timers only for auto sections', async function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 50, scheduler }
+      });
+
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((data) => flushedData.push(data));
+
+      const chainId = Symbol('Pipeline');
+
+      // Auto command - timer scheduled
+      queue.addCommand(['SET', '{a}auto1', 'v1']);
+      collectYielded(queue);
+      assert.equal(schedulerStats.scheduleCount, 1, 'timer for auto1');
+
+      // Explicit pipeline (different slot) - flushes auto, no new timer
+      queue.addCommand(['SET', '{b}explicit1', 'v1'], { chainId });
+      queue.addCommand(['SET', '{b}explicit2', 'v2'], { chainId });
+      const results1 = collectYielded(queue);
+      assert.equal(results1.length, 2, 'auto flushed by slot change + explicit batch');
+      assert.equal(schedulerStats.scheduleCount, 1, 'no new timer for explicit');
+      assert.equal(schedulerStats.cancelCount, 1, 'auto timer cancelled');
+
+      // Another auto command - new timer scheduled
+      queue.addCommand(['SET', '{c}auto2', 'v1']);
+      collectYielded(queue);
+      assert.equal(schedulerStats.scheduleCount, 2, 'timer for auto2');
+
+      // Wait for timer to fire
+      await delay(60);
+      assert.equal(flushedData.length, 1, 'timer flushed auto2');
+
+      queue.destroy();
+    });
+  });
+});
