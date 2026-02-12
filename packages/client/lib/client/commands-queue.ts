@@ -608,7 +608,12 @@ export default class RedisCommandsQueue {
   *commandsToWrite() {
     const outbound = this.#outbound;
     let toSend = this.#toWrite.shift();
+    let explicitPipeline = false;
     while (toSend) {
+      // Track if we're processing an explicit pipeline (all commands share same chainId)
+      if (toSend.chainId !== undefined) {
+        explicitPipeline = true;
+      }
       const args = toSend.args;
       let encoded: ReadonlyArray<RedisArgument>
       try {
@@ -643,13 +648,15 @@ export default class RedisCommandsQueue {
             yield output;
           }
           // After flushing, if there's still pending data (e.g., slot mismatch added new command),
-          // schedule a new flush for the remaining buffered commands
-          if (this.#scheduler !== null && outbound.hasPending()) {
+          // schedule a new flush for the remaining buffered commands.
+          // Skip timer scheduling for explicit pipelines - they flush at end of iteration.
+          if (this.#scheduler !== null && !explicitPipeline && outbound.hasPending()) {
             this.#scheduleFlush();
           }
         }
 
-        if (outputs.length === 0 && this.#scheduler !== null && !hadPending && outbound.hasPending()) {
+        // Schedule timer for auto-pipelining only (not explicit pipelines)
+        if (outputs.length === 0 && this.#scheduler !== null && !explicitPipeline && !hadPending && outbound.hasPending()) {
           this.#scheduleFlush();
         }
       } else {
@@ -659,13 +666,22 @@ export default class RedisCommandsQueue {
       toSend = this.#toWrite.shift();
     }
 
-    // Only drain immediately if no timer-based batching is configured.
-    // When a scheduler is set, the timer callback handles flushing buffered commands.
-    // This allows commands to batch up to maxWaitMs before being sent.
-    if (outbound !== null && this.#scheduler === null) {
-      const drained = outbound.flush(FlushReason.DRAIN);
-      if (drained !== null) {
-        yield drained;
+    // Flush pending outbound data based on context:
+    // - No scheduler: always drain immediately (original behavior)
+    // - With scheduler + explicit pipeline: flush immediately (no point waiting for timer)
+    // - With scheduler + auto-pipelining: let timer handle it (allows batching across ticks)
+    //
+    // Explicit pipelines (execAsPipeline) have a chainId set on all commands.
+    // Auto-pipelining commands have chainId = undefined.
+    // For explicit pipelines, we know the batch is complete, so flush immediately.
+    // For auto-pipelining, timer allows commands from different ticks to batch together.
+    if (outbound !== null && outbound.hasPending()) {
+      if (this.#scheduler === null || explicitPipeline) {
+        this.#cancelPendingFlush();
+        const drained = outbound.flush(FlushReason.DRAIN);
+        if (drained !== null) {
+          yield drained;
+        }
       }
     }
   }
