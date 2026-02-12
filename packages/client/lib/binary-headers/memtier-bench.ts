@@ -1761,7 +1761,7 @@ async function main(): Promise<void> {
 
   const modes: ModeName[] =
     config.mode === 'all'
-      ? ['fast-headers-off', 'fast-headers-on']
+      ? ['fast-headers-on', 'fast-headers-off']
       : [config.mode as ModeName];
 
   const results: ModeResult[] = [];

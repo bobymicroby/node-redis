@@ -1,5 +1,5 @@
 import { DoublyLinkedNode, DoublyLinkedList, EmptyAwareSinglyLinkedList } from './linked-list';
-import encodeCommand from '../RESP/encoder';
+import encodeCommand, { encodeCommandWithLength } from '../RESP/encoder';
 import { Decoder, PUSH_TYPE_MAPPING, RESP_TYPES } from '../RESP/decoder';
 import { TypeMapping, ReplyUnion, RespVersions, RedisArgument } from '../RESP/types';
 import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, PubSubTypeListeners } from './pub-sub';
@@ -49,11 +49,13 @@ export interface OutboundInterceptor {
    *
    * @param encoded - RESP-encoded command data
    * @param args - Original command arguments (available for inspection)
+   * @param byteLength - Pre-calculated byte length of encoded data (optional optimization)
    * @returns Chunks to write to socket (empty array = buffered, nothing to send yet)
    */
   intercept(
     encoded: SocketChunk,
-    args: CommandArguments
+    args: CommandArguments,
+    byteLength?: number
   ): SocketChunks;
 
   /**
@@ -631,9 +633,16 @@ export default class RedisCommandsQueue {
       }
       currentChainId = toSend.chainId;
       const args = toSend.args;
-      let encoded: ReadonlyArray<RedisArgument>
+      let encoded: ReadonlyArray<RedisArgument>;
+      let byteLength: number | undefined;
       try {
-        encoded = encodeCommand(args);
+        if (outbound !== null) {
+          const result = encodeCommandWithLength(args);
+          encoded = result.encoded;
+          byteLength = result.byteLength;
+        } else {
+          encoded = encodeCommand(args);
+        }
       } catch (err) {
         toSend.reject(err);
         toSend = this.#toWrite.shift();
@@ -656,7 +665,7 @@ export default class RedisCommandsQueue {
 
       if (outbound !== null) {
         const hadPending = outbound.hasPending();
-        const outputs = outbound.intercept(encoded, args);
+        const outputs = outbound.intercept(encoded, args, byteLength);
 
         if (outputs.length > 0) {
           this.#cancelPendingFlush();

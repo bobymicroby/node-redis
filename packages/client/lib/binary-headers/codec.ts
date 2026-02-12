@@ -1,7 +1,7 @@
 import type { OutboundInterceptor, InboundInterceptor, WireInterceptor, SocketChunk, SocketChunks, CommandArguments } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
-import { CommandPacker, calculatePayloadLength, type CommandPackerOptions } from './packing';
+import { CommandPacker, calculatePayloadLength as calcPayloadLength, type CommandPackerOptions } from './packing';
 import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
 import { FlushReason, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from './stats';
 
@@ -71,7 +71,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     this.#packer = new CommandPacker(this.#statsCounter, packerOptions);
   }
 
-  intercept(encoded: SocketChunk, args: CommandArguments): SocketChunks {
+  intercept(encoded: SocketChunk, args: CommandArguments, byteLength?: number): SocketChunks {
     this.#statsCounter.recordCommand();
 
     const slot = this.#resolver.getSlot(args);
@@ -84,7 +84,8 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
 
     this.#statsCounter.recordBatchedCommand();
 
-    const packed = this.#packer.add(encoded, slot, calculatePayloadLength(encoded));
+    const payloadLength = byteLength ?? calcPayloadLength(encoded);
+    const packed = this.#packer.add(encoded, slot, payloadLength);
     return packed ? [packed] : [];
   }
 

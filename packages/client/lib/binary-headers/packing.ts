@@ -9,6 +9,27 @@ import type { BinaryHeaderStatsCounter } from './stats';
 export type { Cancellable, Scheduler };
 
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
+const HEADER_LENGTH = RequestHeaderEncoder.ENCODED_LENGTH;
+const DESIGNATOR = RequestHeaderEncoder.designatorConstantValue();
+
+// Fast header encoding - uses direct byte writes instead of writeUInt32BE/writeUInt16BE
+function encodeHeaderFast(length: number, commandCount: number, slot: number): Buffer {
+  const buffer = Buffer.allocUnsafe(HEADER_LENGTH);
+
+  // Direct byte writes - faster than Buffer methods for small fixed-size data
+  buffer[0] = DESIGNATOR;
+  buffer[1] = (length >>> 24) & 0xFF;
+  buffer[2] = (length >>> 16) & 0xFF;
+  buffer[3] = (length >>> 8) & 0xFF;
+  buffer[4] = length & 0xFF;
+  buffer[5] = commandCount;
+  buffer[6] = (slot >>> 8) & 0xFF;
+  buffer[7] = slot & 0xFF;
+  buffer[8] = 0;
+  buffer[9] = 0;
+
+  return buffer;
+}
 
 /**
  * Options for CommandPacker flush thresholds.
@@ -72,7 +93,9 @@ export class CommandPacker {
   readonly #statsCounter: BinaryHeaderStatsCounter;
   readonly #maxCommandCount: number;
   readonly #maxPayloadLength: number;
-  readonly #resps: Array<SocketChunk> = [];
+  // Pre-allocate array to avoid reallocations - use index instead of push/length=0
+  readonly #resps: Array<SocketChunk>;
+  #respCount: number = 0;
 
   #resolvedSlot: number = NULL_SLOT;
   #totalPayloadLength: number = 0;
@@ -96,6 +119,9 @@ export class CommandPacker {
     if (this.#maxPayloadLength < 1 || this.#maxPayloadLength > codecMaxPayloadLength) {
       throw new Error(`maxPayloadLength must be between 1 and ${codecMaxPayloadLength}, got ${this.#maxPayloadLength}`);
     }
+
+    // Pre-allocate array to max size to avoid reallocations
+    this.#resps = new Array(this.#maxCommandCount);
   }
 
   add(
@@ -103,7 +129,7 @@ export class CommandPacker {
     slot: number,
     payloadLength: number
   ): SocketChunk | null {
-    const count = this.#resps.length;
+    const count = this.#respCount;
 
     if (count > 0) {
       const flushReason = this.#getFlushReason(count, slot, payloadLength);
@@ -123,12 +149,12 @@ export class CommandPacker {
   }
 
   drain(reason: FlushReason): SocketChunk | null {
-    if (this.#resps.length === 0) return null;
+    if (this.#respCount === 0) return null;
     return this.#flush(reason);
   }
 
   get bufferSize(): number {
-    return this.#resps.length;
+    return this.#respCount;
   }
 
   #getFlushReason(count: number, slot: number, payloadLength: number): FlushReason | null {
@@ -145,15 +171,14 @@ export class CommandPacker {
   }
 
   #pushFirst(resp: SocketChunk, slot: number, payloadLength: number): void {
-    this.#resps.push(resp);
+    this.#resps[0] = resp;
+    this.#respCount = 1;
     this.#totalPayloadLength = payloadLength;
-    if (slot !== NULL_SLOT) {
-      this.#resolvedSlot = slot;
-    }
+    this.#resolvedSlot = slot !== NULL_SLOT ? slot : NULL_SLOT;
   }
 
   #push(resp: SocketChunk, slot: number, payloadLength: number): void {
-    this.#resps.push(resp);
+    this.#resps[this.#respCount++] = resp;
     this.#totalPayloadLength += payloadLength;
     if (slot !== NULL_SLOT) {
       this.#resolvedSlot = slot;
@@ -161,40 +186,40 @@ export class CommandPacker {
   }
 
   #flush(reason: FlushReason): SocketChunk {
-    const count = this.#resps.length;
+    const count = this.#respCount;
     this.#statsCounter.recordFlush(reason);
 
-    // v0 signature: allocateAndEncode(length, commandCount, slot, clientIdx)
-    const header = RequestHeaderEncoder.allocateAndEncode(
+    // Use fast header encoding
+    const header = encodeHeaderFast(
       this.#totalPayloadLength,
       count,
-      toWireSlot(this.#resolvedSlot),
-      0  // clientIdx - not used in current implementation
+      toWireSlot(this.#resolvedSlot)
     );
 
+    // Calculate total parts needed
     let totalParts = 1;
     for (let i = 0; i < count; i++) {
       totalParts += this.#resps[i].length;
     }
 
+    // Build result array
     const result = new Array<RedisArgument>(totalParts);
     result[0] = header;
 
     let idx = 1;
     for (let i = 0; i < count; i++) {
       const resp = this.#resps[i];
-      for (let j = 0; j < resp.length; j++) {
+      const respLen = resp.length;
+      for (let j = 0; j < respLen; j++) {
         result[idx++] = resp[j];
       }
     }
 
-    this.#reset();
-    return result;
-  }
-
-  #reset(): void {
-    this.#resps.length = 0;
+    // Reset state without reallocating array
+    this.#respCount = 0;
     this.#resolvedSlot = NULL_SLOT;
     this.#totalPayloadLength = 0;
+
+    return result;
   }
 }
