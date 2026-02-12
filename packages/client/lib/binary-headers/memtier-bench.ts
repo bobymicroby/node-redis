@@ -31,7 +31,7 @@
 
 import { parseArgs } from 'node:util';
 import { fork, ChildProcess, execSync } from 'node:child_process';
-import { build as buildHistogram, Histogram } from 'hdr-histogram-js';
+import { build as buildHistogram, Histogram, encodeIntoCompressedBase64, decodeFromCompressedBase64 } from 'hdr-histogram-js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -223,10 +223,16 @@ function mergeProfiles(profiles: inspector.Profiler.Profile[]): inspector.Profil
   };
 }
 
+interface ProfileOpsData {
+  onTotalOps: number;
+  offTotalOps: number;
+}
+
 function compareProfiles(
   offProfile: inspector.Profiler.Profile,
   onProfile: inspector.Profiler.Profile,
-  npmClientVersion?: string
+  npmClientVersion?: string,
+  opsData?: ProfileOpsData
 ): void {
   const offTimes = extractFunctionTimes(offProfile);
   const onTimes = extractFunctionTimes(onProfile);
@@ -327,16 +333,32 @@ function compareProfiles(
   // Summary
   console.log('-'.repeat(100));
   console.log('CPU Time Summary:');
-  console.log(`  ${offLabel}:`.padEnd(35) + `${(offTotal / 1000).toFixed(1)}ms`);
-  console.log(`  ${onLabel}:`.padEnd(35) + `${(onTotal / 1000).toFixed(1)}ms`);
 
-  const totalDiff = (onTotal - offTotal) / 1000;
-  const diffSign = totalDiff >= 0 ? '+' : '';
-  const pctDiff = offTotal > 0 ? ((onTotal - offTotal) / offTotal * 100) : 0;
-  const pctSign = pctDiff >= 0 ? '+' : '';
+  if (opsData && opsData.onTotalOps > 0 && opsData.offTotalOps > 0) {
+    // Normalized CPU time per 1K operations
+    const onCpuPer1KOps = (onTotal / opsData.onTotalOps) * 1000;
+    const offCpuPer1KOps = (offTotal / opsData.offTotalOps) * 1000;
+    const cpuPerOpDiff = onCpuPer1KOps - offCpuPer1KOps;
+    const cpuPerOpDiffSign = cpuPerOpDiff >= 0 ? '+' : '';
+    const cpuPerOpPctDiff = offCpuPer1KOps > 0 ? ((cpuPerOpDiff) / offCpuPer1KOps * 100) : 0;
+    const cpuPerOpPctSign = cpuPerOpPctDiff >= 0 ? '+' : '';
 
-  console.log('  ' + '─'.repeat(50));
-  console.log(`  Difference:`.padEnd(35) + `${diffSign}${totalDiff.toFixed(1)}ms (${pctSign}${pctDiff.toFixed(1)}%)`);
+    console.log(`  ON:  ${onLabel.padEnd(30)} ${(onCpuPer1KOps / 1000).toFixed(2)}ms / 1K ops  (${formatTotalOps(opsData.onTotalOps)} total ops)`);
+    console.log(`  OFF: ${offLabel.padEnd(30)} ${(offCpuPer1KOps / 1000).toFixed(2)}ms / 1K ops  (${formatTotalOps(opsData.offTotalOps)} total ops)`);
+    console.log('  ' + '─'.repeat(45));
+    console.log(`  Difference (ON - OFF):${' '.repeat(12)} ${cpuPerOpDiffSign}${(cpuPerOpDiff / 1000).toFixed(2)}ms / 1K ops (${cpuPerOpPctSign}${cpuPerOpPctDiff.toFixed(1)}%)`);
+  } else {
+    // Fallback to raw totals if ops data not available
+    const totalDiff = (onTotal - offTotal) / 1000;
+    const diffSign = totalDiff >= 0 ? '+' : '';
+    const pctDiff = offTotal > 0 ? ((onTotal - offTotal) / offTotal * 100) : 0;
+    const pctSign = pctDiff >= 0 ? '+' : '';
+
+    console.log(`  ON:  ${onLabel.padEnd(30)} ${(onTotal / 1000).toFixed(1)}ms (total)`);
+    console.log(`  OFF: ${offLabel.padEnd(30)} ${(offTotal / 1000).toFixed(1)}ms (total)`);
+    console.log('  ' + '─'.repeat(45));
+    console.log(`  Difference (ON - OFF):${' '.repeat(12)} ${diffSign}${totalDiff.toFixed(1)}ms (${pctSign}${pctDiff.toFixed(1)}%)`);
+  }
   console.log('═'.repeat(100));
 }
 
@@ -485,6 +507,9 @@ interface FinalStatsMessage {
   totalErrors: number;
   binaryHeaderStats?: BinaryHeaderStatsData;
   profileData?: string; // JSON-serialized inspector.Profiler.Profile
+  // Encoded histogram data for proper percentile merging
+  setHistogram?: string; // base64 encoded histogram
+  getHistogram?: string; // base64 encoded histogram
 }
 
 interface WorkerReadyMessage {
@@ -799,6 +824,7 @@ class MemtierStats {
     get: StatsSummary;
     total: StatsSummary;
     totalErrors: number;
+    totalOps: number;
   } {
     // Create a combined histogram for total stats
     const totalHist = createLatencyHistogram();
@@ -810,6 +836,17 @@ class MemtierStats {
       get: computeSummaryFromHistogram(this.#getTotalHist, totalDurationSeconds),
       total: computeSummaryFromHistogram(totalHist, totalDurationSeconds),
       totalErrors: this.#errorCount,
+      totalOps: totalHist.totalCount,
+    };
+  }
+
+  /**
+   * Get base64-encoded histograms for sending to parent process
+   */
+  getEncodedHistograms(): { setHistogram: string; getHistogram: string } {
+    return {
+      setHistogram: encodeIntoCompressedBase64(this.#setTotalHist),
+      getHistogram: encodeIntoCompressedBase64(this.#getTotalHist),
     };
   }
 }
@@ -1048,6 +1085,12 @@ function formatOps(ops: number): string {
   return ops.toFixed(0);
 }
 
+function formatTotalOps(ops: number): string {
+  if (ops >= 1_000_000) return (ops / 1_000_000).toFixed(2) + 'M';
+  if (ops >= 1_000) return (ops / 1_000).toFixed(1) + 'K';
+  return ops.toFixed(0);
+}
+
 function printIntervalStats(
   seconds: number,
   snapshot: { set: StatsSummary; get: StatsSummary; errors: number }
@@ -1063,7 +1106,7 @@ function printIntervalStats(
 }
 
 function printFinalSummary(
-  summary: { set: StatsSummary; get: StatsSummary; total: StatsSummary; totalErrors: number }
+  summary: { set: StatsSummary; get: StatsSummary; total: StatsSummary; totalErrors: number; totalOps?: number }
 ): void {
   console.log('\n────────────────────────────────────────────────────────────────────');
   console.log('SUMMARY');
@@ -1195,6 +1238,7 @@ function printBinaryHeaderStats(bhStats: any): void {
 interface ModeResult {
   mode: string;
   summary: { set: StatsSummary; get: StatsSummary; total: StatsSummary };
+  totalOps: number; // Actual total operation count from histogram
 }
 
 function printComparison(results: ModeResult[]): void {
@@ -1349,7 +1393,7 @@ async function runMode(
     }
   }
 
-  return { mode, summary };
+  return { mode, summary, totalOps: summary.totalOps };
 }
 
 // ============================================================================
@@ -1512,6 +1556,9 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
     }
   }
 
+  // Get encoded histograms for proper percentile merging in parent
+  const encodedHistograms = stats.getEncodedHistograms();
+
   const finalMsg: FinalStatsMessage = {
     type: 'final-stats',
     workerId,
@@ -1533,6 +1580,8 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
     totalErrors: summary.totalErrors,
     binaryHeaderStats: binaryHeaderStatsData,
     profileData,
+    setHistogram: encodedHistograms.setHistogram,
+    getHistogram: encodedHistograms.getHistogram,
   };
   process.send!(finalMsg);
 
@@ -1549,21 +1598,6 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
 // ============================================================================
 // Multi-Process Orchestration (Main Process)
 // ============================================================================
-
-interface AggregatedStats {
-  setCount: number;
-  getCount: number;
-  setP50Sum: number;
-  setP95Sum: number;
-  setP99Sum: number;
-  setP999Sum: number;
-  getP50Sum: number;
-  getP95Sum: number;
-  getP99Sum: number;
-  getP999Sum: number;
-  totalErrors: number;
-  workerCount: number;
-}
 
 async function runModeMultiProcess(
   mode: ModeName,
@@ -1755,60 +1789,44 @@ async function runModeMultiProcess(
     return null;
   }
 
+  // Merge histograms from all workers for proper percentile calculation
+  const mergedSetHist = createLatencyHistogram();
+  const mergedGetHist = createLatencyHistogram();
   let totalDuration = 0;
-  const agg: AggregatedStats = {
-    setCount: 0,
-    getCount: 0,
-    setP50Sum: 0,
-    setP95Sum: 0,
-    setP99Sum: 0,
-    setP999Sum: 0,
-    getP50Sum: 0,
-    getP95Sum: 0,
-    getP99Sum: 0,
-    getP999Sum: 0,
-    totalErrors: 0,
-    workerCount: finalStats.size,
-  };
+  let setCount = 0;
+  let getCount = 0;
+  let totalErrors = 0;
 
   for (const stat of finalStats.values()) {
     totalDuration = Math.max(totalDuration, stat.durationSeconds);
-    agg.setCount += stat.set.count;
-    agg.getCount += stat.get.count;
-    agg.setP50Sum += stat.set.p50;
-    agg.setP95Sum += stat.set.p95;
-    agg.setP99Sum += stat.set.p99;
-    agg.setP999Sum += stat.set.p999;
-    agg.getP50Sum += stat.get.p50;
-    agg.getP95Sum += stat.get.p95;
-    agg.getP99Sum += stat.get.p99;
-    agg.getP999Sum += stat.get.p999;
-    agg.totalErrors += stat.totalErrors;
+    setCount += stat.set.count;
+    getCount += stat.get.count;
+    totalErrors += stat.totalErrors;
+
+    // Decode and merge histograms
+    if (stat.setHistogram) {
+      const decoded = decodeFromCompressedBase64(stat.setHistogram);
+      mergedSetHist.add(decoded);
+    }
+    if (stat.getHistogram) {
+      const decoded = decodeFromCompressedBase64(stat.getHistogram);
+      mergedGetHist.add(decoded);
+    }
   }
 
+  // Create combined histogram for total stats
+  const mergedTotalHist = createLatencyHistogram();
+  mergedTotalHist.add(mergedSetHist);
+  mergedTotalHist.add(mergedGetHist);
+
+  const totalOps = mergedTotalHist.totalCount;
+
   const summary = {
-    set: {
-      ops: agg.setCount / totalDuration,
-      p50: agg.setP50Sum / agg.workerCount,
-      p95: agg.setP95Sum / agg.workerCount,
-      p99: agg.setP99Sum / agg.workerCount,
-      p999: agg.setP999Sum / agg.workerCount,
-    },
-    get: {
-      ops: agg.getCount / totalDuration,
-      p50: agg.getP50Sum / agg.workerCount,
-      p95: agg.getP95Sum / agg.workerCount,
-      p99: agg.getP99Sum / agg.workerCount,
-      p999: agg.getP999Sum / agg.workerCount,
-    },
-    total: {
-      ops: (agg.setCount + agg.getCount) / totalDuration,
-      p50: (agg.setP50Sum + agg.getP50Sum) / (agg.workerCount * 2),
-      p95: (agg.setP95Sum + agg.getP95Sum) / (agg.workerCount * 2),
-      p99: (agg.setP99Sum + agg.getP99Sum) / (agg.workerCount * 2),
-      p999: (agg.setP999Sum + agg.getP999Sum) / (agg.workerCount * 2),
-    },
-    totalErrors: agg.totalErrors,
+    set: computeSummaryFromHistogram(mergedSetHist, totalDuration),
+    get: computeSummaryFromHistogram(mergedGetHist, totalDuration),
+    total: computeSummaryFromHistogram(mergedTotalHist, totalDuration),
+    totalErrors,
+    totalOps,
   };
 
   printFinalSummary(summary);
@@ -1848,7 +1866,7 @@ async function runModeMultiProcess(
     }
   }
 
-  return { mode, summary };
+  return { mode, summary, totalOps };
 }
 
 // ============================================================================
@@ -1951,7 +1969,15 @@ async function main(): Promise<void> {
     }
 
     if (offProfile && onProfile) {
-      compareProfiles(offProfile, onProfile, config.npmClientVersion);
+      // Get ops data from results for normalized comparison
+      const onResult = results.find(r => r.mode === 'fast-headers-on');
+      const offResult = results.find(r => r.mode === 'fast-headers-off');
+      const opsData: ProfileOpsData | undefined = (onResult && offResult) ? {
+        onTotalOps: onResult.totalOps,
+        offTotalOps: offResult.totalOps,
+      } : undefined;
+
+      compareProfiles(offProfile, onProfile, config.npmClientVersion, opsData);
     }
   }
 
