@@ -93,6 +93,43 @@ interface FunctionTime {
   selfTime: number;
 }
 
+/**
+ * Normalize a URL/path to a consistent relative path for comparison.
+ * This allows matching functions from local source vs npm package.
+ *
+ * Examples:
+ *   /Users/.../node-redis/packages/client/dist/lib/client/commands-queue.js -> client/commands-queue.js
+ *   /Users/.../.cache/memtier-bench/5.10.0/node_modules/@redis/client/dist/lib/client/commands-queue.js -> client/commands-queue.js
+ *   node:internal/streams/readable -> node:internal/streams/readable (unchanged)
+ */
+function normalizeProfileUrl(url: string): string {
+  if (!url || url.startsWith('node:') || url === '(native)') {
+    return url;
+  }
+
+  // Look for common path segments that indicate the start of the relative path
+  // Try to extract from: .../dist/lib/... or .../lib/...
+  const distLibMatch = url.match(/dist\/lib\/(.+)$/);
+  if (distLibMatch) {
+    return distLibMatch[1];
+  }
+
+  const libMatch = url.match(/\/lib\/(.+)$/);
+  if (libMatch) {
+    return libMatch[1];
+  }
+
+  // For node_modules paths, extract package-relative path
+  const nodeModulesMatch = url.match(/node_modules\/@redis\/client\/(.+)$/);
+  if (nodeModulesMatch) {
+    return nodeModulesMatch[1];
+  }
+
+  // Fallback: just use the filename
+  const lastSlash = url.lastIndexOf('/');
+  return lastSlash >= 0 ? url.slice(lastSlash + 1) : url;
+}
+
 function extractFunctionTimes(profile: inspector.Profiler.Profile): Map<string, FunctionTime> {
   const result = new Map<string, FunctionTime>();
   const samples = profile.samples || [];
@@ -110,7 +147,9 @@ function extractFunctionTimes(profile: inspector.Profiler.Profile): Map<string, 
     if (!node) continue;
 
     const cf = node.callFrame;
-    const key = `${cf.functionName || '(anonymous)'}@${cf.url}:${cf.lineNumber}`;
+    const normalizedUrl = normalizeProfileUrl(cf.url);
+    // Don't include line number in key - it differs between versions
+    const key = `${cf.functionName || '(anonymous)'}@${normalizedUrl}`;
 
     const existing = result.get(key);
     if (existing) {
@@ -118,7 +157,7 @@ function extractFunctionTimes(profile: inspector.Profiler.Profile): Map<string, 
     } else {
       result.set(key, {
         name: cf.functionName || '(anonymous)',
-        url: cf.url || '(native)',
+        url: normalizedUrl,
         line: cf.lineNumber,
         selfTime: delta,
       });
@@ -247,7 +286,9 @@ function compareProfiles(
   }
 
   console.log('-'.repeat(100));
-  console.log(`Total active time: OFF=${(offTotal / 1000).toFixed(1)}ms, ON=${(onTotal / 1000).toFixed(1)}ms, diff=+${((onTotal - offTotal) / 1000).toFixed(1)}ms`);
+  const totalDiff = (onTotal - offTotal) / 1000;
+  const diffSign = totalDiff >= 0 ? '+' : '';
+  console.log(`Total active time: OFF=${(offTotal / 1000).toFixed(1)}ms, ON=${(onTotal / 1000).toFixed(1)}ms, diff=${diffSign}${totalDiff.toFixed(1)}ms`);
   console.log('═'.repeat(100));
 }
 
