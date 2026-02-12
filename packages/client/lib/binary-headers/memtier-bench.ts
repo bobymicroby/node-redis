@@ -363,6 +363,7 @@ interface WorkerConfig {
   workerId: number;
   mode: ModeName;
   config: BenchConfig;
+  useNpmClient: boolean; // Whether this worker should use npm client (for fast-headers-off) or local source
 }
 
 interface IntervalStatsMessage {
@@ -1504,12 +1505,14 @@ async function runModeMultiProcess(
   const workerReady: Promise<void>[] = [];
 
   for (let i = 0; i < numWorkers; i++) {
+    // When npmClientVersion is set, fast-headers-off uses npm, fast-headers-on uses local
+    const useNpmForThisMode = config.npmClientVersion && mode === 'fast-headers-off';
     const worker = fork(__filename, [], {
       env: {
         ...process.env,
         MEMTIER_WORKER: '1',
-        // Pass npm version to worker if set
-        ...(config.npmClientVersion ? { MEMTIER_NPM_VERSION: config.npmClientVersion } : {}),
+        // Pass npm version to worker only if this mode should use npm client
+        ...(useNpmForThisMode ? { MEMTIER_NPM_VERSION: config.npmClientVersion } : {}),
       },
       // Use 'inherit' for stdio to avoid piping issues with many workers
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
@@ -1549,6 +1552,7 @@ async function runModeMultiProcess(
       workerId: i,
       mode,
       config,
+      useNpmClient: !!useNpmForThisMode,
     };
     worker.send(configMsg);
   }
@@ -1765,15 +1769,19 @@ async function runModeMultiProcess(
 async function main(): Promise<void> {
   const config = parseConfig();
 
-  // Initialize Redis client (local or npm version)
-  initializeRedisClient(config.npmClientVersion);
+  // Pre-install npm client if needed (so workers don't race to install)
+  if (config.npmClientVersion) {
+    initializeRedisClient(config.npmClientVersion);
+    console.log(''); // blank line after npm install output
+  }
 
   console.log('═══════════════════════════════════════════════════════════════════');
   console.log('  Memtier-like Benchmark for node-redis');
   console.log('═══════════════════════════════════════════════════════════════════');
   console.log(`Host: ${config.host}:${config.port}`);
   if (config.npmClientVersion) {
-    console.log(`Client: @redis/client@${config.npmClientVersion} (npm)`);
+    console.log(`Client (fast-headers-off): @redis/client@${config.npmClientVersion} (npm)`);
+    console.log(`Client (fast-headers-on): local source (../client)`);
   } else {
     console.log(`Client: local source (../client)`);
   }
@@ -1803,6 +1811,15 @@ async function main(): Promise<void> {
   const results: ModeResult[] = [];
 
   for (const mode of modes) {
+    // When npmClientVersion is set: fast-headers-off uses npm, fast-headers-on uses local
+    // Otherwise: both modes use local source
+    if (config.npmClientVersion) {
+      const useNpm = mode === 'fast-headers-off';
+      initializeRedisClient(useNpm ? config.npmClientVersion : undefined);
+    } else {
+      initializeRedisClient(undefined);
+    }
+
     if (config.profile) {
       startCpuProfiler(mode);
     }
