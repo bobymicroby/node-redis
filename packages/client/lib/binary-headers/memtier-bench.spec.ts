@@ -900,6 +900,11 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       const stats = queue.wireInterceptorStats();
       assert(stats, 'Stats should be available');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
+      // With chainId boundary flushing, we flush when chainId changes (not on slot mismatch)
+      // 3 different slots with same chainId = 2 slot mismatches within the chain
+      // But since all have the same chainId, we only flush at chain boundary (drain)
+      // Actually: key1 (slot a), key2 (slot b), key3 (slot c) all same chainId
+      // Slot mismatch still happens within the chain
       assert.equal(stats.slotMismatchFlushCount, 2, 'slotMismatchFlushCount should be 2');
       assert.equal(stats.drainFlushCount, 1, 'drainFlushCount should be 1');
     });
@@ -916,14 +921,17 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
       const results = collectYielded(queue);
 
-      // Both should flush together (same slot, both have chainId)
-      assert.equal(results.length, 1, 'Should yield 1 batch');
+      // With chainId boundary flushing, each chainId gets its own batch
+      // chainId1 commands are flushed when we see chainId2
+      // chainId2 commands are flushed at the end (drain)
+      assert.equal(results.length, 2, 'Should yield 2 batches (one per chainId)');
 
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
       const stats = queue.wireInterceptorStats();
       assert(stats, 'Stats should be available');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
+      assert.equal(stats.drainFlushCount, 2, 'drainFlushCount should be 2 (one per chainId)');
     });
   });
 
@@ -1001,8 +1009,9 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
       const results = collectYielded(queue);
 
-      // Should have 10 batches (one per slot change between bulks)
-      assert.equal(results.length, 10, 'Should yield 10 batches (slot changes between bulks)');
+      // Should have 10 batches (one per chainId boundary)
+      // With chainId boundary flushing, each bulk (with its own chainId) is flushed separately
+      assert.equal(results.length, 10, 'Should yield 10 batches (one per chainId/bulk)');
 
       // CRITICAL: No timer scheduled
       assert.equal(schedulerStats.scheduleCount, 0,
@@ -1019,11 +1028,12 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       assert.equal(stats.timerFlushCount, 0,
         `timerFlushCount should be 0, got ${stats.timerFlushCount}`);
 
-      // Should have slot mismatch flushes (9) + drain flush (1)
-      assert.equal(stats.slotMismatchFlushCount, 9,
-        `slotMismatchFlushCount should be 9, got ${stats.slotMismatchFlushCount}`);
-      assert.equal(stats.drainFlushCount, 1,
-        `drainFlushCount should be 1, got ${stats.drainFlushCount}`);
+      // With chainId boundary flushing: no slot mismatches, all drain flushes
+      // Each chainId boundary triggers a drain flush
+      assert.equal(stats.slotMismatchFlushCount, 0,
+        `slotMismatchFlushCount should be 0, got ${stats.slotMismatchFlushCount}`);
+      assert.equal(stats.drainFlushCount, 10,
+        `drainFlushCount should be 10, got ${stats.drainFlushCount}`);
     });
 
     it('verifies BulkKeyGenerator from memtier-bench produces correct slot grouping', function () {
@@ -1059,6 +1069,226 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       // Bulk1 and bulk2 should have DIFFERENT slots
       assert.notEqual(bulk1Slots[0], bulk2Slots[0],
         `Bulk1 slot (${bulk1Slots[0]}) should differ from bulk2 slot (${bulk2Slots[0]})`);
+    });
+
+    /**
+     * This test investigates the slot mismatch issue when pipeline > bulk-size.
+     *
+     * With pipeline=40, bulk-size=10:
+     * - initialBulks = Math.ceil(40/10) = 4
+     * - 4 bulks are issued synchronously in a loop
+     * - Each bulk calls execAsPipeline() which creates its own chainId
+     * - All commands are added to the queue before commandsToWrite() is called
+     *
+     * The question is: do all commands within each bulk maintain the same slot?
+     * And do slot mismatches occur between bulks?
+     */
+    it('pipeline=40, bulk-size=10: multiple bulks issued synchronously (SLOT MISMATCH INVESTIGATION)', function () {
+      const { queue, schedulerStats } = createQueueWithTimer();
+
+      const pipelineDepth = 40;
+      const bulkSize = 10;
+      const initialBulks = Math.ceil(pipelineDepth / bulkSize); // = 4
+
+      // Use a SINGLE key generator (like the real memtier-bench does)
+      const keyGen = createBulkKeyGenerator('test-', bulkSize, 10, 0, 999, 0, 0);
+
+      // Track what keys are generated per bulk for debugging
+      const bulkKeys: string[][] = [];
+      const bulkSlots: string[][] = [];
+
+      // Simulate the exact pattern from memtier-bench.ts runPipelinedConnection()
+      // All 4 issueBulk() calls happen synchronously BEFORE commandsToWrite()
+      for (let b = 0; b < initialBulks; b++) {
+        const chainId = Symbol('Pipeline Chain'); // New symbol each bulk, like real code
+        const keysInBulk: string[] = [];
+        const slotsInBulk: string[] = [];
+
+        for (let i = 0; i < bulkSize; i++) {
+          const key = nextKey(keyGen);
+          keysInBulk.push(key);
+          slotsInBulk.push(extractSlot(key) || 'null');
+          queue.addCommand(['SET', key, 'value'], { chainId });
+        }
+
+        bulkKeys.push(keysInBulk);
+        bulkSlots.push(slotsInBulk);
+      }
+
+      // Verify each bulk has only ONE unique slot (critical for binary header batching)
+      for (let b = 0; b < initialBulks; b++) {
+        const uniqueSlots = [...new Set(bulkSlots[b])];
+        assert.equal(uniqueSlots.length, 1,
+          `Bulk ${b} should have exactly 1 slot, but has ${uniqueSlots.length}: [${uniqueSlots.join(', ')}]`);
+      }
+
+      // Now trigger the write (simulating setImmediate callback)
+      const results = collectYielded(queue);
+
+      // Get stats
+      const stats = queue.wireInterceptorStats();
+      assert(stats, 'Stats should be available');
+
+      // Each bulk has its own chainId, so we expect 4 drain flushes (one per explicit pipeline)
+      // But slot changes between bulks cause slot mismatch flushes
+      // With 4 bulks targeting slots 0, 1, 2, 3 respectively:
+      // - Bulk 0 (slot 0): ends with drain when chainId changes
+      // - Bulk 1 (slot 1): slot differs from bulk 0, so slot mismatch flush, then drain
+      // - etc.
+
+      // The key question: are we seeing slot mismatches WITHIN bulks or BETWEEN bulks?
+      assert.equal(stats.totalCommandCount, pipelineDepth,
+        `Should have ${pipelineDepth} total commands`);
+
+      // Timer should never be scheduled for explicit pipelines
+      assert.equal(schedulerStats.scheduleCount, 0,
+        'Timer should never be scheduled for explicit pipelines');
+      assert.equal(stats.timerFlushCount, 0,
+        `timerFlushCount should be 0, got ${stats.timerFlushCount}`);
+    });
+
+    /**
+     * Test with pipeline=10, bulk-size=10 (single bulk) for comparison
+     */
+    it('pipeline=10, bulk-size=10: single bulk, no slot mismatches expected', function () {
+      const { queue, schedulerStats } = createQueueWithTimer();
+
+      const pipelineDepth = 10;
+      const bulkSize = 10;
+      const initialBulks = Math.ceil(pipelineDepth / bulkSize); // = 1
+
+      const keyGen = createBulkKeyGenerator('test-', bulkSize, 10, 0, 999, 0, 0);
+
+      const bulkSlots: string[] = [];
+
+      for (let b = 0; b < initialBulks; b++) {
+        const chainId = Symbol('Pipeline Chain');
+
+        for (let i = 0; i < bulkSize; i++) {
+          const key = nextKey(keyGen);
+          bulkSlots.push(extractSlot(key) || 'null');
+          queue.addCommand(['SET', key, 'value'], { chainId });
+        }
+      }
+
+      const uniqueSlots = [...new Set(bulkSlots)];
+
+      // With single bulk, all keys should have same slot
+      assert.equal(uniqueSlots.length, 1,
+        `Single bulk should have exactly 1 slot, but has ${uniqueSlots.length}`);
+
+      const results = collectYielded(queue);
+
+      const stats = queue.wireInterceptorStats();
+      assert(stats, 'Stats should be available');
+
+      // With single bulk, no slot mismatches
+      assert.equal(stats.slotMismatchFlushCount, 0,
+        `Should have 0 slot mismatch flushes, got ${stats.slotMismatchFlushCount}`);
+      assert.equal(stats.drainFlushCount, 1,
+        `Should have 1 drain flush, got ${stats.drainFlushCount}`);
+    });
+
+    /**
+     * This test simulates EXACTLY how memtier-bench.ts shares a single keyGen across
+     * multiple concurrent issueBulk() calls.
+     *
+     * The real code does:
+     * 1. Create ONE keyGen per connection
+     * 2. Issue initialBulks (e.g., 4) calls to issueBulk() in a synchronous loop
+     * 3. Each issueBulk() calls keyGen.nextKey() bulkSize times
+     *
+     * The question is: does the shared keyGen produce correct slot grouping?
+     */
+    it('shared keyGen across concurrent bulks: verifies slot grouping is correct', function () {
+      const pipelineDepth = 40;
+      const bulkSize = 10;
+      const initialBulks = Math.ceil(pipelineDepth / bulkSize); // = 4
+
+      // ONE keyGen shared across all bulks (like real memtier-bench)
+      const keyGen = createBulkKeyGenerator('test-', bulkSize, 10, 0, 999, 0, 0);
+
+      // Simulate 4 concurrent issueBulk() calls, each using the SAME keyGen
+      const allBulks: { keys: string[]; slots: string[] }[] = [];
+
+      for (let b = 0; b < initialBulks; b++) {
+        const bulk = { keys: [] as string[], slots: [] as string[] };
+
+        for (let i = 0; i < bulkSize; i++) {
+          const key = nextKey(keyGen);
+          bulk.keys.push(key);
+          bulk.slots.push(extractSlot(key) || 'null');
+        }
+
+        allBulks.push(bulk);
+      }
+
+      // Verify slot grouping
+      for (let b = 0; b < initialBulks; b++) {
+        const uniqueSlots = [...new Set(allBulks[b].slots)];
+        assert.equal(uniqueSlots.length, 1,
+          `Bulk ${b} should have exactly 1 unique slot, got ${uniqueSlots.length}: [${uniqueSlots.join(', ')}]`);
+      }
+
+      // Verify each bulk has a DIFFERENT slot (expected for bulk batching)
+      const bulkSlots = allBulks.map(b => b.slots[0]);
+      const uniqueBulkSlots = [...new Set(bulkSlots)];
+
+      assert.equal(uniqueBulkSlots.length, initialBulks,
+        `Each of ${initialBulks} bulks should target a different slot, got ${uniqueBulkSlots.length} unique slots`);
+    });
+
+    /**
+     * This test demonstrates the IMPROVED chainId boundary flushing behavior.
+     *
+     * With chainId boundary flushing, when the queue sees a different chainId,
+     * it flushes the pending batch BEFORE processing the new command.
+     *
+     * Queue order: [bulk0-cmd0..9 (chainId A), bulk1-cmd0..9 (chainId B), ...]
+     *
+     * The queue now:
+     *   - Commands 0-9 (chainId A): batched together
+     *   - Command 10 (chainId B): FLUSH chainId A batch, then start new batch
+     *   - Commands 10-19 (chainId B): batched together
+     *   - etc.
+     *
+     * This avoids slot mismatch flushes and is cleaner because each explicit
+     * pipeline (execAsPipeline) is guaranteed to be sent as a complete batch.
+     */
+    it('demonstrates chainId boundary flushing: no slot mismatches needed', function () {
+      const { queue } = createQueueWithTimer();
+
+      const pipelineDepth = 40;
+      const bulkSize = 10;
+      const initialBulks = Math.ceil(pipelineDepth / bulkSize);
+
+      const keyGen = createBulkKeyGenerator('test-', bulkSize, 10, 0, 999, 0, 0);
+
+      // Add all commands from all bulks
+      for (let b = 0; b < initialBulks; b++) {
+        const chainId = Symbol(`Pipeline ${b}`);
+        for (let i = 0; i < bulkSize; i++) {
+          const key = nextKey(keyGen);
+          queue.addCommand(['SET', key, 'value'], { chainId });
+        }
+      }
+
+      const results = collectYielded(queue);
+      const stats = queue.wireInterceptorStats();
+      assert(stats, 'Stats should be available');
+
+      // With chainId boundary flushing: each chainId gets flushed when the next one starts
+      // No slot mismatches - all drain flushes
+      assert.equal(stats.slotMismatchFlushCount, 0,
+        'Expected 0 slot mismatch flushes (chainId boundary flushing handles this)');
+      assert.equal(stats.drainFlushCount, initialBulks,
+        `Expected ${initialBulks} drain flushes (one per chainId)`);
+      assert.equal(stats.batchCount, initialBulks,
+        `Expected ${initialBulks} batches (one per bulk/chainId)`);
+
+      // Average batch size should be bulkSize (all commands within a bulk batch together)
+      assert.equal(stats.averageBatchSize(), bulkSize,
+        `Average batch size should be ${bulkSize}`);
     });
 
     it('full benchmark simulation: pipeline=10, bulk-size=10, continuous operation', function () {

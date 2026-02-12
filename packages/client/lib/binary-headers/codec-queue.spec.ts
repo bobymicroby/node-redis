@@ -2697,11 +2697,16 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
 
       const results = collectYielded(queue);
 
-      // Both should flush (both have chainId, so explicitPipeline = true)
-      assert.equal(results.length, 1, 'All commands with any chainId should flush');
+      // With chainId boundary flushing, each chainId gets its own batch
+      // chainId1 is flushed when we see chainId2, chainId2 is flushed at end
+      assert.equal(results.length, 2, 'Each chainId should flush separately');
       assertPackedData(results[0], {
-        commandCount: 2,
-        commands: [['SET', '{slot}k1', 'v1'], ['SET', '{slot}k2', 'v2']]
+        commandCount: 1,
+        commands: [['SET', '{slot}k1', 'v1']]
+      });
+      assertPackedData(results[1], {
+        commandCount: 1,
+        commands: [['SET', '{slot}k2', 'v2']]
       });
 
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');

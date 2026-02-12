@@ -229,8 +229,8 @@ describe('Binary Headers Stats E2E', function () {
         slotMismatchFlushCount: 0,
         maxCommandsFlushCount: 0,
         maxPayloadFlushCount: 0,
-        timerFlushCount: 2,
-        drainFlushCount: 0,
+        timerFlushCount: 0,
+        drainFlushCount: 2,
         averageBatchSize: 2,
       },
       expectedServerStats: {
