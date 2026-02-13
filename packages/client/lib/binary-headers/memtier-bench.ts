@@ -1091,16 +1091,45 @@ function formatTotalOps(ops: number): string {
   return ops.toFixed(0);
 }
 
+// Track max column widths across interval stats calls
+const intervalColWidths = {
+  setOps: 0,
+  setP50: 0,
+  setP99: 0,
+  getOps: 0,
+  getP50: 0,
+  getP99: 0,
+};
+
+
+
 function printIntervalStats(
   seconds: number,
   snapshot: { set: StatsSummary; get: StatsSummary; errors: number }
 ): void {
   const { set, get, errors } = snapshot;
   const errStr = errors > 0 ? `  ERR: ${errors}` : '';
+
+  // Format values
+  const setOps = formatOps(set.ops);
+  const setP50 = formatNs(set.p50);
+  const setP99 = formatNs(set.p99);
+  const getOps = formatOps(get.ops);
+  const getP50 = formatNs(get.p50);
+  const getP99 = formatNs(get.p99);
+
+  // Update max widths
+  intervalColWidths.setOps = Math.max(intervalColWidths.setOps, setOps.length);
+  intervalColWidths.setP50 = Math.max(intervalColWidths.setP50, setP50.length);
+  intervalColWidths.setP99 = Math.max(intervalColWidths.setP99, setP99.length);
+  intervalColWidths.getOps = Math.max(intervalColWidths.getOps, getOps.length);
+  intervalColWidths.getP50 = Math.max(intervalColWidths.getP50, getP50.length);
+  intervalColWidths.getP99 = Math.max(intervalColWidths.getP99, getP99.length);
+
   console.log(
-    `[${seconds}s]  ` +
-    `SET: ${formatOps(set.ops).padStart(8)} ops/sec  p50=${formatNs(set.p50).padStart(10)}  p99=${formatNs(set.p99).padStart(10)}  |  ` +
-    `GET: ${formatOps(get.ops).padStart(8)} ops/sec  p50=${formatNs(get.p50).padStart(10)}  p99=${formatNs(get.p99).padStart(10)}` +
+    `[${seconds}s] ` +
+    `SET: ${setOps.padStart(intervalColWidths.setOps)} ops/s p50=${setP50.padStart(intervalColWidths.setP50)} p99=${setP99.padStart(intervalColWidths.setP99)} | ` +
+    `GET: ${getOps.padStart(intervalColWidths.getOps)} ops/s p50=${getP50.padStart(intervalColWidths.getP50)} p99=${getP99.padStart(intervalColWidths.getP99)}` +
     errStr
   );
 }
