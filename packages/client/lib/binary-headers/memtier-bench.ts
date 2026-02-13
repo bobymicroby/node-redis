@@ -1433,6 +1433,43 @@ async function runWorker(): Promise<void> {
   return new Promise((resolve, reject) => {
     let workerConfig: WorkerConfig | null = null;
 
+    // Global error handlers to capture crashes
+    process.on('uncaughtException', (err) => {
+      const workerId = workerConfig?.workerId ?? -1;
+      console.error(`[Worker ${workerId}] Uncaught exception: ${err.message}`);
+      console.error(err.stack);
+      const errorMsg: WorkerErrorMessage = {
+        type: 'error',
+        workerId,
+        message: `Uncaught exception: ${err.message}\n${err.stack}`,
+      };
+      try {
+        process.send!(errorMsg);
+      } catch {
+        // ignore if can't send
+      }
+      process.exit(1);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+      const workerId = workerConfig?.workerId ?? -1;
+      const message = reason instanceof Error ? reason.message : String(reason);
+      const stack = reason instanceof Error ? reason.stack : '';
+      console.error(`[Worker ${workerId}] Unhandled rejection: ${message}`);
+      if (stack) console.error(stack);
+      const errorMsg: WorkerErrorMessage = {
+        type: 'error',
+        workerId,
+        message: `Unhandled rejection: ${message}\n${stack}`,
+      };
+      try {
+        process.send!(errorMsg);
+      } catch {
+        // ignore if can't send
+      }
+      process.exit(1);
+    });
+
     process.on('message', async (msg: ParentToWorkerMessage) => {
       if (msg.type === 'config') {
         workerConfig = msg;
@@ -1447,7 +1484,7 @@ async function runWorker(): Promise<void> {
           const errorMsg: WorkerErrorMessage = {
             type: 'error',
             workerId: workerConfig.workerId,
-            message: (err as Error).message,
+            message: (err as Error).message + '\n' + (err as Error).stack,
           };
           process.send!(errorMsg);
           reject(err);
@@ -1689,10 +1726,10 @@ async function runModeMultiProcess(
           reject(err);
         });
 
-        worker.on('exit', (code) => {
-          if (code !== 0) {
+        worker.on('exit', (code, signal) => {
+          if (code !== 0 && code !== null) {
             clearTimeout(timeout);
-            reject(new Error(`Worker ${i} exited with code ${code}`));
+            reject(new Error(`Worker ${i} exited with code ${code}, signal ${signal}`));
           }
         });
       })
@@ -1728,19 +1765,43 @@ async function runModeMultiProcess(
   const finalStats: Map<number, FinalStatsMessage> = new Map();
   const finalStatsReceivedResolvers: Map<number, () => void> = new Map();
   const finalStatsPromises: Promise<void>[] = [];
+  const workerExited: Map<number, boolean> = new Map();
 
   for (let i = 0; i < numWorkers; i++) {
     intervalStats.set(i, []);
+    workerExited.set(i, false);
     // Create a promise that resolves when this worker's final-stats is received
+    // or times out after test time + 30 seconds grace period
     finalStatsPromises.push(
       new Promise<void>((resolve) => {
         finalStatsReceivedResolvers.set(i, resolve);
+        // Timeout to prevent hanging forever if a worker crashes
+        setTimeout(() => {
+          if (!finalStats.has(i)) {
+            console.error(`[WARNING] Worker ${i} did not send final-stats within timeout`);
+            resolve(); // Resolve anyway to prevent hanging
+          }
+        }, (config.testTime + 30) * 1000);
       })
     );
   }
 
-  // Setup message handlers for stats
-  for (const worker of workers) {
+  // Setup message handlers for stats and track worker exits
+  for (let i = 0; i < workers.length; i++) {
+    const worker = workers[i];
+
+    worker.on('exit', (code, signal) => {
+      workerExited.set(i, true);
+      if (!finalStats.has(i)) {
+        console.error(`[WARNING] Worker ${i} exited (code=${code}, signal=${signal}) without sending final-stats`);
+        // Resolve the promise to prevent hanging
+        const resolver = finalStatsReceivedResolvers.get(i);
+        if (resolver) {
+          resolver();
+        }
+      }
+    });
+
     worker.on('message', (msg: WorkerToParentMessage) => {
       if (msg.type === 'interval-stats') {
         intervalStats.get(msg.workerId)?.push(msg);
