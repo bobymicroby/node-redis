@@ -1781,6 +1781,7 @@ async function runModeMultiProcess(
           printIntervalStats(currentInterval, snapshot);
         }
       } else if (msg.type === 'final-stats') {
+        console.log(`[DEBUG] Received final-stats from worker ${msg.workerId}: duration=${msg.durationSeconds.toFixed(2)}s, setCount=${msg.set.count}, getCount=${msg.get.count}`);
         finalStats.set(msg.workerId, msg);
         // Collect profile data from workers
         if (msg.profileData) {
@@ -1811,6 +1812,10 @@ async function runModeMultiProcess(
   );
 
   console.log(`\nAll child processes finished.`);
+  console.log(`[DEBUG] finalStats.size = ${finalStats.size}, expected = ${numWorkers}`);
+  for (const [workerId, stat] of finalStats.entries()) {
+    console.log(`[DEBUG] Worker ${workerId}: duration=${stat.durationSeconds.toFixed(2)}s, setCount=${stat.set.count}, getCount=${stat.get.count}`);
+  }
 
   // Aggregate final stats
   if (finalStats.size === 0) {
@@ -1827,6 +1832,7 @@ async function runModeMultiProcess(
   let totalErrors = 0;
 
   for (const stat of finalStats.values()) {
+    console.log(`[DEBUG] Processing stat: duration=${stat.durationSeconds.toFixed(2)}s, setCount=${stat.set.count}, histogram totalCount=${stat.setHistogram ? 'present' : 'missing'}`);
     totalDuration = Math.max(totalDuration, stat.durationSeconds);
     setCount += stat.set.count;
     getCount += stat.get.count;
@@ -1849,6 +1855,7 @@ async function runModeMultiProcess(
   mergedTotalHist.add(mergedGetHist);
 
   const totalOps = mergedTotalHist.totalCount;
+  console.log(`[DEBUG] After merging: totalDuration=${totalDuration.toFixed(2)}s, setCount=${setCount}, getCount=${getCount}, mergedSetHist.totalCount=${mergedSetHist.totalCount}, mergedGetHist.totalCount=${mergedGetHist.totalCount}, totalOps=${totalOps}`);
 
   const summary = {
     set: computeSummaryFromHistogram(mergedSetHist, totalDuration),
