@@ -1862,12 +1862,10 @@ async function runModeMultiProcess(
       } else if (msg.type === 'final-stats') {
         finalStats.set(msg.workerId, msg);
         // Collect profile data from workers
-        console.log(`[DEBUG] Worker ${msg.workerId} final-stats: profileData=${msg.profileData ? 'present (' + msg.profileData.length + ' bytes)' : 'missing'}`);
         if (msg.profileData) {
           const profiles = workerProfiles.get(mode) || [];
           profiles.push(JSON.parse(msg.profileData));
           workerProfiles.set(mode, profiles);
-          console.log(`[DEBUG] workerProfiles for ${mode} now has ${profiles.length} profiles`);
         }
         // Resolve the promise for this worker's final stats
         const resolver = finalStatsReceivedResolvers.get(msg.workerId);
@@ -2071,32 +2069,22 @@ async function main(): Promise<void> {
 
   // Compare profiles if we have both modes (use worker profiles if available, otherwise main process)
   if (config.profile) {
-    console.log(`[DEBUG] Profile comparison: workerProfiles keys = ${Array.from(workerProfiles.keys()).join(', ')}`);
-    console.log(`[DEBUG] workerProfiles 'fast-headers-off' count = ${workerProfiles.get('fast-headers-off')?.length ?? 0}`);
-    console.log(`[DEBUG] workerProfiles 'fast-headers-on' count = ${workerProfiles.get('fast-headers-on')?.length ?? 0}`);
-    console.log(`[DEBUG] collectedProfiles keys = ${Array.from(collectedProfiles.keys()).join(', ')}`);
-
     let offProfile: inspector.Profiler.Profile | undefined;
     let onProfile: inspector.Profiler.Profile | undefined;
 
     // Prefer worker profiles (multi-process mode)
     if (workerProfiles.has('fast-headers-off') && workerProfiles.get('fast-headers-off')!.length > 0) {
       offProfile = mergeProfiles(workerProfiles.get('fast-headers-off')!);
-      console.log(`[DEBUG] Using worker profiles for fast-headers-off`);
     } else if (collectedProfiles.has('fast-headers-off')) {
       offProfile = collectedProfiles.get('fast-headers-off');
-      console.log(`[DEBUG] Using collected profile for fast-headers-off`);
     }
 
     if (workerProfiles.has('fast-headers-on') && workerProfiles.get('fast-headers-on')!.length > 0) {
       onProfile = mergeProfiles(workerProfiles.get('fast-headers-on')!);
-      console.log(`[DEBUG] Using worker profiles for fast-headers-on`);
     } else if (collectedProfiles.has('fast-headers-on')) {
       onProfile = collectedProfiles.get('fast-headers-on');
-      console.log(`[DEBUG] Using collected profile for fast-headers-on`);
     }
 
-    console.log(`[DEBUG] offProfile=${offProfile ? 'present' : 'missing'}, onProfile=${onProfile ? 'present' : 'missing'}`);
     if (offProfile && onProfile) {
       // Get ops data from results for normalized comparison
       const onResult = results.find(r => r.mode === 'fast-headers-on');
