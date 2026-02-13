@@ -1649,7 +1649,17 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
     setHistogram: encodedHistograms.setHistogram,
     getHistogram: encodedHistograms.getHistogram,
   };
-  process.send!(finalMsg);
+  // Wait for the message to be sent before cleanup
+  await new Promise<void>((resolve, reject) => {
+    process.send!(finalMsg, (err) => {
+      if (err) {
+        console.error(`[Worker ${workerId}] Failed to send final-stats: ${err.message}`);
+        reject(err);
+      } else {
+        resolve();
+      }
+    });
+  });
 
   // Cleanup
   for (const client of clients) {
