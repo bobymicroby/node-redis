@@ -1651,7 +1651,7 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
   };
   // Wait for the message to be sent before cleanup
   await new Promise<void>((resolve, reject) => {
-    process.send!(finalMsg, (err) => {
+    process.send!(finalMsg, (err: Error | null) => {
       if (err) {
         console.error(`[Worker ${workerId}] Failed to send final-stats: ${err.message}`);
         reject(err);
