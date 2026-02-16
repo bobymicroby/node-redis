@@ -55,7 +55,8 @@ export interface OutboundInterceptor {
   intercept(
     encoded: SocketChunk,
     args: CommandArguments,
-    byteLength?: number
+    byteLength?: number,
+    chainId?: symbol
   ): SocketChunks;
 
   /**
@@ -665,7 +666,7 @@ export default class RedisCommandsQueue {
 
       if (outbound !== null) {
         const hadPending = outbound.hasPending();
-        const outputs = outbound.intercept(encoded, args, byteLength);
+        const outputs = outbound.intercept(encoded, args, byteLength, currentChainId);
 
         if (outputs.length > 0) {
           this.#cancelPendingFlush();
