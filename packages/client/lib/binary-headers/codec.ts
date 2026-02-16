@@ -57,6 +57,8 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   readonly #resolver: EligibilityResolver;
   readonly #packer: CommandPacker;
   readonly #statsCounter: BinaryHeaderStatsCounter;
+  #chainSlotCache: Map<symbol, number> = new Map();
+  #lastChainId: symbol | undefined;
 
   constructor(
     options: BinaryHeadersOutboundOptions = {},
@@ -71,10 +73,33 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     this.#packer = new CommandPacker(this.#statsCounter, packerOptions);
   }
 
-  intercept(encoded: SocketChunk, args: CommandArguments, byteLength?: number): SocketChunks {
+  intercept(encoded: SocketChunk, args: CommandArguments, byteLength?: number, chainId?: symbol): SocketChunks {
     this.#statsCounter.recordCommand();
 
-    const slot = this.#resolver.getSlot(args);
+    // Clear cache when chain changes (to avoid memory leak)
+    if (chainId !== this.#lastChainId) {
+      if (this.#lastChainId !== undefined) {
+        this.#chainSlotCache.delete(this.#lastChainId);
+      }
+      this.#lastChainId = chainId;
+    }
+
+    let slot: number;
+
+    // Fast path: reuse cached slot for same chain (multi/pipeline)
+    // If chainId is set, we trust that all commands in the chain are valid and use the same slot.
+    // If user sends invalid commands or different slots in same chain, they'll get server-side errors.
+    if (chainId !== undefined && this.#chainSlotCache.has(chainId)) {
+      slot = this.#chainSlotCache.get(chainId)!;
+    } else {
+      // Calculate slot (only once per chain)
+      slot = this.#resolver.getSlot(args);
+
+      // Cache for subsequent commands in this chain
+      if (chainId !== undefined && slot !== SLOT_INELIGIBLE) {
+        this.#chainSlotCache.set(chainId, slot);
+      }
+    }
 
     if (slot === SLOT_INELIGIBLE) {
       this.#statsCounter.recordIneligible();

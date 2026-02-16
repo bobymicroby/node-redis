@@ -2583,8 +2583,8 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
     });
   });
 
-  describe('explicit pipeline with slot changes', function () {
-    it('slot change mid-pipeline flushes first batch, rest flushes at end', function () {
+  describe('explicit pipeline with slot changes (slot cached per chainId)', function () {
+    it('commands with different slots in same chainId all use first slots cached value', function () {
       const { scheduler, stats: schedulerStats } = createTrackingScheduler();
       const queue = createBinhdrQueueWithTimer({
         timer: { maxWaitMs: 100, scheduler }
@@ -2592,23 +2592,23 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
 
       const chainId = Symbol('Pipeline Chain');
 
-      // Commands with different slots
-      queue.addCommand(['SET', '{slot1}key1', 'value1'], { chainId });
-      queue.addCommand(['SET', '{slot2}key2', 'value2'], { chainId }); // Triggers flush of slot1
-      queue.addCommand(['SET', '{slot2}key3', 'value3'], { chainId });
+      // Commands with different slots - but chainId caches the first slot
+      queue.addCommand(['SET', '{slot1}key1', 'value1'], { chainId }); // slot1 calculated and cached
+      queue.addCommand(['SET', '{slot2}key2', 'value2'], { chainId }); // uses cached slot1
+      queue.addCommand(['SET', '{slot2}key3', 'value3'], { chainId }); // uses cached slot1
 
       const results = collectYielded(queue);
 
-      // Should yield 2 batches: slot1 flushed by slot change, slot2 flushed at end
-      assert.equal(results.length, 2, 'Should yield 2 batches');
+      // Should yield 1 batch: all commands use cached slot, flushed at drain
+      assert.equal(results.length, 1, 'Should yield 1 batch (all use cached slot)');
 
       assertPackedData(results[0], {
-        commandCount: 1,
-        commands: [['SET', '{slot1}key1', 'value1']]
-      });
-      assertPackedData(results[1], {
-        commandCount: 2,
-        commands: [['SET', '{slot2}key2', 'value2'], ['SET', '{slot2}key3', 'value3']]
+        commandCount: 3,
+        commands: [
+          ['SET', '{slot1}key1', 'value1'],
+          ['SET', '{slot2}key2', 'value2'],
+          ['SET', '{slot2}key3', 'value3']
+        ]
       });
 
       // No timer should be scheduled for explicit pipeline
@@ -2620,7 +2620,7 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       queue.destroy();
     });
 
-    it('multiple slot changes in explicit pipeline all flush without timer', function () {
+    it('multiple different slots in explicit pipeline all batch together using cached slot', function () {
       const { scheduler, stats: schedulerStats } = createTrackingScheduler();
       const queue = createBinhdrQueueWithTimer({
         timer: { maxWaitMs: 100, scheduler }
@@ -2628,18 +2628,19 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
 
       const chainId = Symbol('Pipeline Chain');
 
-      // Alternating slots: A, B, C
-      queue.addCommand(['SET', '{a}k1', 'v1'], { chainId });
-      queue.addCommand(['SET', '{b}k2', 'v2'], { chainId }); // Flush A
-      queue.addCommand(['SET', '{c}k3', 'v3'], { chainId }); // Flush B
+      // Alternating slots: A, B, C - but all use cached slot from first command
+      queue.addCommand(['SET', '{a}k1', 'v1'], { chainId }); // slot a calculated and cached
+      queue.addCommand(['SET', '{b}k2', 'v2'], { chainId }); // uses cached slot a
+      queue.addCommand(['SET', '{c}k3', 'v3'], { chainId }); // uses cached slot a
 
       const results = collectYielded(queue);
 
-      // Should yield 3 batches
-      assert.equal(results.length, 3, 'Should yield 3 batches');
-      assertPackedData(results[0], { commandCount: 1, commands: [['SET', '{a}k1', 'v1']] });
-      assertPackedData(results[1], { commandCount: 1, commands: [['SET', '{b}k2', 'v2']] });
-      assertPackedData(results[2], { commandCount: 1, commands: [['SET', '{c}k3', 'v3']] });
+      // Should yield 1 batch (all use cached slot)
+      assert.equal(results.length, 1, 'Should yield 1 batch (all use cached slot)');
+      assertPackedData(results[0], {
+        commandCount: 3,
+        commands: [['SET', '{a}k1', 'v1'], ['SET', '{b}k2', 'v2'], ['SET', '{c}k3', 'v3']]
+      });
 
       // No timer scheduled
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer for explicit pipeline');
@@ -2714,7 +2715,7 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       queue.destroy();
     });
 
-    it('ineligible command in explicit pipeline still passes through', function () {
+    it('ineligible command in explicit pipeline uses cached slot and batches together', function () {
       const { scheduler, stats: schedulerStats } = createTrackingScheduler();
       const queue = createBinhdrQueueWithTimer({
         timer: { maxWaitMs: 100, scheduler }
@@ -2722,22 +2723,20 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
 
       const chainId = Symbol('Pipeline Chain');
 
-      queue.addCommand(['SET', 'k1', 'v1'], { chainId });
-      queue.addCommand(['UNKNOWNCMD', 'arg'], { chainId }); // Ineligible - triggers flush
-      queue.addCommand(['SET', 'k2', 'v2'], { chainId });
+      queue.addCommand(['SET', 'k1', 'v1'], { chainId }); // slot calculated and cached
+      queue.addCommand(['UNKNOWNCMD', 'arg'], { chainId }); // uses cached slot (not recalculated)
+      queue.addCommand(['SET', 'k2', 'v2'], { chainId }); // uses cached slot
 
       const results = collectYielded(queue);
 
-      // Should yield 3: batch1, ineligible passthrough, batch2
-      assert.equal(results.length, 3, 'Should yield 3 outputs');
+      // With chainId slot caching, all commands use the cached slot from first command
+      // So even UNKNOWNCMD gets batched together (server will error if invalid)
+      assert.equal(results.length, 1, 'Should yield 1 batch (all use cached slot)');
 
-      assertPackedData(results[0], { commandCount: 1, commands: [['SET', 'k1', 'v1']] });
-
-      // Ineligible passes through as raw RESP
-      const parsedIneligible = parseRespCommands((results[1] as string[]).join(''));
-      assert.deepEqual(parsedIneligible, [['UNKNOWNCMD', 'arg']]);
-
-      assertPackedData(results[2], { commandCount: 1, commands: [['SET', 'k2', 'v2']] });
+      assertPackedData(results[0], {
+        commandCount: 3,
+        commands: [['SET', 'k1', 'v1'], ['UNKNOWNCMD', 'arg'], ['SET', 'k2', 'v2']]
+      });
 
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
@@ -2771,23 +2770,24 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       queue.destroy();
     });
 
-    it('slot change in explicit pipeline records SLOT_MISMATCH then DRAIN', function () {
+    it('different slots in explicit pipeline all use cached slot - only DRAIN flush', function () {
       const queue = createBinhdrQueueWithTimerAndStats({
         timer: { maxWaitMs: 100, scheduler: createTimeoutScheduler() }
       });
 
       const chainId = Symbol('Pipeline Chain');
 
-      queue.addCommand(['SET', '{a}k1', 'v1'], { chainId });
-      queue.addCommand(['SET', '{b}k2', 'v2'], { chainId }); // Slot change
+      queue.addCommand(['SET', '{a}k1', 'v1'], { chainId }); // slot a cached
+      queue.addCommand(['SET', '{b}k2', 'v2'], { chainId }); // uses cached slot a
 
       collectYielded(queue);
 
       const stats = queue.getStats();
 
+      // With chainId slot caching, all commands use cached slot - no slot mismatch
       assert.equal(stats.totalCommandCount, 2, 'totalCommandCount');
-      assert.equal(stats.batchCount, 2, 'batchCount');
-      assert.equal(stats.slotMismatchFlushCount, 1, 'slotMismatchFlushCount');
+      assert.equal(stats.batchCount, 1, 'batchCount - all batched together');
+      assert.equal(stats.slotMismatchFlushCount, 0, 'slotMismatchFlushCount - no mismatch with caching');
       assert.equal(stats.drainFlushCount, 1, 'drainFlushCount');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount');
 

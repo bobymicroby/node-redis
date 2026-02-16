@@ -880,32 +880,29 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
     });
 
-    it('slot changes within explicit pipeline: still no timer flushes', function () {
+    it('different slots within explicit pipeline all use cached slot - no slot mismatch flushes', function () {
       const { queue, schedulerStats } = createQueueWithTimer();
       const chainId = Symbol('Pipeline Chain');
 
-      // Different slots - will trigger slot mismatch flushes
-      queue.addCommand(['SET', '{a}key1', 'value'], { chainId });
-      queue.addCommand(['SET', '{b}key2', 'value'], { chainId }); // Slot change
-      queue.addCommand(['SET', '{c}key3', 'value'], { chainId }); // Slot change
+      // Different slots - but with chainId slot caching, all use the first command's cached slot
+      queue.addCommand(['SET', '{a}key1', 'value'], { chainId }); // slot a calculated and cached
+      queue.addCommand(['SET', '{b}key2', 'value'], { chainId }); // uses cached slot a
+      queue.addCommand(['SET', '{c}key3', 'value'], { chainId }); // uses cached slot a
 
       const results = collectYielded(queue);
 
-      // Should have 3 batches (one per slot)
-      assert.equal(results.length, 3, 'Should yield 3 batches due to slot changes');
+      // Should have 1 batch - all commands use cached slot from first command
+      assert.equal(results.length, 1, 'Should yield 1 batch (all use cached slot)');
 
-      // No timer scheduled - slot changes are immediate flushes
+      // No timer scheduled - explicit pipeline flushes at drain
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
       const stats = queue.wireInterceptorStats();
       assert(stats, 'Stats should be available');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
-      // With chainId boundary flushing, we flush when chainId changes (not on slot mismatch)
-      // 3 different slots with same chainId = 2 slot mismatches within the chain
-      // But since all have the same chainId, we only flush at chain boundary (drain)
-      // Actually: key1 (slot a), key2 (slot b), key3 (slot c) all same chainId
-      // Slot mismatch still happens within the chain
-      assert.equal(stats.slotMismatchFlushCount, 2, 'slotMismatchFlushCount should be 2');
+      // With chainId slot caching, all commands in the same chain use the cached slot
+      // No slot mismatch occurs - only drain flush at the end
+      assert.equal(stats.slotMismatchFlushCount, 0, 'slotMismatchFlushCount should be 0 (slot cached)');
       assert.equal(stats.drainFlushCount, 1, 'drainFlushCount should be 1');
     });
 

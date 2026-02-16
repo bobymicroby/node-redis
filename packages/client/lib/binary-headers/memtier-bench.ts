@@ -16,17 +16,19 @@
  *   The -t flag is named for memtier CLI compatibility.
  *
  * Modes:
- *   1. current      - node-redis client without binary headers
- *   2. fast-headers - node-redis client with binary headers enabled
- *   3. all          - Run both modes sequentially for comparison
+ *   1. fast-headers-off - node-redis client without binary headers
+ *   2. fast-headers-on  - node-redis client with binary headers enabled
+ *   3. oss-cluster      - npm @redis/client with OSS cluster API (requires --npm-oss-cluster)
+ *   4. all              - Run applicable modes sequentially for comparison
  *
  * Usage:
  *   npx ts-node packages/client/lib/binary-headers/memtier-bench.ts [options]
  *
  * Examples:
- *   --mode current --test-time 5
- *   --mode fast-headers --pipeline 10
+ *   --mode fast-headers-off --test-time 5
+ *   --mode fast-headers-on --pipeline 10
  *   --mode all --pipeline 10 -c 4 -t 4 --test-time 30
+ *   --mode all --npm-oss-cluster --npm-client-version 5.1.1 --oss-node redis-16099.example.com:16099 --test-time 30
  */
 
 import { parseArgs } from 'node:util';
@@ -362,8 +364,74 @@ function compareProfiles(
   console.log('═'.repeat(100));
 }
 
+/**
+ * Print profile information for a single mode (no comparison)
+ */
+function printSingleProfile(
+  profile: inspector.Profiler.Profile,
+  modeName: string,
+  totalOps?: number
+): void {
+  const times = extractFunctionTimes(profile);
+
+  // Calculate total active time (excluding idle and inspector overhead)
+  let total = 0;
+  let inspectorTime = 0;
+  for (const [key, fn] of times) {
+    if (key.includes('(idle)')) continue;
+    if (key.includes('node:inspector') || fn.url.includes('node:inspector')) {
+      inspectorTime += fn.selfTime;
+    } else {
+      total += fn.selfTime;
+    }
+  }
+
+  // Sort by self time descending, excluding idle/gc/inspector from display
+  const sorted = Array.from(times.entries())
+    .filter(([key, fn]) =>
+      !key.includes('(idle)') &&
+      !key.includes('(garbage collector)') &&
+      !key.includes('node:inspector') &&
+      !fn.url.includes('node:inspector')
+    )
+    .sort((a, b) => b[1].selfTime - a[1].selfTime);
+
+  console.log('\n' + '═'.repeat(100));
+  console.log(`CPU PROFILE: ${modeName}`);
+  console.log('═'.repeat(100));
+  console.log(`Total CPU time: ${(total / 1000).toFixed(1)}ms (excludes ${(inspectorTime / 1000).toFixed(1)}ms profiler overhead)`);
+  if (totalOps && totalOps > 0) {
+    const cpuPer1KOps = (total / totalOps) * 1000;
+    console.log(`CPU time per 1K ops: ${(cpuPer1KOps / 1000).toFixed(2)}ms`);
+  }
+  console.log('-'.repeat(100));
+  console.log('Top functions by self time:');
+  console.log(`${'Function'.padEnd(50)} ${'Location'.padEnd(30)} ${'Self Time'.padStart(12)}`);
+  console.log('-'.repeat(100));
+
+  const top = sorted.slice(0, 30);
+  for (const [_key, fn] of top) {
+    const shortUrl = fn.url
+      ? fn.url
+          .replace(/^.*node_modules\//, '')
+          .replace(/^.*lib\//, 'lib/')
+      : '(native)';
+    const location = fn.url && fn.line >= 0 ? `${shortUrl}:${fn.line}` : shortUrl;
+    const timeStr = `${(fn.selfTime / 1000).toFixed(2)}ms`;
+    const pct = total > 0 ? ((fn.selfTime / total) * 100).toFixed(1) : '0.0';
+
+    console.log(`${fn.name.slice(0, 48).padEnd(50)} ${location.slice(0, 28).padEnd(30)} ${timeStr.padStart(10)} (${pct}%)`);
+  }
+
+  if (sorted.length > 30) {
+    console.log(`  ... and ${sorted.length - 30} more functions`);
+  }
+  console.log('═'.repeat(100));
+}
+
 // Dynamic client import - will be set at runtime based on --npm-client-version
 let RedisClient: any;
+let RedisCluster: any;
 let BinaryHeaderStatsClass: any;
 
 // Type alias for Redis client
@@ -375,7 +443,7 @@ const NPM_CACHE_DIR = path.join(os.homedir(), '.cache', 'memtier-bench');
 /**
  * Initialize Redis client - either from local source or npm package
  */
-function initializeRedisClient(npmVersion?: string): void {
+function initializeRedisClient(npmVersion?: string, forCluster: boolean = false): void {
   if (!npmVersion) {
     // Use local source with require (works with ts-node)
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -384,6 +452,7 @@ function initializeRedisClient(npmVersion?: string): void {
     const localStats = require('./stats');
     RedisClient = localClient.default;
     BinaryHeaderStatsClass = localStats.BinaryHeaderStats;
+    RedisCluster = null; // Local source cluster not needed for binary headers mode
     return;
   }
 
@@ -415,6 +484,24 @@ function initializeRedisClient(npmVersion?: string): void {
     }
 
     console.log(`Installed @redis/client@${npmVersion}`);
+
+    // Patch cluster-key-slot to rename 'generate' to 'calculateSlot' for clearer profiling
+    const clusterKeySlotPath = path.join(versionDir, 'node_modules', 'cluster-key-slot', 'lib', 'index.js');
+    if (fs.existsSync(clusterKeySlotPath)) {
+      let slotCode = fs.readFileSync(clusterKeySlotPath, 'utf-8');
+      // Rename the function from 'generate' to 'calculateSlot'
+      slotCode = slotCode.replace(
+        'var generate = module.exports = function generate(str) {',
+        'var calculateSlot = module.exports = function calculateSlot(str) {'
+      );
+      // Also update any internal references to 'generate'
+      slotCode = slotCode.replace(
+        /\bgenerate\b/g,
+        'calculateSlot'
+      );
+      fs.writeFileSync(clusterKeySlotPath, slotCode);
+      console.log('Patched cluster-key-slot: renamed generate -> calculateSlot');
+    }
   } else {
     console.log(`Using cached @redis/client@${npmVersion}`);
   }
@@ -437,6 +524,22 @@ function initializeRedisClient(npmVersion?: string): void {
   const clientPath = path.join(packageDir, 'dist', 'lib', 'client', 'index.js');
   const clientModule = require(clientPath);
   RedisClient = clientModule.default;
+
+  // Load cluster client if needed
+  if (forCluster) {
+    try {
+      const clusterPath = path.join(packageDir, 'dist', 'lib', 'cluster', 'index.js');
+      if (fs.existsSync(clusterPath)) {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const clusterModule = require(clusterPath);
+        RedisCluster = clusterModule.default;
+      } else {
+        RedisCluster = null;
+      }
+    } catch {
+      RedisCluster = null;
+    }
+  }
 
   // Note: BinaryHeaderStatsClass may not exist in older versions
   try {
@@ -544,7 +647,13 @@ const isWorkerProcess = process.env.MEMTIER_WORKER === '1';
 // CLI Argument Parsing
 // ============================================================================
 
-type ModeName = 'fast-headers-off' | 'fast-headers-on';
+type ModeName = 'fast-headers-off' | 'fast-headers-on' | 'oss-cluster';
+
+// OSS cluster node configuration
+interface OssClusterNode {
+  host: string;
+  port: number;
+}
 
 // Store profiles for comparison
 const collectedProfiles = new Map<string, inspector.Profiler.Profile>();
@@ -566,7 +675,7 @@ interface BenchConfig {
   keyMaximum: number;
   keyPrefix: string;
   testTime: number;
-  mode: 'fast-headers-off' | 'fast-headers-on' | 'all';
+  mode: 'fast-headers-off' | 'fast-headers-on' | 'oss-cluster' | 'all';
   interval: number;
   hideHistogram: boolean;
   username?: string;
@@ -577,6 +686,9 @@ interface BenchConfig {
   binaryHeadersMaxWaitTime?: number;
   binaryHeadersMaxCommandCount?: number;
   binaryHeadersMaxPayloadLength?: number;
+  // OSS cluster options
+  npmOssCluster?: boolean;
+  ossNodes?: OssClusterNode[];
 }
 
 function parseConfig(): BenchConfig {
@@ -603,6 +715,9 @@ function parseConfig(): BenchConfig {
       username: { type: 'string', short: 'u' },
       password: { type: 'string', short: 'a' },
       'npm-client-version': { type: 'string' },
+      // OSS cluster options
+      'npm-oss-cluster': { type: 'boolean', default: false },
+      'oss-node': { type: 'string', multiple: true },
       // Binary headers options
       'bh-timer-disabled': { type: 'boolean', default: false },
       'bh-max-wait-time': { type: 'string' },
@@ -638,6 +753,9 @@ function parseConfig(): BenchConfig {
     username: values.username as string | undefined,
     password: values.password as string | undefined,
     npmClientVersion: values['npm-client-version'] as string | undefined,
+    // OSS cluster options
+    npmOssCluster: values['npm-oss-cluster'] as boolean,
+    ossNodes: parseOssNodes(values['oss-node'] as string[] | undefined),
     // Binary headers options (undefined means use defaults)
     binaryHeadersTimerDisabled: values['bh-timer-disabled'] as boolean,
     binaryHeadersMaxWaitTime: values['bh-max-wait-time'] ? parseInt(values['bh-max-wait-time'] as string, 10) : undefined,
@@ -646,8 +764,22 @@ function parseConfig(): BenchConfig {
   };
 
   // Validation
-  if (!['fast-headers-off', 'fast-headers-on', 'all'].includes(config.mode)) {
-    throw new Error(`Invalid mode: ${config.mode}. Must be fast-headers-off, fast-headers-on, or all`);
+  if (!['fast-headers-off', 'fast-headers-on', 'oss-cluster', 'all'].includes(config.mode)) {
+    throw new Error(`Invalid mode: ${config.mode}. Must be fast-headers-off, fast-headers-on, oss-cluster, or all`);
+  }
+
+  // OSS cluster validation
+  if (config.npmOssCluster) {
+    if (!config.npmClientVersion) {
+      throw new Error('--npm-oss-cluster requires --npm-client-version to specify which npm client version to use');
+    }
+    if (!config.ossNodes || config.ossNodes.length === 0) {
+      throw new Error('--npm-oss-cluster requires at least one --oss-node (format: host:port)');
+    }
+  }
+
+  if (config.mode === 'oss-cluster' && !config.npmOssCluster) {
+    throw new Error('Mode "oss-cluster" requires --npm-oss-cluster flag');
   }
   if (config.threads < 1) {
     throw new Error(`threads (-t) must be >= 1 (note: uses child processes for parallelism)`);
@@ -674,6 +806,28 @@ function parseConfig(): BenchConfig {
   }
 
   return config;
+}
+
+/**
+ * Parse --oss-node arguments into OssClusterNode array
+ */
+function parseOssNodes(nodes: string[] | undefined): OssClusterNode[] | undefined {
+  if (!nodes || nodes.length === 0) {
+    return undefined;
+  }
+
+  return nodes.map((node, index) => {
+    const parts = node.split(':');
+    if (parts.length !== 2) {
+      throw new Error(`Invalid --oss-node format at index ${index}: "${node}". Expected format: host:port`);
+    }
+    const host = parts[0];
+    const port = parseInt(parts[1], 10);
+    if (isNaN(port) || port < 1 || port > 65535) {
+      throw new Error(`Invalid port in --oss-node at index ${index}: "${parts[1]}". Port must be a number between 1 and 65535`);
+    }
+    return { host, port };
+  });
 }
 
 // ============================================================================
@@ -860,6 +1014,7 @@ class MemtierStats {
 interface BenchClient {
   readonly client: AnyRedisClient;
   readonly binaryHeaders: boolean;
+  readonly isCluster?: boolean;
   disconnect(): Promise<void>;
 }
 
@@ -876,8 +1031,66 @@ async function createBenchClient(
   binaryHeaders: boolean,
   username?: string,
   password?: string,
-  bhOptions?: BinaryHeadersClientOptions
+  bhOptions?: BinaryHeadersClientOptions,
+  useOssCluster: boolean = false,
+  ossNodes?: OssClusterNode[]
 ): Promise<BenchClient> {
+  // OSS Cluster mode - use RedisCluster
+  if (useOssCluster && ossNodes && ossNodes.length > 0) {
+    if (!RedisCluster) {
+      throw new Error('RedisCluster not available. Make sure --npm-client-version is set and the version supports clustering.');
+    }
+
+    const rootNodes = ossNodes.map(node => ({
+      socket: { host: node.host, port: node.port }
+    }));
+
+    const cluster = RedisCluster.create({
+      rootNodes,
+      defaults: {
+        socket: {
+          connectTimeout: 10000,
+          reconnectStrategy: false,
+        },
+        ...(username ? { username } : {}),
+        ...(password ? { password } : {}),
+      },
+    });
+
+    cluster.on('error', () => {
+      // Suppress connection errors during benchmark
+    });
+
+    await cluster.connect();
+
+    // Probe with PING to verify connection works
+    try {
+      await Promise.race([
+        cluster.sendCommand(undefined, true, ['PING']),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('PING timed out - cluster not responding')), 10000)
+        ),
+      ]);
+    } catch (err) {
+      cluster.destroy();
+      throw err;
+    }
+
+    return {
+      client: cluster as AnyRedisClient,
+      binaryHeaders: false,
+      isCluster: true,
+      async disconnect() {
+        try {
+          await cluster.quit();
+        } catch {
+          cluster.destroy();
+        }
+      },
+    };
+  }
+
+  // Standard client mode
   const client = RedisClient.create({
     socket: {
       host,
@@ -930,6 +1143,7 @@ async function createBenchClient(
   return {
     client: client as AnyRedisClient,
     binaryHeaders,
+    isCluster: false,
     async disconnect() {
       try {
         await client.quit();
@@ -974,14 +1188,16 @@ function runPipelinedConnection(
   ratioGet: number,
   stats: MemtierStats,
   signal: AbortSignal,
-  connId: number
+  connId: number,
+  isCluster: boolean = false
 ): Promise<void> {
-  return new Promise((resolve) => {
+  return new Promise<void>((resolve) => {
     const ratioTotal = ratioSet + ratioGet;
     let cmdIndex = 0;
     let inFlight = 0;
     let bulkResponseCount = 0;
     let resolved = false;
+    let firstErrorLogged = false;
 
     /**
      * Issue a batch of bulk-size commands using multi().execAsPipeline().
@@ -1011,10 +1227,20 @@ function runPipelinedConnection(
         commandMeta.push({ isSet, start: bulkStart });
 
         // Use addCommand to add raw commands to the multi
-        if (isSet) {
-          multi.addCommand(['SET', key, value]);
+        // Cluster multi.addCommand has different signature: (firstKey, isReadonly, args)
+        // Regular client multi.addCommand: (args)
+        if (isCluster) {
+          if (isSet) {
+            multi.addCommand(key, false, ['SET', key, value]);
+          } else {
+            multi.addCommand(key, true, ['GET', key]);
+          }
         } else {
-          multi.addCommand(['GET', key]);
+          if (isSet) {
+            multi.addCommand(['SET', key, value]);
+          } else {
+            multi.addCommand(['GET', key]);
+          }
         }
       }
 
@@ -1027,7 +1253,12 @@ function runPipelinedConnection(
             stats.record(meta.isSet, elapsed);
           }
         })
-        .catch(() => {
+        .catch((err: Error) => {
+          // Log first error for debugging
+          if (!firstErrorLogged) {
+            console.error(`First error: ${err.message || err}`);
+            firstErrorLogged = true;
+          }
           // Record errors for each command in the bulk
           for (let i = 0; i < commandMeta.length; i++) {
             stats.recordError();
@@ -1300,9 +1531,10 @@ async function runMode(
   config: BenchConfig
 ): Promise<ModeResult | null> {
   const binaryHeaders = mode === 'fast-headers-on';
+  const useOssCluster = mode === 'oss-cluster';
 
   console.log(`\n${'═'.repeat(70)}`);
-  console.log(`  MODE: ${mode}${binaryHeaders ? ' (binary headers enabled)' : ''}`);
+  console.log(`  MODE: ${mode}${binaryHeaders ? ' (binary headers enabled)' : ''}${useOssCluster ? ' (OSS cluster)' : ''}`);
   console.log(`  Pipeline depth: ${config.pipeline} commands in flight`);
   if (config.bulkSize > 1) {
     console.log(`  Bulk size: ${config.bulkSize} commands per binary header`);
@@ -1325,7 +1557,9 @@ async function runMode(
           maxWaitTime: config.binaryHeadersMaxWaitTime,
           maxCommandCount: config.binaryHeadersMaxCommandCount,
           maxPayloadLength: config.binaryHeadersMaxPayloadLength,
-        }
+        },
+        useOssCluster,
+        config.ossNodes
       );
       clients.push(client);
     }
@@ -1364,7 +1598,8 @@ async function runMode(
       config.ratioGet,
       stats,
       ac.signal,
-      i
+      i,
+      benchClient.isCluster ?? false
     );
   });
 
@@ -1499,6 +1734,7 @@ async function runWorker(): Promise<void> {
 async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
   const { workerId, mode, config } = workerConfig;
   const binaryHeaders = mode === 'fast-headers-on';
+  const useOssCluster = mode === 'oss-cluster';
 
   // Start profiler for this worker if enabled
   if (config.profile) {
@@ -1520,7 +1756,9 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
           maxWaitTime: config.binaryHeadersMaxWaitTime,
           maxCommandCount: config.binaryHeadersMaxCommandCount,
           maxPayloadLength: config.binaryHeadersMaxPayloadLength,
-        }
+        },
+        useOssCluster,
+        config.ossNodes
       );
       clients.push(client);
     }
@@ -1551,7 +1789,8 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
       config.ratioGet,
       stats,
       ac.signal,
-      i
+      i,
+      benchClient.isCluster ?? false
     );
   });
 
@@ -1705,13 +1944,16 @@ async function runModeMultiProcess(
 
   for (let i = 0; i < numWorkers; i++) {
     // When npmClientVersion is set, fast-headers-off uses npm, fast-headers-on uses local
-    const useNpmForThisMode = config.npmClientVersion && mode === 'fast-headers-off';
+    // When npmOssCluster is set, oss-cluster mode uses npm cluster client
+    const useNpmForThisMode = (config.npmClientVersion && mode === 'fast-headers-off') ||
+                              (config.npmOssCluster && mode === 'oss-cluster');
     const worker = fork(__filename, [], {
       env: {
         ...process.env,
         MEMTIER_WORKER: '1',
         // Pass npm version to worker only if this mode should use npm client
         ...(useNpmForThisMode ? { MEMTIER_NPM_VERSION: config.npmClientVersion } : {}),
+        ...(config.npmOssCluster && mode === 'oss-cluster' ? { MEMTIER_USE_CLUSTER: '1' } : {}),
       },
       // Use 'inherit' for stdio to avoid piping issues with many workers
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
@@ -1995,7 +2237,7 @@ async function main(): Promise<void> {
 
   // Pre-install npm client if needed (so workers don't race to install)
   if (config.npmClientVersion) {
-    initializeRedisClient(config.npmClientVersion);
+    initializeRedisClient(config.npmClientVersion, config.npmOssCluster);
     console.log(''); // blank line after npm install output
   }
 
@@ -2003,7 +2245,11 @@ async function main(): Promise<void> {
   console.log('  Memtier-like Benchmark for node-redis');
   console.log('═══════════════════════════════════════════════════════════════════');
   console.log(`Host: ${config.host}:${config.port}`);
-  if (config.npmClientVersion) {
+  if (config.npmOssCluster) {
+    console.log(`Client (oss-cluster): @redis/client@${config.npmClientVersion} with createCluster() (npm)`);
+    console.log(`Client (fast-headers-on): local source (../client)`);
+    console.log(`OSS Cluster nodes: ${config.ossNodes!.map(n => `${n.host}:${n.port}`).join(', ')}`);
+  } else if (config.npmClientVersion) {
     console.log(`Client (fast-headers-off): @redis/client@${config.npmClientVersion} (npm)`);
     console.log(`Client (fast-headers-on): local source (../client)`);
   } else {
@@ -2029,17 +2275,19 @@ async function main(): Promise<void> {
 
   const modes: ModeName[] =
     config.mode === 'all'
-      ? ['fast-headers-on', 'fast-headers-off']
+      ? (config.npmOssCluster ? ['fast-headers-on', 'oss-cluster'] : ['fast-headers-on', 'fast-headers-off'])
       : [config.mode as ModeName];
 
   const results: ModeResult[] = [];
 
   for (const mode of modes) {
+    // When npmOssCluster is set: oss-cluster uses npm cluster, fast-headers-on uses local
     // When npmClientVersion is set: fast-headers-off uses npm, fast-headers-on uses local
     // Otherwise: both modes use local source
-    if (config.npmClientVersion) {
-      const useNpm = mode === 'fast-headers-off';
-      initializeRedisClient(useNpm ? config.npmClientVersion : undefined);
+    if (config.npmOssCluster && mode === 'oss-cluster') {
+      initializeRedisClient(config.npmClientVersion, true);
+    } else if (config.npmClientVersion && mode === 'fast-headers-off') {
+      initializeRedisClient(config.npmClientVersion, false);
     } else {
       initializeRedisClient(undefined);
     }
@@ -2055,10 +2303,10 @@ async function main(): Promise<void> {
     if (result) results.push(result);
 
     if (config.profile) {
-      const result = await stopCpuProfiler();
-      if (result) {
-        collectedProfiles.set(mode, result.profile);
-        collectedProfilePaths.push(result.path);
+      const profileResult = await stopCpuProfiler();
+      if (profileResult) {
+        collectedProfiles.set(mode, profileResult.profile);
+        collectedProfilePaths.push(profileResult.path);
       }
     }
   }
@@ -2073,10 +2321,12 @@ async function main(): Promise<void> {
     let onProfile: inspector.Profiler.Profile | undefined;
 
     // Prefer worker profiles (multi-process mode)
-    if (workerProfiles.has('fast-headers-off') && workerProfiles.get('fast-headers-off')!.length > 0) {
-      offProfile = mergeProfiles(workerProfiles.get('fast-headers-off')!);
-    } else if (collectedProfiles.has('fast-headers-off')) {
-      offProfile = collectedProfiles.get('fast-headers-off');
+    // For oss-cluster mode, use oss-cluster profiles as "off" for comparison
+    const offModeName = config.npmOssCluster ? 'oss-cluster' : 'fast-headers-off';
+    if (workerProfiles.has(offModeName) && workerProfiles.get(offModeName)!.length > 0) {
+      offProfile = mergeProfiles(workerProfiles.get(offModeName)!);
+    } else if (collectedProfiles.has(offModeName)) {
+      offProfile = collectedProfiles.get(offModeName);
     }
 
     if (workerProfiles.has('fast-headers-on') && workerProfiles.get('fast-headers-on')!.length > 0) {
@@ -2088,13 +2338,19 @@ async function main(): Promise<void> {
     if (offProfile && onProfile) {
       // Get ops data from results for normalized comparison
       const onResult = results.find(r => r.mode === 'fast-headers-on');
-      const offResult = results.find(r => r.mode === 'fast-headers-off');
+      const offResult = results.find(r => r.mode === (config.npmOssCluster ? 'oss-cluster' : 'fast-headers-off'));
       const opsData: ProfileOpsData | undefined = (onResult && offResult) ? {
         onTotalOps: onResult.totalOps,
         offTotalOps: offResult.totalOps,
       } : undefined;
 
       compareProfiles(offProfile, onProfile, config.npmClientVersion, opsData);
+    } else if (offProfile || onProfile) {
+      // Single mode profiling - print the available profile
+      const profile = offProfile || onProfile;
+      const modeName = offProfile ? (config.npmOssCluster ? 'oss-cluster' : 'fast-headers-off') : 'fast-headers-on';
+      const modeResult = results.find(r => r.mode === modeName);
+      printSingleProfile(profile!, modeName, modeResult?.totalOps);
     }
   }
 
@@ -2118,7 +2374,8 @@ async function main(): Promise<void> {
 if (isWorkerProcess) {
   // Worker process: get npm version from env if set
   const workerNpmVersion = process.env.MEMTIER_NPM_VERSION || undefined;
-  initializeRedisClient(workerNpmVersion);
+  const workerUseCluster = process.env.MEMTIER_USE_CLUSTER === '1';
+  initializeRedisClient(workerNpmVersion, workerUseCluster);
   runWorker()
     .then(() => {
       process.exit(0);
