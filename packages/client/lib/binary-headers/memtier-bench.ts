@@ -109,27 +109,35 @@ function normalizeProfileUrl(url: string): string {
     return url;
   }
 
+  let result: string;
+
   // Look for common path segments that indicate the start of the relative path
   // Try to extract from: .../dist/lib/... or .../lib/...
   const distLibMatch = url.match(/dist\/lib\/(.+)$/);
   if (distLibMatch) {
-    return distLibMatch[1];
+    result = distLibMatch[1];
+  } else {
+    const libMatch = url.match(/\/lib\/(.+)$/);
+    if (libMatch) {
+      result = libMatch[1];
+    } else {
+      // For node_modules paths, extract package-relative path
+      const nodeModulesMatch = url.match(/node_modules\/@redis\/client\/(.+)$/);
+      if (nodeModulesMatch) {
+        result = nodeModulesMatch[1];
+      } else {
+        // Fallback: just use the filename
+        const lastSlash = url.lastIndexOf('/');
+        result = lastSlash >= 0 ? url.slice(lastSlash + 1) : url;
+      }
+    }
   }
 
-  const libMatch = url.match(/\/lib\/(.+)$/);
-  if (libMatch) {
-    return libMatch[1];
-  }
+  // Normalize .js to .ts so compiled JS and TypeScript source are treated as the same
+  // This allows fair comparison between npm package (.js) and dev version (.ts)
+  result = result.replace(/\.js$/, '.ts');
 
-  // For node_modules paths, extract package-relative path
-  const nodeModulesMatch = url.match(/node_modules\/@redis\/client\/(.+)$/);
-  if (nodeModulesMatch) {
-    return nodeModulesMatch[1];
-  }
-
-  // Fallback: just use the filename
-  const lastSlash = url.lastIndexOf('/');
-  return lastSlash >= 0 ? url.slice(lastSlash + 1) : url;
+  return result;
 }
 
 function extractFunctionTimes(profile: inspector.Profiler.Profile): Map<string, FunctionTime> {
