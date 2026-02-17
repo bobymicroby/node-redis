@@ -16,7 +16,8 @@
     "release": "release-it"
   },
   "dependencies": {
-    "cluster-key-slot": "1.1.2"
+    "cluster-key-slot": "1.1.2",
+    "hdr-histogram-js": "^3.0.1"
   },
   "devDependencies": {
     "@node-rs/xxhash": "1.7.6",
@@ -24,7 +25,6 @@
     "@opentelemetry/sdk-metrics": "^2.2.0",
     "@redis/test-utils": "*",
     "@types/sinon": "^17.0.3",
-    "hdr-histogram-js": "^3.0.1",
     "sinon": "^17.0.1"
   },
   "peerDependencies": {

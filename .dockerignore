@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build outputs (will be rebuilt in container)
+dist/
+coverage/
+.nyc_output/
+documentation/
+tsconfig.tsbuildinfo
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Test and benchmark artifacts
+dump.rdb
+memtier_benchmark/
+*.cpuprofile
+
+# CI/CD
+.github/
+
+# Docs
+*.md
+!packages/client/lib/binary-headers/schemas/*.md
+
+# Docker files (no need to copy these into the build context)
+packages/client/lib/binary-headers/docker/
