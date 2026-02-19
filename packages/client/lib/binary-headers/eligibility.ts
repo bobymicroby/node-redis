@@ -8,24 +8,6 @@ export const SLOT_INELIGIBLE = -1;
 const DEFAULT_KEY_INDEX = 1;
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
 
-// Pre-allocated result objects to avoid allocations in hot path
-const INELIGIBLE_RESULT: EligibilityResult = Object.freeze({ eligible: false });
-
-// Pre-allocate eligible results for all possible slots (0-16383) + NULL_SLOT
-const ELIGIBLE_RESULTS: ReadonlyArray<EligibilityResult> = (() => {
-  const results: EligibilityResult[] = new Array(16385);
-  for (let i = 0; i <= 16383; i++) {
-    results[i] = Object.freeze({ eligible: true, slot: i });
-  }
-  results[16384] = Object.freeze({ eligible: true, slot: NULL_SLOT });
-  return results;
-})();
-
-function getEligibleResult(slot: number): EligibilityResult {
-  if (slot === NULL_SLOT) return ELIGIBLE_RESULTS[16384];
-  return ELIGIBLE_RESULTS[slot];
-}
-
 export type KeyPosition =
   | { readonly keyless: true }
   | { readonly index: number };
@@ -142,8 +124,8 @@ export class EligibilityResolver {
 
   getEligibility(args: CommandArguments): EligibilityResult {
     const slot = this.getSlot(args);
-    if (slot === SLOT_INELIGIBLE) return INELIGIBLE_RESULT;
-    return getEligibleResult(slot);
+    if (slot === SLOT_INELIGIBLE) return { eligible: false };
+    return { eligible: true, slot };
   }
 
   getSlot(args: CommandArguments): number {
