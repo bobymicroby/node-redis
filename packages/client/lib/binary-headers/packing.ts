@@ -9,27 +9,6 @@ import type { BinaryHeaderStatsCounter } from './stats';
 export type { Cancellable, Scheduler };
 
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
-const HEADER_LENGTH = RequestHeaderEncoder.ENCODED_LENGTH;
-const DESIGNATOR = RequestHeaderEncoder.designatorConstantValue();
-
-// Fast header encoding - uses direct byte writes instead of writeUInt32BE/writeUInt16BE
-function encodeHeaderFast(length: number, commandCount: number, slot: number): Buffer {
-  const buffer = Buffer.allocUnsafe(HEADER_LENGTH);
-
-  // Direct byte writes - faster than Buffer methods for small fixed-size data
-  buffer[0] = DESIGNATOR;
-  buffer[1] = (length >>> 24) & 0xFF;
-  buffer[2] = (length >>> 16) & 0xFF;
-  buffer[3] = (length >>> 8) & 0xFF;
-  buffer[4] = length & 0xFF;
-  buffer[5] = commandCount;
-  buffer[6] = (slot >>> 8) & 0xFF;
-  buffer[7] = slot & 0xFF;
-  buffer[8] = 0;
-  buffer[9] = 0;
-
-  return buffer;
-}
 
 /**
  * Options for CommandPacker flush thresholds.
@@ -189,11 +168,11 @@ export class CommandPacker {
     const count = this.#respCount;
     this.#statsCounter.recordFlush(reason);
 
-    // Use fast header encoding
-    const header = encodeHeaderFast(
+    const header = RequestHeaderEncoder.allocateAndEncode(
       this.#totalPayloadLength,
       count,
-      toWireSlot(this.#resolvedSlot)
+      toWireSlot(this.#resolvedSlot),
+      0  // clientIdx - not used in current implementation
     );
 
     // Calculate total parts needed

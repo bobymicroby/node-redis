@@ -61,18 +61,51 @@ function bufferReadMethod(type: PrimitiveType, endian?: Endianness): string {
   return methodMap[type];
 }
 
-function bufferWriteMethod(type: PrimitiveType, endian?: Endianness): string {
-  const suffix = endianSuffix(type, endian);
-  const methodMap: Record<PrimitiveType, string> = {
-    uint8: 'writeUInt8', int8: 'writeInt8',
-    uint16: `writeUInt16${suffix}`, int16: `writeInt16${suffix}`,
-    uint32: `writeUInt32${suffix}`, int32: `writeInt32${suffix}`,
-  };
-  return methodMap[type];
-}
-
 function formatHex(value: number): string {
   return value >= 16 ? '0x' + value.toString(16).toUpperCase() : value.toString();
+}
+
+/**
+ * Generate fast manual byte write statements for multi-byte integers.
+ * This is faster than Buffer.writeUInt32BE/writeUInt16BE because it avoids
+ * the overhead of bounds checking and method dispatch.
+ */
+function generateFastByteWrites(
+  bufferExpr: string,
+  offsetExpr: string,
+  valueExpr: string,
+  type: PrimitiveType,
+  endian?: Endianness
+): string[] {
+  const isBigEndian = endian !== 'little';
+  const lines: string[] = [];
+
+  if (type === 'uint32' || type === 'int32') {
+    if (isBigEndian) {
+      lines.push(`${bufferExpr}[${offsetExpr}] = (${valueExpr} >>> 24) & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 1] = (${valueExpr} >>> 16) & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 2] = (${valueExpr} >>> 8) & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 3] = ${valueExpr} & 0xFF;`);
+    } else {
+      lines.push(`${bufferExpr}[${offsetExpr}] = ${valueExpr} & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 1] = (${valueExpr} >>> 8) & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 2] = (${valueExpr} >>> 16) & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 3] = (${valueExpr} >>> 24) & 0xFF;`);
+    }
+  } else if (type === 'uint16' || type === 'int16') {
+    if (isBigEndian) {
+      lines.push(`${bufferExpr}[${offsetExpr}] = (${valueExpr} >>> 8) & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 1] = ${valueExpr} & 0xFF;`);
+    } else {
+      lines.push(`${bufferExpr}[${offsetExpr}] = ${valueExpr} & 0xFF;`);
+      lines.push(`${bufferExpr}[${offsetExpr} + 1] = (${valueExpr} >>> 8) & 0xFF;`);
+    }
+  } else {
+    // uint8/int8 - single byte
+    lines.push(`${bufferExpr}[${offsetExpr}] = ${valueExpr};`);
+  }
+
+  return lines;
 }
 
 
@@ -275,15 +308,14 @@ function generateEncoderSetter(meta: FieldMetadata, className: string): string[]
     lines.push(`    this.#buffer![byteOffset] = current | (value & ${formatHex(meta.mask!)});`);
     lines.push('    return this;');
     lines.push('  }');
-  } else if (meta.type === 'uint8' || meta.type === 'int8') {
-    lines.push(`  ${name}(value: number): ${className} {`);
-    lines.push(`    this.#buffer![this.#offset + ${className}.${name}EncodingOffset()] = value;`);
-    lines.push('    return this;');
-    lines.push('  }');
   } else {
-    const method = bufferWriteMethod(meta.type, meta.endian);
+    // Use fast manual byte writes for all numeric types
     lines.push(`  ${name}(value: number): ${className} {`);
-    lines.push(`    this.#buffer!.${method}(value, this.#offset + ${className}.${name}EncodingOffset());`);
+    const offsetExpr = `this.#offset + ${className}.${name}EncodingOffset()`;
+    const byteWrites = generateFastByteWrites('this.#buffer!', offsetExpr, 'value', meta.type, meta.endian);
+    for (const line of byteWrites) {
+      lines.push(`    ${line}`);
+    }
     lines.push('    return this;');
     lines.push('  }');
   }
@@ -361,11 +393,11 @@ function generateEncoderClass(msg: MessageSchema, schemaVersion: number): string
   lines.push(`  static encodeInto(buffer: Buffer, offset: number, ${params}): number {`);
 
   for (const meta of fixedFields) {
-    if (meta.type === 'uint8' || meta.type === 'int8') {
-      lines.push(`    buffer[offset + ${className}.${meta.name}EncodingOffset()] = ${className}.${meta.name}ConstantValue();`);
-    } else {
-      const method = bufferWriteMethod(meta.type as PrimitiveType, meta.endian);
-      lines.push(`    buffer.${method}(${className}.${meta.name}ConstantValue(), offset + ${className}.${meta.name}EncodingOffset());`);
+    const offsetExpr = `offset + ${className}.${meta.name}EncodingOffset()`;
+    const valueExpr = `${className}.${meta.name}ConstantValue()`;
+    const byteWrites = generateFastByteWrites('buffer', offsetExpr, valueExpr, meta.type as PrimitiveType, meta.endian);
+    for (const line of byteWrites) {
+      lines.push(`    ${line}`);
     }
   }
 
@@ -375,11 +407,12 @@ function generateEncoderClass(msg: MessageSchema, schemaVersion: number): string
       const group = bitfieldGroups.get(meta.offset) ?? [];
       group.push(meta);
       bitfieldGroups.set(meta.offset, group);
-    } else if (meta.type === 'uint8' || meta.type === 'int8') {
-      lines.push(`    buffer[offset + ${className}.${meta.name}EncodingOffset()] = ${meta.name};`);
     } else {
-      const method = bufferWriteMethod(meta.type, meta.endian);
-      lines.push(`    buffer.${method}(${meta.name}, offset + ${className}.${meta.name}EncodingOffset());`);
+      const offsetExpr = `offset + ${className}.${meta.name}EncodingOffset()`;
+      const byteWrites = generateFastByteWrites('buffer', offsetExpr, meta.name, meta.type, meta.endian);
+      for (const line of byteWrites) {
+        lines.push(`    ${line}`);
+      }
     }
   }
 
