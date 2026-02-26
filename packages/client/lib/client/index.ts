@@ -674,14 +674,18 @@ export default class RedisClient<
     return options;
   }
 
+  #normalizedBinaryHeadersOptions(): BinaryHeadersOptions | undefined {
+    if (this.#options.binaryHeaders === true) {
+      return { enabled: true };
+    }
+    if (this.#options.binaryHeaders === false) {
+      return undefined;
+    }
+    return this.#options.binaryHeaders;
+  }
+
   #initiateQueue(): RedisCommandsQueue {
-    // Normalize binaryHeaders option: boolean true becomes { enabled: true }
-    const binaryHeadersOpts: BinaryHeadersOptions | undefined =
-      this.#options.binaryHeaders === true
-        ? { enabled: true }
-        : this.#options.binaryHeaders === false
-          ? undefined
-          : this.#options.binaryHeaders;
+    const binaryHeadersOpts = this.#normalizedBinaryHeadersOptions();
 
     if (binaryHeadersOpts?.enabled) {
       // Create stats counter based on stats-collector option (default to noop)
@@ -723,8 +727,8 @@ export default class RedisClient<
   }
 
   #setupBinhdrFlushCallback(): void {
-    const binaryHeadersOpts = this.#options.binaryHeaders;
-    if (binaryHeadersOpts && typeof binaryHeadersOpts === 'object' && binaryHeadersOpts.enabled && binaryHeadersOpts.timer !== false) {
+    const binaryHeadersOpts = this.#normalizedBinaryHeadersOptions();
+    if (binaryHeadersOpts?.enabled && binaryHeadersOpts.timer !== false) {
       this.#queue.setTimerFlushCallback(encoded => {
         this.#socket.write([encoded]);
       });

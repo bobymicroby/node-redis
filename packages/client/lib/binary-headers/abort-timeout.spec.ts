@@ -2,9 +2,12 @@ import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { once } from 'node:events';
 import net from 'node:net';
-import { createClient, RedisClientType } from '../..';
+import RedisClient, { RedisClientType } from '../client';
+import RedisCommandsQueue from '../client/commands-queue';
 import { createBinhdrResponse } from './test-utils';
 import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
+
+const createClient = RedisClient.create;
 
 interface ParsedRequest {
   hasBinaryHeader: boolean;
@@ -30,10 +33,10 @@ function parseClientRequest(data: Buffer): ParsedRequest {
 describe('Binary Headers Abort and Timeout', function () {
   this.timeout(10000);
 
-  let server: net.Server;
+  let server: net.Server | undefined;
   let port: number;
   let receivedRequests: ParsedRequest[];
-  let client: RedisClientType;
+  let client: RedisClientType | undefined;
 
   async function getFreePort(): Promise<number> {
     return new Promise((resolve, reject) => {
@@ -70,10 +73,10 @@ describe('Binary Headers Abort and Timeout', function () {
     });
   }
 
-  async function createConnectedClient(): Promise<RedisClientType> {
+  async function createConnectedClient(binaryHeaders: boolean | { enabled: true } = { enabled: true }): Promise<RedisClientType> {
     client = createClient({
       socket: { host: 'localhost', port },
-      binaryHeaders: { enabled: true },
+      binaryHeaders,
       disableClientInfo: true,
     });
     client.on('error', () => {});
@@ -99,8 +102,12 @@ describe('Binary Headers Abort and Timeout', function () {
   });
 
   afterEach(function () {
-    client?.destroy();
+    if (client?.isOpen) {
+      client.destroy();
+    }
+    client = undefined;
     server?.close();
+    server = undefined;
   });
 
   describe('Abort signal handling', function () {
@@ -247,6 +254,46 @@ describe('Binary Headers Abort and Timeout', function () {
       // Abort after completion - no effect
       controller.abort();
       assert.equal(await client.ping(), 'PONG');
+    });
+  });
+
+  describe('Binary headers option normalization', function () {
+    function countTimerFlushCallbackWiring(binaryHeaders: boolean | { enabled: true }): number {
+      const original = RedisCommandsQueue.prototype.setTimerFlushCallback;
+      let calls = 0;
+
+      try {
+        (RedisCommandsQueue.prototype as unknown as { setTimerFlushCallback: typeof original }).setTimerFlushCallback =
+          function (this: RedisCommandsQueue, callback: (encoded: ReadonlyArray<unknown>) => void): void {
+            calls++;
+            original.call(this, callback as Parameters<typeof original>[0]);
+          };
+
+        createClient({
+          binaryHeaders,
+          disableClientInfo: true,
+        }).on('error', () => {});
+      } finally {
+        (RedisCommandsQueue.prototype as unknown as { setTimerFlushCallback: typeof original }).setTimerFlushCallback = original;
+      }
+
+      return calls;
+    }
+
+    it('binaryHeaders object form wires timer flush callback (control)', function () {
+      assert.equal(
+        countTimerFlushCallbackWiring({ enabled: true }),
+        1,
+        'Expected timer flush callback to be wired for binaryHeaders: { enabled: true }'
+      );
+    });
+
+    it('binaryHeaders: true wires timer flush callback', function () {
+      assert.equal(
+        countTimerFlushCallbackWiring(true),
+        1,
+        'Expected timer flush callback to be wired for binaryHeaders: true'
+      );
     });
   });
 });
