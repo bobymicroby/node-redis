@@ -136,6 +136,20 @@ const ASCII_ZERO = 0x30;
 const ASCII_NINE = 0x39;
 const BOOL_TRUE = 0x74;
 const BOOL_FALSE = 0x66;
+const RESP_SIMPLE_STRING = 0x2B; // +
+const RESP_SIMPLE_ERROR = 0x2D; // -
+const RESP_INTEGER = 0x3A; // :
+const RESP_DOUBLE = 0x2C; // ,
+const RESP_BIG_NUMBER = 0x28; // (
+const RESP_BOOLEAN = 0x23; // #
+const RESP_NULL = 0x5F; // _
+const RESP_BLOB_STRING = 0x24; // $
+const RESP_BLOB_ERROR = 0x21; // !
+const RESP_VERBATIM_STRING = 0x3D; // =
+const RESP_ARRAY = 0x2A; // *
+const RESP_SET = 0x7E; // ~
+const RESP_PUSH = 0x3E; // >
+const RESP_MAP = 0x25; // %
 
 const enum ParseResult {
   CONTINUE,
@@ -150,14 +164,20 @@ const enum InboundMode {
 }
 
 const enum PlainParseState {
+  // Await a RESP type byte for the next plain value/frame.
   EXPECT_TYPE,
+  // Read until CRLF (for +, -, :, ,, () values).
   READ_SIMPLE_LINE,
+  // Read a signed length line until CRLF (for $, !, =, *, ~, >, %).
   READ_LENGTH_LINE,
+  // Read single boolean token byte (t/f), then CRLF.
   READ_BOOLEAN_VALUE,
   EXPECT_BOOLEAN_CR,
   EXPECT_BOOLEAN_LF,
+  // Read RESP null terminator "_\r\n".
   EXPECT_NULL_CR,
   EXPECT_NULL_LF,
+  // Read fixed-size blob payload, then CRLF terminator.
   READ_BULK_DATA,
   EXPECT_BULK_CR,
   EXPECT_BULK_LF,
@@ -175,6 +195,41 @@ const enum PlainConsumeResult {
 }
 
 /**
+ * Developer note: inbound state model
+ *
+ * Top-level mode transitions:
+ *   UNKNOWN --(valid binary header)--> BINARY
+ *   UNKNOWN --(non-designator byte)--> PLAIN
+ *   PLAIN   --(any subsequent chunk)--> PLAIN
+ *   BINARY  --(mixed plain frame)-----> BINARY
+ *
+ * Decode loop (high level):
+ *   [payloadRemaining > 0] -> forward payload bytes
+ *   [BINARY and (plain frame in progress or non-designator)] -> consume one plain RESP frame
+ *   [non-designator in UNKNOWN/PLAIN] -> passthrough tail (lock UNKNOWN->PLAIN)
+ *   [designator candidate] -> parse header (valid => BINARY + payloadRemaining)
+ *
+ * Plain-frame sub-state machine (used only by BINARY mixed fallback):
+ *   EXPECT_TYPE
+ *     -> READ_SIMPLE_LINE   (+ - : , ()
+ *     -> READ_BOOLEAN_VALUE (#)
+ *     -> EXPECT_NULL_CR     (_)
+ *     -> READ_LENGTH_LINE   ($ ! = * ~ > %)
+ *
+ *   READ_SIMPLE_LINE -> COMPLETE on CRLF
+ *   READ_BOOLEAN_VALUE -> EXPECT_BOOLEAN_CR -> EXPECT_BOOLEAN_LF -> COMPLETE
+ *   EXPECT_NULL_CR -> EXPECT_NULL_LF -> COMPLETE
+ *
+ *   READ_LENGTH_LINE
+ *     bulk-like ($ ! =):
+ *       len == -1 -> COMPLETE
+ *       len >= 0  -> READ_BULK_DATA -> EXPECT_BULK_CR -> EXPECT_BULK_LF -> COMPLETE
+ *     aggregate-like (* ~ > %):
+ *       len <= 0  -> COMPLETE
+ *       len > 0   -> push remaining child count, loop through EXPECT_TYPE until exhausted
+ */
+
+/**
  * Binary headers inbound interceptor.
  *
  * - Parses binary header frames from incoming data
@@ -185,7 +240,8 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
   readonly #onProtocolError: OnProtocolError | undefined;
-  #plainProbeActive = false;
+  // True when a plain RESP frame began in binary mode but has not completed yet.
+  #plainFrameInProgress = false;
   #plainParseState = PlainParseState.EXPECT_TYPE;
   #plainSawCR = false;
   #plainLengthValue = 0;
@@ -229,7 +285,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
       // Once binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
       // Consume exactly one plain RESP frame, then continue scanning for the next header.
       // This path also handles the continuation of plain frames split across chunks.
-      if (this.#mode === InboundMode.BINARY && (this.#plainProbeActive || data[offset] !== DESIGNATOR)) {
+      if (this.#mode === InboundMode.BINARY && (this.#plainFrameInProgress || data[offset] !== DESIGNATOR)) {
         const plainFrameEnd = this.#consumeBinaryModePlainFrame(data, offset, emit);
         if (plainFrameEnd === -1) {
           return;
@@ -239,12 +295,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
       }
 
       if (data[offset] !== DESIGNATOR) {
-
-        // Pre-binary mode: any non-designator data means plain RESP path.
-        if (this.#mode === InboundMode.UNKNOWN) {
-          this.#mode = InboundMode.PLAIN;
-        }
-        emit(data.subarray(offset));
+        this.#emitPreBinaryPassthroughAndLockMode(data, offset, emit);
         return;
       }
 
@@ -273,8 +324,16 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     return offset + toForward;
   }
 
+  #emitPreBinaryPassthroughAndLockMode(data: Buffer, offset: number, emit: (data: Buffer) => void): void {
+    // Once we see a non-designator before any valid binary frame, stay in plain mode.
+    if (this.#mode === InboundMode.UNKNOWN) {
+      this.#mode = InboundMode.PLAIN;
+    }
+    emit(data.subarray(offset));
+  }
+
   #consumeBinaryModePlainFrame(data: Buffer, offset: number, emit: (data: Buffer) => void): number {
-    const plainFrameEnd = this.#findPlainFrameEnd(data, offset);
+    const plainFrameEnd = this.#consumePlainFrameEnd(data, offset);
     if (plainFrameEnd === -1) {
       emit(data.subarray(offset));
       return -1;
@@ -283,7 +342,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     return plainFrameEnd;
   }
 
-  #findPlainFrameEnd(data: Buffer, startOffset: number): number {
+  #consumePlainFrameEnd(data: Buffer, startOffset: number): number {
     for (let i = startOffset; i < data.length; i++) {
       const consume = this.#consumePlainByte(data[i]);
       if (consume === PlainConsumeResult.INVALID) {
@@ -296,11 +355,12 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
       }
     }
 
-    this.#plainProbeActive = true;
+    this.#plainFrameInProgress = true;
     return -1;
   }
 
   #resetPlainProbe(): void {
+    // Invariant: reset to parser-start state and clear all pending per-frame metadata.
     this.#plainParseState = PlainParseState.EXPECT_TYPE;
     this.#plainSawCR = false;
     this.#resetPlainLengthParser();
@@ -308,7 +368,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     this.#plainLengthKind = PlainLengthKind.BULK;
     this.#plainAggregateMultiplier = 1;
     this.#plainContainerRemaining.length = 0;
-    this.#plainProbeActive = false;
+    this.#plainFrameInProgress = false;
   }
 
   #resetPlainLengthParser(): void {
@@ -383,34 +443,34 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
 
   #consumePlainType(byte: number): PlainConsumeResult {
     switch (byte) {
-      case 0x2B: // +
-      case 0x2D: // -
-      case 0x3A: // :
-      case 0x2C: // ,
-      case 0x28: // (
+      case RESP_SIMPLE_STRING:
+      case RESP_SIMPLE_ERROR:
+      case RESP_INTEGER:
+      case RESP_DOUBLE:
+      case RESP_BIG_NUMBER:
         this.#plainParseState = PlainParseState.READ_SIMPLE_LINE;
         this.#plainSawCR = false;
         return PlainConsumeResult.CONTINUE;
 
-      case 0x23: // #
+      case RESP_BOOLEAN:
         this.#plainParseState = PlainParseState.READ_BOOLEAN_VALUE;
         return PlainConsumeResult.CONTINUE;
 
-      case 0x5F: // _
+      case RESP_NULL:
         this.#plainParseState = PlainParseState.EXPECT_NULL_CR;
         return PlainConsumeResult.CONTINUE;
 
-      case 0x24: // $
-      case 0x21: // !
-      case 0x3D: // =
+      case RESP_BLOB_STRING:
+      case RESP_BLOB_ERROR:
+      case RESP_VERBATIM_STRING:
         return this.#startPlainLengthLine(PlainLengthKind.BULK, 1);
 
-      case 0x2A: // *
-      case 0x7E: // ~
-      case 0x3E: // >
+      case RESP_ARRAY:
+      case RESP_SET:
+      case RESP_PUSH:
         return this.#startPlainLengthLine(PlainLengthKind.AGGREGATE, 1);
 
-      case 0x25: // %
+      case RESP_MAP:
         return this.#startPlainLengthLine(PlainLengthKind.AGGREGATE, 2);
 
       default:
@@ -497,6 +557,8 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   }
 
   #onPlainValueComplete(): PlainConsumeResult {
+    // Invariant: after a value completes, parser points at the next type byte
+    // unless we are still inside an aggregate container.
     this.#plainParseState = PlainParseState.EXPECT_TYPE;
     this.#plainSawCR = false;
     this.#resetPlainLengthParser();
