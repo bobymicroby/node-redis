@@ -984,16 +984,42 @@ describe('Codec Queue [codec-queue]', function () {
     });
 
     it('switches from binary header frame to regular RESP passthrough', async function () {
-      // This tests when non-binhdr data comes through (passthrough behavior)
-      const queue = createNoCodecQueue(); // No codec - baseline
-      const promise = queue.addCommand<number>(['INCR', 'x']);
+      const queue = createBinhdrQueue();
+      const promise1 = queue.addCommand<string>(['PING']);
+      const promise2 = queue.addCommand<number>(['INCR', 'x']);
       for (const _ of queue.commandsToWrite()) {}
 
-      // Regular RESP (not binary header wrapped)
+      queue.processIncomingData(createBinhdrFrame(Buffer.from('+PONG\r\n')));
       queue.processIncomingData(Buffer.from(':999\r\n'));
 
-      const result = await promise;
-      assert.equal(result, 999);
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+      assert.equal(result1, 'PONG');
+      assert.equal(result2, 999);
+    });
+
+    it('handles mixed plain RESP and binary frame in a single chunk after binary traffic', async function () {
+      const queue = createBinhdrQueue();
+
+      // Prime interceptor as "binary observed".
+      const prime = queue.addCommand<string>(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+      queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n')));
+      assert.equal(await prime, 'OK');
+
+      const promise1 = queue.addCommand<number>(['INCR', 'x']);
+      const promise2 = queue.addCommand<number>(['INCR', 'y']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      const mixedChunk = Buffer.concat([
+        Buffer.from(':1\r\n'),
+        createBinhdrFrame(Buffer.from(':2\r\n')),
+      ]);
+
+      queue.processIncomingData(mixedChunk);
+
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+      assert.equal(result1, 1);
+      assert.equal(result2, 2);
     });
   });
 

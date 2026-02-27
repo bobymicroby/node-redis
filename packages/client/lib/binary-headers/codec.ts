@@ -149,6 +149,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   readonly #onProtocolError: OnProtocolError | undefined;
   #partial: Buffer | null = null;
   #payloadRemaining = 0;
+  #seenBinaryHeader = false;
 
   constructor(options: BinaryHeadersInboundOptions = {}) {
     this.#onHeader = options.onHeader;
@@ -162,6 +163,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   reset(): void {
     this.#partial = null;
     this.#payloadRemaining = 0;
+    this.#seenBinaryHeader = false;
   }
 
   #decode(chunk: Buffer, emit: (data: Buffer) => void): void {
@@ -172,6 +174,26 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     while (offset < data.length) {
       if (this.#payloadRemaining > 0) {
         offset = this.#forwardPayload(data, offset, emit);
+        continue;
+      }
+
+      if (data[offset] !== DESIGNATOR) {
+        // Before we see any binary frame, preserve original behavior: passthrough the rest.
+        if (!this.#seenBinaryHeader) {
+          emit(data.subarray(offset));
+          return;
+        }
+
+        // After binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
+        // Recover by forwarding the plain prefix up to the next CRLF-boundary designator candidate.
+        const nextHeaderOffset = this.#findNextHeaderOffset(data, offset + 1);
+        if (nextHeaderOffset === -1) {
+          emit(data.subarray(offset));
+          return;
+        }
+
+        emit(data.subarray(offset, nextHeaderOffset));
+        offset = nextHeaderOffset;
         continue;
       }
 
@@ -189,6 +211,20 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     emit(data.subarray(offset, offset + toForward));
     this.#payloadRemaining -= toForward;
     return offset + toForward;
+  }
+
+  #findNextHeaderOffset(data: Buffer, startOffset: number): number {
+    for (let i = startOffset; i < data.length; i++) {
+      if (
+        data[i] === DESIGNATOR &&
+        i >= 2 &&
+        data[i - 2] === 0x0D &&
+        data[i - 1] === 0x0A
+      ) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   #parseHeader(data: Buffer, offset: number, emit: (data: Buffer) => void): ParseResult {
@@ -210,6 +246,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     }
 
     this.#payloadRemaining = this.#headerDecoder.length();
+    this.#seenBinaryHeader = true;
 
     if (this.#onHeader !== undefined || (this.#onProtocolError !== undefined && this.#headerDecoder.protocolError())) {
       const header = this.#headerDecoder.toObject();
