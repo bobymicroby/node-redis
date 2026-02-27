@@ -129,6 +129,8 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
 
 const HEADER_LENGTH = ResponseHeaderDecoder.ENCODED_LENGTH;
 const DESIGNATOR = ResponseHeaderDecoder.designatorConstantValue();
+const CR = 0x0D;
+const LF = 0x0A;
 
 const enum ParseResult {
   CONTINUE,
@@ -142,6 +144,31 @@ const enum InboundMode {
   BINARY,
 }
 
+const enum PlainParseState {
+  EXPECT_TYPE,
+  READ_SIMPLE_LINE,
+  READ_LENGTH_LINE,
+  READ_BOOLEAN_VALUE,
+  EXPECT_BOOLEAN_CR,
+  EXPECT_BOOLEAN_LF,
+  EXPECT_NULL_CR,
+  EXPECT_NULL_LF,
+  READ_BULK_DATA,
+  EXPECT_BULK_CR,
+  EXPECT_BULK_LF,
+}
+
+const enum PlainLengthKind {
+  BULK,
+  AGGREGATE,
+}
+
+const enum PlainConsumeResult {
+  CONTINUE,
+  COMPLETE,
+  INVALID,
+}
+
 /**
  * Binary headers inbound interceptor.
  *
@@ -153,6 +180,14 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
   readonly #onProtocolError: OnProtocolError | undefined;
+  #plainProbeActive = false;
+  #plainParseState = PlainParseState.EXPECT_TYPE;
+  #plainLine = '';
+  #plainSawCR = false;
+  #plainBulkRemaining = 0;
+  #plainLengthKind: PlainLengthKind = PlainLengthKind.BULK;
+  #plainAggregateMultiplier = 1;
+  readonly #plainContainerRemaining: number[] = [];
   #partial: Buffer | null = null;
   #payloadRemaining = 0;
   #mode = InboundMode.UNKNOWN;
@@ -170,6 +205,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     this.#partial = null;
     this.#payloadRemaining = 0;
     this.#mode = InboundMode.UNKNOWN;
+    this.#resetPlainProbe();
   }
 
   #decode(chunk: Buffer, emit: (data: Buffer) => void): void {
@@ -183,18 +219,32 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
         continue;
       }
 
+      // If a plain RESP frame was started in a previous chunk while in binary mode,
+      // continue consuming it even if this chunk starts with 0x80.
+      if (this.#mode === InboundMode.BINARY && this.#plainProbeActive) {
+        const plainFrameEnd = this.#findPlainFrameEnd(data, offset);
+        if (plainFrameEnd === -1) {
+          emit(data.subarray(offset));
+          return;
+        }
+
+        emit(data.subarray(offset, plainFrameEnd));
+        offset = plainFrameEnd;
+        continue;
+      }
+
       if (data[offset] !== DESIGNATOR) {
         // Once binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
-        // Recover by forwarding the plain prefix up to the next CRLF-boundary designator candidate.
+        // Consume exactly one plain RESP frame, then continue scanning for the next header.
         if (this.#mode === InboundMode.BINARY) {
-          const nextHeaderOffset = this.#findNextHeaderOffset(data, offset + 1);
-          if (nextHeaderOffset === -1) {
+          const plainFrameEnd = this.#findPlainFrameEnd(data, offset);
+          if (plainFrameEnd === -1) {
             emit(data.subarray(offset));
             return;
           }
 
-          emit(data.subarray(offset, nextHeaderOffset));
-          offset = nextHeaderOffset;
+          emit(data.subarray(offset, plainFrameEnd));
+          offset = plainFrameEnd;
           continue;
         }
 
@@ -231,18 +281,223 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     return offset + toForward;
   }
 
-  #findNextHeaderOffset(data: Buffer, startOffset: number): number {
+  #findPlainFrameEnd(data: Buffer, startOffset: number): number {
     for (let i = startOffset; i < data.length; i++) {
-      if (
-        data[i] === DESIGNATOR &&
-        i >= 2 &&
-        data[i - 2] === 0x0D &&
-        data[i - 1] === 0x0A
-      ) {
-        return i;
+      const consume = this.#consumePlainByte(data[i]);
+      if (consume === PlainConsumeResult.INVALID) {
+        this.#resetPlainProbe();
+        return -1;
+      }
+      if (consume === PlainConsumeResult.COMPLETE) {
+        this.#resetPlainProbe();
+        return i + 1;
       }
     }
+
+    this.#plainProbeActive = true;
     return -1;
+  }
+
+  #resetPlainProbe(): void {
+    this.#plainParseState = PlainParseState.EXPECT_TYPE;
+    this.#plainLine = '';
+    this.#plainSawCR = false;
+    this.#plainBulkRemaining = 0;
+    this.#plainLengthKind = PlainLengthKind.BULK;
+    this.#plainAggregateMultiplier = 1;
+    this.#plainContainerRemaining.length = 0;
+    this.#plainProbeActive = false;
+  }
+
+  #consumePlainByte(byte: number): PlainConsumeResult {
+    switch (this.#plainParseState) {
+      case PlainParseState.EXPECT_TYPE:
+        return this.#consumePlainType(byte);
+
+      case PlainParseState.READ_SIMPLE_LINE:
+        return this.#consumeSimpleLineByte(byte);
+
+      case PlainParseState.READ_LENGTH_LINE:
+        return this.#consumeLengthLineByte(byte);
+
+      case PlainParseState.READ_BOOLEAN_VALUE:
+        this.#plainParseState = PlainParseState.EXPECT_BOOLEAN_CR;
+        return PlainConsumeResult.CONTINUE;
+
+      case PlainParseState.EXPECT_BOOLEAN_CR:
+        if (byte !== CR) return PlainConsumeResult.INVALID;
+        this.#plainParseState = PlainParseState.EXPECT_BOOLEAN_LF;
+        return PlainConsumeResult.CONTINUE;
+
+      case PlainParseState.EXPECT_BOOLEAN_LF:
+        if (byte !== LF) return PlainConsumeResult.INVALID;
+        return this.#onPlainValueComplete();
+
+      case PlainParseState.EXPECT_NULL_CR:
+        if (byte !== CR) return PlainConsumeResult.INVALID;
+        this.#plainParseState = PlainParseState.EXPECT_NULL_LF;
+        return PlainConsumeResult.CONTINUE;
+
+      case PlainParseState.EXPECT_NULL_LF:
+        if (byte !== LF) return PlainConsumeResult.INVALID;
+        return this.#onPlainValueComplete();
+
+      case PlainParseState.READ_BULK_DATA:
+        this.#plainBulkRemaining--;
+        if (this.#plainBulkRemaining === 0) {
+          this.#plainParseState = PlainParseState.EXPECT_BULK_CR;
+        }
+        return PlainConsumeResult.CONTINUE;
+
+      case PlainParseState.EXPECT_BULK_CR:
+        if (byte !== CR) return PlainConsumeResult.INVALID;
+        this.#plainParseState = PlainParseState.EXPECT_BULK_LF;
+        return PlainConsumeResult.CONTINUE;
+
+      case PlainParseState.EXPECT_BULK_LF:
+        if (byte !== LF) return PlainConsumeResult.INVALID;
+        return this.#onPlainValueComplete();
+
+      default:
+        return PlainConsumeResult.INVALID;
+    }
+  }
+
+  #consumePlainType(byte: number): PlainConsumeResult {
+    switch (byte) {
+      case 0x2B: // +
+      case 0x2D: // -
+      case 0x3A: // :
+      case 0x2C: // ,
+      case 0x28: // (
+        this.#plainParseState = PlainParseState.READ_SIMPLE_LINE;
+        this.#plainSawCR = false;
+        return PlainConsumeResult.CONTINUE;
+
+      case 0x23: // #
+        this.#plainParseState = PlainParseState.READ_BOOLEAN_VALUE;
+        return PlainConsumeResult.CONTINUE;
+
+      case 0x5F: // _
+        this.#plainParseState = PlainParseState.EXPECT_NULL_CR;
+        return PlainConsumeResult.CONTINUE;
+
+      case 0x24: // $
+      case 0x21: // !
+      case 0x3D: // =
+        this.#plainParseState = PlainParseState.READ_LENGTH_LINE;
+        this.#plainLengthKind = PlainLengthKind.BULK;
+        this.#plainAggregateMultiplier = 1;
+        this.#plainLine = '';
+        this.#plainSawCR = false;
+        return PlainConsumeResult.CONTINUE;
+
+      case 0x2A: // *
+      case 0x7E: // ~
+      case 0x3E: // >
+        this.#plainParseState = PlainParseState.READ_LENGTH_LINE;
+        this.#plainLengthKind = PlainLengthKind.AGGREGATE;
+        this.#plainAggregateMultiplier = 1;
+        this.#plainLine = '';
+        this.#plainSawCR = false;
+        return PlainConsumeResult.CONTINUE;
+
+      case 0x25: // %
+        this.#plainParseState = PlainParseState.READ_LENGTH_LINE;
+        this.#plainLengthKind = PlainLengthKind.AGGREGATE;
+        this.#plainAggregateMultiplier = 2;
+        this.#plainLine = '';
+        this.#plainSawCR = false;
+        return PlainConsumeResult.CONTINUE;
+
+      default:
+        return PlainConsumeResult.INVALID;
+    }
+  }
+
+  #consumeSimpleLineByte(byte: number): PlainConsumeResult {
+    if (!this.#plainSawCR) {
+      if (byte === CR) {
+        this.#plainSawCR = true;
+      }
+      return PlainConsumeResult.CONTINUE;
+    }
+
+    if (byte !== LF) {
+      this.#plainSawCR = false;
+      return PlainConsumeResult.CONTINUE;
+    }
+
+    return this.#onPlainValueComplete();
+  }
+
+  #consumeLengthLineByte(byte: number): PlainConsumeResult {
+    if (!this.#plainSawCR) {
+      if (byte === CR) {
+        this.#plainSawCR = true;
+      } else {
+        this.#plainLine += String.fromCharCode(byte);
+      }
+      return PlainConsumeResult.CONTINUE;
+    }
+
+    if (byte !== LF) {
+      return PlainConsumeResult.INVALID;
+    }
+
+    const length = Number(this.#plainLine);
+    if (!Number.isInteger(length)) {
+      return PlainConsumeResult.INVALID;
+    }
+
+    this.#plainLine = '';
+    this.#plainSawCR = false;
+
+    if (this.#plainLengthKind === PlainLengthKind.BULK) {
+      if (length < -1) {
+        return PlainConsumeResult.INVALID;
+      }
+      if (length === -1) {
+        return this.#onPlainValueComplete();
+      }
+      if (length === 0) {
+        this.#plainParseState = PlainParseState.EXPECT_BULK_CR;
+      } else {
+        this.#plainParseState = PlainParseState.READ_BULK_DATA;
+        this.#plainBulkRemaining = length;
+      }
+      return PlainConsumeResult.CONTINUE;
+    }
+
+    if (length < -1) {
+      return PlainConsumeResult.INVALID;
+    }
+    if (length <= 0) {
+      return this.#onPlainValueComplete();
+    }
+
+    this.#plainContainerRemaining.push(length * this.#plainAggregateMultiplier);
+    this.#plainParseState = PlainParseState.EXPECT_TYPE;
+    return PlainConsumeResult.CONTINUE;
+  }
+
+  #onPlainValueComplete(): PlainConsumeResult {
+    this.#plainParseState = PlainParseState.EXPECT_TYPE;
+    this.#plainLine = '';
+    this.#plainSawCR = false;
+    this.#plainBulkRemaining = 0;
+
+    while (this.#plainContainerRemaining.length > 0) {
+      const idx = this.#plainContainerRemaining.length - 1;
+      const remaining = this.#plainContainerRemaining[idx] - 1;
+      this.#plainContainerRemaining[idx] = remaining;
+      if (remaining > 0) {
+        return PlainConsumeResult.CONTINUE;
+      }
+      this.#plainContainerRemaining.pop();
+    }
+
+    return PlainConsumeResult.COMPLETE;
   }
 
   #parseHeader(data: Buffer, offset: number, emit: (data: Buffer) => void): ParseResult {
@@ -265,6 +520,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
 
     this.#payloadRemaining = this.#headerDecoder.length();
     this.#mode = InboundMode.BINARY;
+    this.#resetPlainProbe();
 
     if (this.#onHeader !== undefined || (this.#onProtocolError !== undefined && this.#headerDecoder.protocolError())) {
       const header = this.#headerDecoder.toObject();
