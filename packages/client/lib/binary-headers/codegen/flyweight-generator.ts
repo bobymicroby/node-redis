@@ -574,6 +574,10 @@ function generateCodecFile(msg: MessageSchema, schema: ProtocolSchema): string {
   const lines: string[] = [];
 
   lines.push(`// Generated from ${schema.name} protocol v${schema.version} - DO NOT EDIT`);
+  lines.push('//');
+  lines.push('// Performance contract: encoder write paths are intentionally unchecked.');
+  lines.push('// Callers must validate inputs against generated *MinValue/*MaxValue metadata');
+  lines.push('// before calling encode methods. Out-of-range values are truncated on the wire.');
   lines.push('');
 
   lines.push('/**');
