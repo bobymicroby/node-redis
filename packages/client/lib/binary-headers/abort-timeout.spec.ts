@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { once } from 'node:events';
 import net from 'node:net';
-import RedisClient, { RedisClientType } from '../client';
+import RedisClient, { BinaryHeadersOptions, RedisClientType } from '../client';
 import RedisCommandsQueue from '../client/commands-queue';
 import { createBinhdrResponse } from './test-utils';
 import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
@@ -20,10 +20,14 @@ function parseClientRequest(data: Buffer): ParsedRequest {
     const decoder = new RequestHeaderDecoder();
     decoder.wrap(data, 0);
     if (decoder.isValid()) {
+      const payloadLength = decoder.length();
       return {
         hasBinaryHeader: true,
         header: { commandCount: decoder.commandCount(), length: decoder.length() },
-        payload: data.subarray(RequestHeaderDecoder.ENCODED_LENGTH),
+        payload: data.subarray(
+          RequestHeaderDecoder.ENCODED_LENGTH,
+          RequestHeaderDecoder.ENCODED_LENGTH + payloadLength
+        ),
       };
     }
   }
@@ -57,23 +61,35 @@ describe('Binary Headers Abort and Timeout', function () {
   function createMockServer(mode: ResponseMode = 'smart'): net.Server {
     return net.createServer((socket) => {
       socket.on('data', (data) => {
-        const parsed = parseClientRequest(data);
-        receivedRequests.push(parsed);
+        let offset = 0;
+        while (offset < data.length) {
+          const remaining = data.subarray(offset);
+          const parsed = parseClientRequest(remaining);
+          receivedRequests.push(parsed);
 
-        const cmdCount = parsed.header?.commandCount ?? 1;
-        const payloadStr = parsed.payload.toString();
+          const cmdCount = parsed.header?.commandCount ?? 1;
+          const payloadStr = parsed.payload.toString();
 
-        for (let i = 0; i < cmdCount; i++) {
-          const resp = mode === 'pong-only' ? '+PONG\r\n'
-            : mode === 'ok-only' ? '+OK\r\n'
-            : payloadStr.includes('PING') ? '+PONG\r\n' : '+OK\r\n';
-          socket.write(createBinhdrResponse(resp));
+          for (let i = 0; i < cmdCount; i++) {
+            const resp = mode === 'pong-only' ? '+PONG\r\n'
+              : mode === 'ok-only' ? '+OK\r\n'
+              : payloadStr.includes('PING') ? '+PONG\r\n' : '+OK\r\n';
+            socket.write(createBinhdrResponse(resp));
+          }
+
+          if (!parsed.hasBinaryHeader) {
+            break;
+          }
+
+          offset += RequestHeaderDecoder.ENCODED_LENGTH + parsed.header!.length;
         }
       });
     });
   }
 
-  async function createConnectedClient(binaryHeaders: boolean | { enabled: true } = { enabled: true }): Promise<RedisClientType> {
+  async function createConnectedClient(
+    binaryHeaders: boolean | BinaryHeadersOptions = { enabled: true }
+  ): Promise<RedisClientType> {
     client = createClient({
       socket: { host: 'localhost', port },
       binaryHeaders,
@@ -139,6 +155,42 @@ describe('Binary Headers Abort and Timeout', function () {
       // Abort after completion should have no effect
       controller.abort();
       assert.equal(await client.ping(), 'PONG');
+    });
+
+    it('flushes command with abortSignal without relying on timer callback', async function () {
+      server = createMockServer('ok-only');
+      await once(server.listen(port), 'listening');
+      let scheduledCount = 0;
+      await createConnectedClient({
+        enabled: true,
+        timer: {
+          maxWaitTime: 100,
+          scheduler: {
+            schedule(_delayMs: number, _task: () => void) {
+              scheduledCount++;
+              return { cancel() {} };
+            },
+          },
+        },
+      });
+
+      const controller = new AbortController();
+      const promise = client.sendCommand(['SET', '{abort}key', 'value'], {
+        abortSignal: controller.signal,
+      });
+
+      const result = await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Command should not wait for timer flush')), 250)),
+      ]);
+
+      // Abort after command has completed - no effect.
+      controller.abort();
+      assert.equal(result, 'OK');
+
+      assert.equal(scheduledCount, 0, 'Abort-enabled command should not rely on timer scheduling');
+      const payloads = getAllPayloads();
+      assert.equal(payloads.includes('{abort}key'), true, 'Command should be written immediately');
     });
 
     it('maintains header integrity when pre-aborted command mixed with valid commands', async function () {
