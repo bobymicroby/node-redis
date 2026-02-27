@@ -618,13 +618,10 @@ export default class RedisCommandsQueue {
   *commandsToWrite() {
     const outbound = this.#outbound;
     let toSend = this.#toWrite.shift();
-    let explicitPipeline = false;
+    let pendingIsExplicitPipeline = false;
     let currentChainId: symbol | undefined = undefined;
     while (toSend) {
-      // Track if we're processing an explicit pipeline (all commands share same chainId)
-      if (toSend.chainId !== undefined) {
-        explicitPipeline = true;
-      }
+      const isExplicitPipelineCommand = toSend.chainId !== undefined;
 
       // Flush on chainId boundary: when transitioning between different chains
       // or from a chain to no-chain (auto-pipelining). This ensures each explicit
@@ -637,6 +634,7 @@ export default class RedisCommandsQueue {
           if (drained !== null) {
             yield drained;
           }
+          pendingIsExplicitPipeline = false;
         }
       }
       currentChainId = toSend.chainId;
@@ -687,6 +685,14 @@ export default class RedisCommandsQueue {
           }
         }
 
+        // Track whether the currently buffered segment contains explicit-pipeline commands.
+        // Segment mode resets when pending data is drained (chain boundary, slot flush, timer, etc.).
+        if (outbound.hasPending()) {
+          pendingIsExplicitPipeline = pendingIsExplicitPipeline || isExplicitPipelineCommand;
+        } else {
+          pendingIsExplicitPipeline = false;
+        }
+
         if (outputs.length > 0) {
           this.#cancelPendingFlush();
           for (const output of outputs) {
@@ -694,14 +700,14 @@ export default class RedisCommandsQueue {
           }
           // After flushing, if there's still pending data (e.g., slot mismatch added new command),
           // schedule a new flush for the remaining buffered commands.
-          // Skip timer scheduling for explicit pipelines - they flush at end of iteration.
-          if (this.#scheduler !== null && !explicitPipeline && outbound.hasPending()) {
+          // Skip timer scheduling for explicit-pipeline segments - they flush at end of segment.
+          if (this.#scheduler !== null && !pendingIsExplicitPipeline && outbound.hasPending()) {
             this.#scheduleFlush();
           }
         }
 
-        // Schedule timer for auto-pipelining only (not explicit pipelines)
-        if (outputs.length === 0 && this.#scheduler !== null && !explicitPipeline && !hadPending && outbound.hasPending()) {
+        // Schedule timer for auto-pipelining only (not explicit-pipeline segments)
+        if (outputs.length === 0 && this.#scheduler !== null && !pendingIsExplicitPipeline && !hadPending && outbound.hasPending()) {
           this.#scheduleFlush();
         }
       } else {
@@ -713,15 +719,15 @@ export default class RedisCommandsQueue {
 
     // Flush pending outbound data based on context:
     // - No scheduler: always drain immediately (original behavior)
-    // - With scheduler + explicit pipeline: flush immediately (no point waiting for timer)
+    // - With scheduler + explicit-pipeline segment: flush immediately (no point waiting for timer)
     // - With scheduler + auto-pipelining: let timer handle it (allows batching across ticks)
     //
     // Explicit pipelines (execAsPipeline) have a chainId set on all commands.
     // Auto-pipelining commands have chainId = undefined.
-    // For explicit pipelines, we know the batch is complete, so flush immediately.
+    // For explicit-pipeline segments, we know the batch is complete, so flush immediately.
     // For auto-pipelining, timer allows commands from different ticks to batch together.
     if (outbound !== null && outbound.hasPending()) {
-      if (this.#scheduler === null || explicitPipeline) {
+      if (this.#scheduler === null || pendingIsExplicitPipeline) {
         this.#cancelPendingFlush();
         const drained = outbound.flush(FlushReason.DRAIN);
         if (drained !== null) {

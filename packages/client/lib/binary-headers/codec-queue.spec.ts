@@ -2542,6 +2542,44 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       queue.destroy();
     });
 
+    it('explicit then auto in same drain: explicit flushes, auto waits for timer', async function () {
+      const { scheduler, stats: schedulerStats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 50, scheduler }
+      });
+
+      const flushedData: ReadonlyArray<unknown>[] = [];
+      queue.setTimerFlushCallback((data) => flushedData.push(data));
+
+      const chainId = Symbol('Pipeline Chain');
+
+      // Queue explicit first, then auto in the same write cycle.
+      queue.addCommand(['SET', '{explicit}key1', 'value1'], { chainId });
+      queue.addCommand(['SET', '{auto}key1', 'value1']);
+
+      const results = collectYielded(queue);
+
+      // Explicit command should flush immediately.
+      assert.equal(results.length, 1, 'Only explicit command should flush immediately');
+      assertPackedData(results[0], {
+        commandCount: 1,
+        commands: [['SET', '{explicit}key1', 'value1']]
+      });
+
+      // Auto command should remain pending and be timer-flushed later.
+      assert.equal((queue as RedisCommandsQueue).hasPendingOutbound(), true, 'Auto command should remain pending');
+      assert.equal(schedulerStats.scheduleCount, 1, 'Timer should be scheduled for pending auto command');
+
+      await delay(60);
+      assert.equal(flushedData.length, 1, 'Timer should flush pending auto command');
+      assertPackedData(flushedData[0], {
+        commandCount: 1,
+        commands: [['SET', '{auto}key1', 'value1']]
+      });
+
+      queue.destroy();
+    });
+
     it('same-slot auto and explicit commands: auto waits, explicit flushes all', async function () {
       const { scheduler, stats: schedulerStats } = createTrackingScheduler();
       const queue = createBinhdrQueueWithTimer({
