@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
 import RedisCommandsQueue, { type WireInterceptor } from '../client/commands-queue';
+import { RESP_TYPES } from '../RESP/decoder';
 import { BinaryHeadersInterceptor } from './codec';
 import {
   // Async utilities
@@ -981,6 +982,28 @@ describe('Codec Queue [codec-queue]', function () {
 
       const result = await promise;
       assert.equal(result.length, 10000);
+    });
+
+    it('does not mis-detect header when plain RESP bulk payload chunk starts with 0x80 before binary mode is established', async function () {
+      const interceptor = new BinaryHeadersInterceptor({
+        outbound: { resolver: STATIC_RESOLVER },
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+
+      const promise = queue.addCommand<Buffer>(['GET', 'k'], {
+        typeMapping: {
+          [RESP_TYPES.BLOB_STRING]: Buffer,
+        },
+      });
+      for (const _ of queue.commandsToWrite()) {}
+
+      // Plain RESP bulk string "$3\r\nA\x80B\r\n", split so second chunk starts with 0x80.
+      queue.processIncomingData(Buffer.from('$3\r\nA'));
+      queue.processIncomingData(Buffer.from([0x80, 0x42, 0x0D, 0x0A]));
+
+      const result = await promise;
+      assert.ok(Buffer.isBuffer(result));
+      assert.deepEqual(result, Buffer.from([0x41, 0x80, 0x42]));
     });
 
     it('switches from binary header frame to regular RESP passthrough', async function () {

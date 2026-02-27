@@ -136,6 +136,12 @@ const enum ParseResult {
   BUFFER_PARTIAL,
 }
 
+const enum InboundMode {
+  UNKNOWN,
+  PLAIN,
+  BINARY,
+}
+
 /**
  * Binary headers inbound interceptor.
  *
@@ -149,7 +155,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   readonly #onProtocolError: OnProtocolError | undefined;
   #partial: Buffer | null = null;
   #payloadRemaining = 0;
-  #seenBinaryHeader = false;
+  #mode = InboundMode.UNKNOWN;
 
   constructor(options: BinaryHeadersInboundOptions = {}) {
     this.#onHeader = options.onHeader;
@@ -163,7 +169,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   reset(): void {
     this.#partial = null;
     this.#payloadRemaining = 0;
-    this.#seenBinaryHeader = false;
+    this.#mode = InboundMode.UNKNOWN;
   }
 
   #decode(chunk: Buffer, emit: (data: Buffer) => void): void {
@@ -178,27 +184,39 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
       }
 
       if (data[offset] !== DESIGNATOR) {
-        // Before we see any binary frame, preserve original behavior: passthrough the rest.
-        if (!this.#seenBinaryHeader) {
-          emit(data.subarray(offset));
-          return;
-        }
-
-        // After binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
+        // Once binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
         // Recover by forwarding the plain prefix up to the next CRLF-boundary designator candidate.
-        const nextHeaderOffset = this.#findNextHeaderOffset(data, offset + 1);
-        if (nextHeaderOffset === -1) {
-          emit(data.subarray(offset));
-          return;
+        if (this.#mode === InboundMode.BINARY) {
+          const nextHeaderOffset = this.#findNextHeaderOffset(data, offset + 1);
+          if (nextHeaderOffset === -1) {
+            emit(data.subarray(offset));
+            return;
+          }
+
+          emit(data.subarray(offset, nextHeaderOffset));
+          offset = nextHeaderOffset;
+          continue;
         }
 
-        emit(data.subarray(offset, nextHeaderOffset));
-        offset = nextHeaderOffset;
-        continue;
+        // Pre-binary mode: any non-designator data means plain RESP path.
+        if (this.#mode === InboundMode.UNKNOWN) {
+          this.#mode = InboundMode.PLAIN;
+        }
+        emit(data.subarray(offset));
+        return;
+      }
+
+      // Pre-binary mode was already classified as plain: never probe header candidates.
+      if (this.#mode === InboundMode.PLAIN) {
+        emit(data.subarray(offset));
+        return;
       }
 
       const result = this.#parseHeader(data, offset, emit);
       if (result === ParseResult.PASSTHROUGH || result === ParseResult.BUFFER_PARTIAL) {
+        if (result === ParseResult.PASSTHROUGH && this.#mode === InboundMode.UNKNOWN) {
+          this.#mode = InboundMode.PLAIN;
+        }
         return;
       }
       offset += HEADER_LENGTH;
@@ -246,7 +264,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     }
 
     this.#payloadRemaining = this.#headerDecoder.length();
-    this.#seenBinaryHeader = true;
+    this.#mode = InboundMode.BINARY;
 
     if (this.#onHeader !== undefined || (this.#onProtocolError !== undefined && this.#headerDecoder.protocolError())) {
       const header = this.#headerDecoder.toObject();
