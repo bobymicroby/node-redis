@@ -185,6 +185,13 @@ RequestHeaderEncoder.slotMaxValue();        // 0x3FFF
 RequestHeaderEncoder.slotNullValue();       // 0xFFFF
 ```
 
+#### Performance contract
+
+Generated encoder write paths are intentionally unchecked for performance:
+- No runtime range validation is performed in setter/encode paths.
+- Callers are responsible for ensuring values satisfy generated metadata (`*MinValue()`, `*MaxValue()`, `*NullValue()`).
+- If invalid values are passed, encoded bytes may be truncated or have unintended flag bits.
+
 ### Decoder
 
 ```typescript

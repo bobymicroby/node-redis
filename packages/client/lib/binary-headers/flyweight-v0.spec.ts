@@ -220,3 +220,75 @@ describe('v0 wire format verification', () => {
     assert.strictEqual(RequestHeaderEncoder.slotMaxValue(), 0x3FFF);
   });
 });
+
+describe('unchecked fast-path contract (v0)', () => {
+  it('RequestHeaderEncoder.encodeInto truncates out-of-range values instead of throwing', () => {
+    const buffer = Buffer.alloc(RequestHeaderEncoder.ENCODED_LENGTH);
+
+    assert.doesNotThrow(() => {
+      RequestHeaderEncoder.encodeInto(
+        buffer,
+        0,
+        0x1_0000_0002, // length (over 32-bit)
+        0x1AA,         // commandCount (over 8-bit)
+        0x12345,       // slot (over 16-bit)
+        0x1ABCD        // clientIdx (over 16-bit)
+      );
+    });
+
+    const decoder = new RequestHeaderDecoder().wrap(buffer, 0);
+    assert.strictEqual(decoder.length(), 2, 'length should be truncated to low 32 bits');
+    assert.strictEqual(decoder.commandCount(), 0xAA, 'commandCount should be truncated to low 8 bits');
+    assert.strictEqual(decoder.slot(), 0x2345, 'slot should be truncated to low 16 bits');
+    assert.strictEqual(decoder.clientIdx(), 0xABCD, 'clientIdx should be truncated to low 16 bits');
+  });
+
+  it('RequestHeaderEncoder flyweight setters follow the same unchecked truncation behavior', () => {
+    const buffer = Buffer.alloc(RequestHeaderEncoder.ENCODED_LENGTH);
+
+    assert.doesNotThrow(() => {
+      new RequestHeaderEncoder()
+        .wrapAndWrite(buffer, 0)
+        .length(0x1_0000_0003)
+        .commandCount(0x1AB)
+        .slot(0x12345)
+        .clientIdx(0x1BCDE);
+    });
+
+    const decoder = new RequestHeaderDecoder().wrap(buffer, 0);
+    assert.strictEqual(decoder.length(), 3);
+    assert.strictEqual(decoder.commandCount(), 0xAB);
+    assert.strictEqual(decoder.slot(), 0x2345);
+    assert.strictEqual(decoder.clientIdx(), 0xBCDE);
+  });
+
+  it('ResponseHeaderEncoder.encodeInto truncates out-of-range values and preserves explicit protocolError', () => {
+    const buffer = Buffer.alloc(ResponseHeaderEncoder.ENCODED_LENGTH);
+
+    assert.doesNotThrow(() => {
+      ResponseHeaderEncoder.encodeInto(
+        buffer,
+        0,
+        0x1_0000_0004, // length (over 32-bit)
+        0x1FF,         // commandCount (over 7-bit field)
+        false,         // protocolError explicitly false
+        0x1CDEF        // clientIdx (over 16-bit)
+      );
+    });
+
+    const decoder = new ResponseHeaderDecoder().wrap(buffer, 0);
+    assert.strictEqual(decoder.length(), 4, 'length should be truncated to low 32 bits');
+    assert.strictEqual(decoder.commandCount(), 0x7F, 'commandCount should be truncated to low 7 bits');
+    assert.strictEqual(
+      decoder.protocolError(),
+      false,
+      'protocolError should follow the explicit boolean input'
+    );
+    assert.strictEqual(decoder.clientIdx(), 0xCDEF, 'clientIdx should be truncated to low 16 bits');
+
+    // Explicit protocolError=true should still set the flag regardless of commandCount truncation.
+    ResponseHeaderEncoder.encodeInto(buffer, 0, 1, 0x155, true, 0);
+    assert.strictEqual(decoder.wrap(buffer, 0).commandCount(), 0x55);
+    assert.strictEqual(decoder.protocolError(), true);
+  });
+});
