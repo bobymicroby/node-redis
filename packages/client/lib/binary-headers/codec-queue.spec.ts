@@ -1044,6 +1044,43 @@ describe('Codec Queue [codec-queue]', function () {
       assert.equal(result1, 1);
       assert.equal(result2, 2);
     });
+
+    it('does not desync when plain RESP payload contains CRLF+0x80 before a real binary header in the same chunk', async function () {
+      const queue = createBinhdrQueue();
+
+      // Prime interceptor as "binary observed".
+      const prime = queue.addCommand<string>(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+      queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n')));
+      assert.equal(await prime, 'OK');
+
+      const blob = queue.addCommand<Buffer>(['GET', 'k1'], {
+        typeMapping: {
+          [RESP_TYPES.BLOB_STRING]: Buffer,
+        },
+      });
+      const integer = queue.addCommand<number>(['INCR', 'k2']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      // Plain RESP bulk payload: "$5\r\nA\r\n\x80B\r\n"
+      // Then a valid binary-header frame in the same chunk.
+      const plainBulk = Buffer.concat([
+        Buffer.from('$5\r\nA\r\n'),
+        Buffer.from([0x80]),
+        Buffer.from('B\r\n'),
+      ]);
+      const mixedChunk = Buffer.concat([
+        plainBulk,
+        createBinhdrFrame(Buffer.from(':2\r\n')),
+      ]);
+
+      queue.processIncomingData(mixedChunk);
+
+      const [blobReply, integerReply] = await Promise.all([blob, integer]);
+      assert.ok(Buffer.isBuffer(blobReply));
+      assert.deepEqual(blobReply, Buffer.from([0x41, 0x0D, 0x0A, 0x80, 0x42]));
+      assert.equal(integerReply, 2);
+    });
   });
 
   describe('inbound codec callbacks', function () {
