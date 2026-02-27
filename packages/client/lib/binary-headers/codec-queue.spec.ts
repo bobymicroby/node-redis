@@ -1086,6 +1086,28 @@ describe('Codec Queue [codec-queue]', function () {
       const result1 = await promise1;
       assert.equal(result1, 'PONG');
     });
+
+    it('resetDecoder clears buffered inbound codec state', async function () {
+      const interceptor = new BinaryHeadersInterceptor({
+        outbound: { resolver: STATIC_RESOLVER },
+      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+
+      const promise = queue.addCommand<string>(['PING']);
+      for (const _ of queue.commandsToWrite()) {}
+
+      const frame = createBinhdrFrame(Buffer.from('+PONG\r\n'));
+
+      // Buffer a partial header, then reset queue parser state.
+      queue.processIncomingData(frame.subarray(0, 4));
+      queue.resetDecoder();
+
+      // Full frame should parse cleanly after reset.
+      queue.processIncomingData(frame);
+
+      const result = await promise;
+      assert.equal(result, 'PONG');
+    });
   });
 });
 
