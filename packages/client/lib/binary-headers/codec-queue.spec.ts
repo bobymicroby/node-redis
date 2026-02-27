@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
 import RedisCommandsQueue, { type WireInterceptor } from '../client/commands-queue';
 import { RESP_TYPES } from '../RESP/decoder';
-import { BinaryHeadersInterceptor } from './codec';
+import { BinaryHeadersInterceptor, BinaryHeadersInboundInterceptor } from './codec';
 import {
   // Async utilities
   delay,
@@ -1080,6 +1080,62 @@ describe('Codec Queue [codec-queue]', function () {
       assert.ok(Buffer.isBuffer(blobReply));
       assert.deepEqual(blobReply, Buffer.from([0x41, 0x0D, 0x0A, 0x80, 0x42]));
       assert.equal(integerReply, 2);
+    });
+
+    it('state flow: UNKNOWN -> BINARY -> mixed plain frame -> BINARY, with exact output order', function () {
+      const seenHeaders: Array<{ length: number; commandCount: number; clientIdx: number }> = [];
+      const interceptor = new BinaryHeadersInboundInterceptor({
+        onHeader: (header) => {
+          seenHeaders.push({
+            length: header.length,
+            commandCount: header.commandCount,
+            clientIdx: header.clientIdx
+          });
+        }
+      });
+
+      const emitted: Buffer[] = [];
+      const emit = (data: Buffer) => emitted.push(Buffer.from(data));
+
+      // 1) UNKNOWN -> BINARY (valid header)
+      interceptor.intercept(createBinhdrFrame(Buffer.from('+OK\r\n'), 1, 7), emit);
+      // 2) In BINARY mode, consume one plain RESP frame and then resume binary header parsing.
+      interceptor.intercept(
+        Buffer.concat([
+          Buffer.from(':1\r\n'),
+          createBinhdrFrame(Buffer.from(':2\r\n'), 1, 9),
+        ]),
+        emit
+      );
+
+      assert.deepEqual(
+        emitted.map((b) => b.toString()),
+        ['+OK\r\n', ':1\r\n', ':2\r\n']
+      );
+      assert.deepEqual(seenHeaders, [
+        { length: 5, commandCount: 1, clientIdx: 7 },
+        { length: 4, commandCount: 1, clientIdx: 9 },
+      ]);
+    });
+
+    it('state flow: UNKNOWN -> PLAIN lock, later 0x80 designator is not probed as header', function () {
+      const seenHeaders: Array<unknown> = [];
+      const interceptor = new BinaryHeadersInboundInterceptor({
+        onHeader: (header) => seenHeaders.push(header)
+      });
+
+      const emitted: Buffer[] = [];
+      const emit = (data: Buffer) => emitted.push(Buffer.from(data));
+
+      // 1) UNKNOWN -> PLAIN (first byte is non-designator)
+      interceptor.intercept(Buffer.from(':100\r\n'), emit);
+      // 2) In PLAIN mode, even a valid binary frame is passthrough (not parsed).
+      const binaryFrame = createBinhdrFrame(Buffer.from(':2\r\n'), 1, 42);
+      interceptor.intercept(binaryFrame, emit);
+
+      assert.equal(seenHeaders.length, 0, 'header parser must stay disabled in locked plain mode');
+      assert.equal(emitted[0].toString(), ':100\r\n');
+      assert.deepEqual(emitted[1], binaryFrame);
     });
   });
 
