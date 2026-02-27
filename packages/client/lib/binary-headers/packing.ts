@@ -73,7 +73,7 @@ export class CommandPacker {
   readonly #maxCommandCount: number;
   readonly #maxPayloadLength: number;
   // Pre-allocate array to avoid reallocations - use index instead of push/length=0
-  readonly #resps: Array<SocketChunk>;
+  readonly #resps: Array<SocketChunk | undefined>;
   #respCount: number = 0;
 
   #resolvedSlot: number = NULL_SLOT;
@@ -178,7 +178,7 @@ export class CommandPacker {
     // Calculate total parts needed
     let totalParts = 1;
     for (let i = 0; i < count; i++) {
-      totalParts += this.#resps[i].length;
+      totalParts += this.#resps[i]!.length;
     }
 
     // Build result array
@@ -187,11 +187,13 @@ export class CommandPacker {
 
     let idx = 1;
     for (let i = 0; i < count; i++) {
-      const resp = this.#resps[i];
+      const resp = this.#resps[i]!;
       const respLen = resp.length;
       for (let j = 0; j < respLen; j++) {
         result[idx++] = resp[j];
       }
+      // Drop references to flushed payload chunks so GC can reclaim buffers promptly.
+      this.#resps[i] = undefined;
     }
 
     // Reset state without reallocating array

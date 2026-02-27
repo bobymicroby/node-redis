@@ -1,4 +1,5 @@
 import { strict as assert } from 'node:assert';
+import { spawnSync } from 'node:child_process';
 import { describe, it } from 'mocha';
 import {
   CommandPacker,
@@ -319,6 +320,61 @@ describe('Packing', () => {
         assert.equal(packed[1], 'part1a');
         assert.equal(packed[2], 'part1b');
         assert.equal(packed[3], 'part2a');
+      });
+    });
+
+    describe('memory retention', () => {
+      it('releases flushed payload references so GC can reclaim them', () => {
+        const script = `
+          const { CommandPacker } = require('./packages/client/lib/binary-headers/packing');
+          const { FlushReason } = require('./packages/client/lib/binary-headers/stats');
+          const packer = new CommandPacker(undefined, { maxCommandCount: 2 });
+
+          let ref;
+          (() => {
+            let payload = Buffer.alloc(8 * 1024 * 1024, 0x61);
+            ref = new WeakRef(payload);
+            packer.add([payload], 1, payload.length);
+            let drained = packer.drain(FlushReason.DRAIN);
+            drained = null;
+            payload = null;
+          })();
+
+          (async () => {
+            for (let i = 0; i < 200; i++) {
+              global.gc();
+              if (ref.deref() === undefined) {
+                process.stdout.write('collected');
+                return;
+              }
+              await new Promise(resolve => setImmediate(resolve));
+            }
+            process.stdout.write('retained');
+          })().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+        `;
+
+        const result = spawnSync(
+          process.execPath,
+          ['--expose-gc', '-r', 'ts-node/register/transpile-only', '-e', script],
+          {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              TS_NODE_PROJECT: './packages/test-utils/tsconfig.json',
+            },
+            encoding: 'utf8',
+          }
+        );
+
+        assert.equal(result.status, 0, `probe process failed: ${result.stderr || 'unknown error'}`);
+        assert.equal(
+          result.stdout.trim(),
+          'collected',
+          `flushed payload is still retained: ${result.stdout.trim()}`
+        );
       });
     });
   });
