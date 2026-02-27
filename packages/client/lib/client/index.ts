@@ -146,7 +146,7 @@ export interface RedisClientOptions<
    *
    * These options can be overridden on a per-command basis when calling specific commands.
    *
-   * @property {symbol} [chainId] - Identifier for chaining commands together
+   * @property {symbol} [chainId] - Advanced: groups commands into an explicit chain; in binary-headers mode this can bypass per-command slot/eligibility checks after the first command, so errors may surface server-side for mixed-slot/invalid chains.
    * @property {boolean} [asap] - When true, the command is executed as soon as possible
    * @property {AbortSignal} [abortSignal] - AbortSignal to cancel the command
    * @property {TypeMapping} [typeMapping] - Custom type mappings between RESP and JavaScript types

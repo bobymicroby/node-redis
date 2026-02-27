@@ -114,6 +114,13 @@ export interface TimerOptions {
 const NOOP_FLUSH_CALLBACK: TimerFlushCallback = () => {};
 
 export interface CommandOptions<T = TypeMapping> {
+  /**
+   * Advanced option for grouping commands into an explicit chain/pipeline.
+   *
+   * When set, queue flushing and binary-header slot handling treat commands with the same `chainId`
+   * as a single chain. In binary-headers mode, slot/eligibility may be inferred from the first
+   * command in the chain, and invalid/mixed-slot commands can fail on the server side instead.
+   */
   chainId?: symbol;
   asap?: boolean;
   abortSignal?: AbortSignal;
@@ -650,6 +657,8 @@ export default class RedisCommandsQueue {
         continue;
       }
 
+      const needsImmediateFlush = toSend.abort !== undefined || toSend.timeout !== undefined;
+
       // TODO reuse `toSend` or create new object?
       (toSend as any).args = undefined;
       if (toSend.abort) {
@@ -666,7 +675,17 @@ export default class RedisCommandsQueue {
 
       if (outbound !== null) {
         const hadPending = outbound.hasPending();
-        const outputs = outbound.intercept(encoded, args, byteLength, currentChainId);
+        let outputs = outbound.intercept(encoded, args, byteLength, currentChainId);
+
+        // Commands with cancellation semantics (abort/timeout) should not remain in timer buffers.
+        // Force-drain immediately so they are either written now or rejected while still queued.
+        if (needsImmediateFlush && outbound.hasPending()) {
+          this.#cancelPendingFlush();
+          const drained = outbound.flush(FlushReason.DRAIN);
+          if (drained !== null) {
+            outputs = outputs.length > 0 ? [...outputs, drained] : [drained];
+          }
+        }
 
         if (outputs.length > 0) {
           this.#cancelPendingFlush();
