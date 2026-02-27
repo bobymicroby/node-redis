@@ -88,6 +88,12 @@ export interface InboundInterceptor {
    * @param next - Callback to pass data to the next handler (decoder)
    */
   intercept(chunk: Buffer, next: (data: Buffer) => void): void;
+
+  /**
+   * Optional hook to clear interceptor-internal state (e.g. partial frame buffers)
+   * when the queue decoder is reset due to reconnect/error recovery.
+   */
+  reset?(): void;
 }
 
 /**
@@ -574,6 +580,7 @@ export default class RedisCommandsQueue {
   resetDecoder() {
     this.#resetDecoderCallbacks();
     this.decoder.reset();
+    this.#inbound?.reset?.();
   }
 
   #resetFallbackOnReply?: Decoder['onReply'];
