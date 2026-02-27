@@ -19,6 +19,18 @@ function computeByteLength(encoded: ReadonlyArray<RedisArgument>): number {
 }
 
 /**
+ * Materializes encoded chunks into a single Buffer for wire-level assertions.
+ */
+function materializeEncoded(encoded: ReadonlyArray<RedisArgument>): Buffer {
+  const chunks = new Array<Buffer>(encoded.length);
+  for (let i = 0; i < encoded.length; i++) {
+    const chunk = encoded[i];
+    chunks[i] = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
  * Compares two encoded outputs for equality.
  * Handles both string and Buffer chunks.
  */
@@ -103,6 +115,63 @@ describe('Encoder Parity (encodeCommand vs encodeCommandWithLength)', function (
         assert.ok(
           encodedEqual(encoded, encodedWithLen),
           `Encoded outputs differ:\n  encodeCommand: ${JSON.stringify(encoded)}\n  encodeCommandWithLength: ${JSON.stringify(encodedWithLen)}`
+        );
+      });
+    }
+  });
+
+  describe('wire-level correctness (golden fixtures)', function () {
+    const cases: Array<{ name: string; args: ReadonlyArray<RedisArgument>; expected: Buffer }> = [
+      {
+        name: 'PING',
+        args: ['PING'],
+        expected: Buffer.from('*1\r\n$4\r\nPING\r\n')
+      },
+      {
+        name: 'SET key value',
+        args: ['SET', 'key', 'value'],
+        expected: Buffer.from('*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n')
+      },
+      {
+        name: 'SET with UTF-8 payload',
+        args: ['SET', 'key', '🐣'],
+        expected: Buffer.from('*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$4\r\n🐣\r\n')
+      },
+      {
+        name: 'SET with empty payload',
+        args: ['SET', 'key', ''],
+        expected: Buffer.from('*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$0\r\n\r\n')
+      },
+      {
+        name: 'SET with binary Buffer payload',
+        args: ['SET', 'bin', Buffer.from([0x00, 0xFF, 0x41])],
+        expected: Buffer.concat([
+          Buffer.from('*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n$3\r\n'),
+          Buffer.from([0x00, 0xFF, 0x41]),
+          Buffer.from('\r\n')
+        ])
+      }
+    ];
+
+    for (const tc of cases) {
+      it(tc.name, function () {
+        const encoded = encodeCommand(tc.args);
+        const withLen = encodeCommandWithLength(tc.args);
+
+        assert.deepEqual(
+          materializeEncoded(encoded),
+          tc.expected,
+          'encodeCommand should match golden RESP bytes'
+        );
+        assert.deepEqual(
+          materializeEncoded(withLen.encoded),
+          tc.expected,
+          'encodeCommandWithLength should match golden RESP bytes'
+        );
+        assert.equal(
+          withLen.byteLength,
+          tc.expected.length,
+          'byteLength should match golden RESP payload length'
         );
       });
     }
@@ -237,17 +306,24 @@ describe('Encoder Parity (encodeCommand vs encodeCommandWithLength)', function (
       }
     });
 
-    it('Buffer mutations do not affect subsequent calls', function () {
+    it('documents buffer aliasing (no defensive copy of argument Buffers)', function () {
       const buf = Buffer.from('original');
       const args: ReadonlyArray<RedisArgument> = ['SET', 'key', buf];
+      const encoded = encodeCommand(args);
+      const withLen = encodeCommandWithLength(args);
 
-      const result1 = encodeCommandWithLength(args);
+      const before1 = materializeEncoded(encoded);
+      const before2 = materializeEncoded(withLen.encoded);
       buf.write('MODIFIED');
-      const result2 = encodeCommandWithLength(args);
+      const after1 = materializeEncoded(encoded);
+      const after2 = materializeEncoded(withLen.encoded);
 
-      // The encoded output references the same buffer, so mutation affects it
-      // This test documents the current behavior (no defensive copy)
-      assert.equal(result1.byteLength, result2.byteLength, 'byteLength should be same');
+      assert.notDeepEqual(after1, before1, 'encodeCommand output should reflect buffer mutation');
+      assert.notDeepEqual(after2, before2, 'encodeCommandWithLength output should reflect buffer mutation');
+      assert.equal(after1.includes(Buffer.from('MODIFIED')), true);
+      assert.equal(after2.includes(Buffer.from('MODIFIED')), true);
+      assert.equal(withLen.byteLength, before2.length, 'byteLength should stay stable for same-size mutation');
+      assert.equal(withLen.byteLength, after2.length, 'byteLength should stay stable for same-size mutation');
     });
   });
 });
