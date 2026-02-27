@@ -131,6 +131,11 @@ const HEADER_LENGTH = ResponseHeaderDecoder.ENCODED_LENGTH;
 const DESIGNATOR = ResponseHeaderDecoder.designatorConstantValue();
 const CR = 0x0D;
 const LF = 0x0A;
+const MINUS = 0x2D;
+const ASCII_ZERO = 0x30;
+const ASCII_NINE = 0x39;
+const BOOL_TRUE = 0x74;
+const BOOL_FALSE = 0x66;
 
 const enum ParseResult {
   CONTINUE,
@@ -182,8 +187,10 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   readonly #onProtocolError: OnProtocolError | undefined;
   #plainProbeActive = false;
   #plainParseState = PlainParseState.EXPECT_TYPE;
-  #plainLine = '';
   #plainSawCR = false;
+  #plainLengthValue = 0;
+  #plainLengthNegative = false;
+  #plainLengthHasDigit = false;
   #plainBulkRemaining = 0;
   #plainLengthKind: PlainLengthKind = PlainLengthKind.BULK;
   #plainAggregateMultiplier = 1;
@@ -219,34 +226,19 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
         continue;
       }
 
-      // If a plain RESP frame was started in a previous chunk while in binary mode,
-      // continue consuming it even if this chunk starts with 0x80.
-      if (this.#mode === InboundMode.BINARY && this.#plainProbeActive) {
-        const plainFrameEnd = this.#findPlainFrameEnd(data, offset);
+      // Once binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
+      // Consume exactly one plain RESP frame, then continue scanning for the next header.
+      // This path also handles the continuation of plain frames split across chunks.
+      if (this.#mode === InboundMode.BINARY && (this.#plainProbeActive || data[offset] !== DESIGNATOR)) {
+        const plainFrameEnd = this.#consumeBinaryModePlainFrame(data, offset, emit);
         if (plainFrameEnd === -1) {
-          emit(data.subarray(offset));
           return;
         }
-
-        emit(data.subarray(offset, plainFrameEnd));
         offset = plainFrameEnd;
         continue;
       }
 
       if (data[offset] !== DESIGNATOR) {
-        // Once binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
-        // Consume exactly one plain RESP frame, then continue scanning for the next header.
-        if (this.#mode === InboundMode.BINARY) {
-          const plainFrameEnd = this.#findPlainFrameEnd(data, offset);
-          if (plainFrameEnd === -1) {
-            emit(data.subarray(offset));
-            return;
-          }
-
-          emit(data.subarray(offset, plainFrameEnd));
-          offset = plainFrameEnd;
-          continue;
-        }
 
         // Pre-binary mode: any non-designator data means plain RESP path.
         if (this.#mode === InboundMode.UNKNOWN) {
@@ -281,6 +273,16 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     return offset + toForward;
   }
 
+  #consumeBinaryModePlainFrame(data: Buffer, offset: number, emit: (data: Buffer) => void): number {
+    const plainFrameEnd = this.#findPlainFrameEnd(data, offset);
+    if (plainFrameEnd === -1) {
+      emit(data.subarray(offset));
+      return -1;
+    }
+    emit(data.subarray(offset, plainFrameEnd));
+    return plainFrameEnd;
+  }
+
   #findPlainFrameEnd(data: Buffer, startOffset: number): number {
     for (let i = startOffset; i < data.length; i++) {
       const consume = this.#consumePlainByte(data[i]);
@@ -300,13 +302,28 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
 
   #resetPlainProbe(): void {
     this.#plainParseState = PlainParseState.EXPECT_TYPE;
-    this.#plainLine = '';
     this.#plainSawCR = false;
+    this.#resetPlainLengthParser();
     this.#plainBulkRemaining = 0;
     this.#plainLengthKind = PlainLengthKind.BULK;
     this.#plainAggregateMultiplier = 1;
     this.#plainContainerRemaining.length = 0;
     this.#plainProbeActive = false;
+  }
+
+  #resetPlainLengthParser(): void {
+    this.#plainLengthValue = 0;
+    this.#plainLengthNegative = false;
+    this.#plainLengthHasDigit = false;
+  }
+
+  #startPlainLengthLine(kind: PlainLengthKind, aggregateMultiplier: number): PlainConsumeResult {
+    this.#plainParseState = PlainParseState.READ_LENGTH_LINE;
+    this.#plainLengthKind = kind;
+    this.#plainAggregateMultiplier = aggregateMultiplier;
+    this.#plainSawCR = false;
+    this.#resetPlainLengthParser();
+    return PlainConsumeResult.CONTINUE;
   }
 
   #consumePlainByte(byte: number): PlainConsumeResult {
@@ -321,6 +338,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
         return this.#consumeLengthLineByte(byte);
 
       case PlainParseState.READ_BOOLEAN_VALUE:
+        if (byte !== BOOL_TRUE && byte !== BOOL_FALSE) return PlainConsumeResult.INVALID;
         this.#plainParseState = PlainParseState.EXPECT_BOOLEAN_CR;
         return PlainConsumeResult.CONTINUE;
 
@@ -385,30 +403,15 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
       case 0x24: // $
       case 0x21: // !
       case 0x3D: // =
-        this.#plainParseState = PlainParseState.READ_LENGTH_LINE;
-        this.#plainLengthKind = PlainLengthKind.BULK;
-        this.#plainAggregateMultiplier = 1;
-        this.#plainLine = '';
-        this.#plainSawCR = false;
-        return PlainConsumeResult.CONTINUE;
+        return this.#startPlainLengthLine(PlainLengthKind.BULK, 1);
 
       case 0x2A: // *
       case 0x7E: // ~
       case 0x3E: // >
-        this.#plainParseState = PlainParseState.READ_LENGTH_LINE;
-        this.#plainLengthKind = PlainLengthKind.AGGREGATE;
-        this.#plainAggregateMultiplier = 1;
-        this.#plainLine = '';
-        this.#plainSawCR = false;
-        return PlainConsumeResult.CONTINUE;
+        return this.#startPlainLengthLine(PlainLengthKind.AGGREGATE, 1);
 
       case 0x25: // %
-        this.#plainParseState = PlainParseState.READ_LENGTH_LINE;
-        this.#plainLengthKind = PlainLengthKind.AGGREGATE;
-        this.#plainAggregateMultiplier = 2;
-        this.#plainLine = '';
-        this.#plainSawCR = false;
-        return PlainConsumeResult.CONTINUE;
+        return this.#startPlainLengthLine(PlainLengthKind.AGGREGATE, 2);
 
       default:
         return PlainConsumeResult.INVALID;
@@ -434,9 +437,25 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   #consumeLengthLineByte(byte: number): PlainConsumeResult {
     if (!this.#plainSawCR) {
       if (byte === CR) {
+        if (!this.#plainLengthHasDigit) {
+          return PlainConsumeResult.INVALID;
+        }
         this.#plainSawCR = true;
       } else {
-        this.#plainLine += String.fromCharCode(byte);
+        if (
+          byte === MINUS &&
+          !this.#plainLengthHasDigit &&
+          !this.#plainLengthNegative &&
+          this.#plainLengthValue === 0
+        ) {
+          this.#plainLengthNegative = true;
+          return PlainConsumeResult.CONTINUE;
+        }
+        if (byte < ASCII_ZERO || byte > ASCII_NINE) {
+          return PlainConsumeResult.INVALID;
+        }
+        this.#plainLengthHasDigit = true;
+        this.#plainLengthValue = this.#plainLengthValue * 10 + (byte - ASCII_ZERO);
       }
       return PlainConsumeResult.CONTINUE;
     }
@@ -445,13 +464,9 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
       return PlainConsumeResult.INVALID;
     }
 
-    const length = Number(this.#plainLine);
-    if (!Number.isInteger(length)) {
-      return PlainConsumeResult.INVALID;
-    }
-
-    this.#plainLine = '';
+    const length = this.#plainLengthNegative ? -this.#plainLengthValue : this.#plainLengthValue;
     this.#plainSawCR = false;
+    this.#resetPlainLengthParser();
 
     if (this.#plainLengthKind === PlainLengthKind.BULK) {
       if (length < -1) {
@@ -483,8 +498,8 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
 
   #onPlainValueComplete(): PlainConsumeResult {
     this.#plainParseState = PlainParseState.EXPECT_TYPE;
-    this.#plainLine = '';
     this.#plainSawCR = false;
+    this.#resetPlainLengthParser();
     this.#plainBulkRemaining = 0;
 
     while (this.#plainContainerRemaining.length > 0) {
