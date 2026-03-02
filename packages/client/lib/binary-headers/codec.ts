@@ -35,6 +35,18 @@ export interface BinaryHeadersInterceptorOptions {
   readonly statsCounter?: BinaryHeaderStatsCounter;
 }
 
+const INTERNAL_BINARY_FRAME_PRODUCED = Symbol('binaryHeadersOutboundOnBinaryFrameProduced');
+const INTERNAL_INBOUND_MODE_STATE = Symbol('binaryHeadersInboundModeState');
+type BinaryResponseModeState = {
+  mayReceiveBinaryFrames: boolean;
+};
+type InternalOutboundOptions = BinaryHeadersOutboundOptions & {
+  [INTERNAL_BINARY_FRAME_PRODUCED]?: () => void;
+};
+type InternalInboundOptions = BinaryHeadersInboundOptions & {
+  [INTERNAL_INBOUND_MODE_STATE]?: BinaryResponseModeState;
+};
+
 /**
  * Binary headers outbound interceptor.
  *
@@ -57,6 +69,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   readonly #resolver: EligibilityResolver;
   readonly #packer: CommandPacker;
   readonly #statsCounter: BinaryHeaderStatsCounter;
+  readonly #onBinaryFrameProduced: (() => void) | undefined;
   #chainSlotCache: Map<symbol, number> = new Map();
   #lastChainId: symbol | undefined;
 
@@ -66,6 +79,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   ) {
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
     this.#resolver = options.resolver ?? NOOP_RESOLVER;
+    this.#onBinaryFrameProduced = (options as InternalOutboundOptions)[INTERNAL_BINARY_FRAME_PRODUCED];
     const packerOptions: CommandPackerOptions = {
       maxCommandCount: options.maxCommandCount,
       maxPayloadLength: options.maxPayloadLength,
@@ -104,18 +118,32 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     if (slot === SLOT_INELIGIBLE) {
       this.#statsCounter.recordIneligible();
       const pending = this.#packer.drain(FlushReason.DRAIN);
-      return pending ? [pending, encoded] : [encoded];
+      if (!pending) {
+        return [encoded];
+      }
+
+      this.#onBinaryFrameProduced?.();
+      return [pending, encoded];
     }
 
     this.#statsCounter.recordBatchedCommand();
 
     const payloadLength = byteLength ?? calcPayloadLength(encoded);
     const packed = this.#packer.add(encoded, slot, payloadLength);
-    return packed ? [packed] : [];
+    if (!packed) {
+      return [];
+    }
+
+    this.#onBinaryFrameProduced?.();
+    return [packed];
   }
 
   flush(reason: FlushReason): SocketChunk | null {
-    return this.#packer.drain(reason);
+    const packed = this.#packer.drain(reason);
+    if (packed) {
+      this.#onBinaryFrameProduced?.();
+    }
+    return packed;
   }
 
   hasPending(): boolean {
@@ -200,13 +228,15 @@ const enum PlainConsumeResult {
  * Top-level mode transitions:
  *   UNKNOWN --(valid binary header)--> BINARY
  *   UNKNOWN --(non-designator byte)--> PLAIN
- *   PLAIN   --(any subsequent chunk)--> PLAIN
+ *   PLAIN   --(binary responses expected + valid header)--> BINARY
+ *   PLAIN   --(otherwise)-------------------------------> PLAIN
  *   BINARY  --(mixed plain frame)-----> BINARY
  *
  * Decode loop (high level):
  *   [payloadRemaining > 0] -> forward payload bytes
+ *   [UNKNOWN/PLAIN pre-binary plain frame] -> consume one plain RESP frame
  *   [BINARY and (plain frame in progress or non-designator)] -> consume one plain RESP frame
- *   [non-designator in UNKNOWN/PLAIN] -> passthrough tail (lock UNKNOWN->PLAIN)
+ *   [non-designator fallback] -> passthrough tail
  *   [designator candidate] -> parse header (valid => BINARY + payloadRemaining)
  *
  * Plain-frame sub-state machine (used only by BINARY mixed fallback):
@@ -240,6 +270,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
   readonly #onProtocolError: OnProtocolError | undefined;
+  readonly #modeState: BinaryResponseModeState;
   // True when a plain RESP frame began in binary mode but has not completed yet.
   #plainFrameInProgress = false;
   #plainParseState = PlainParseState.EXPECT_TYPE;
@@ -256,8 +287,10 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
   #mode = InboundMode.UNKNOWN;
 
   constructor(options: BinaryHeadersInboundOptions = {}) {
-    this.#onHeader = options.onHeader;
-    this.#onProtocolError = options.onProtocolError;
+    const internalOptions = options as InternalInboundOptions;
+    this.#onHeader = internalOptions.onHeader;
+    this.#onProtocolError = internalOptions.onProtocolError;
+    this.#modeState = internalOptions[INTERNAL_INBOUND_MODE_STATE] ?? { mayReceiveBinaryFrames: false };
   }
 
   intercept(chunk: Buffer, next: (data: Buffer) => void): void {
@@ -268,6 +301,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     this.#partial = null;
     this.#payloadRemaining = 0;
     this.#mode = InboundMode.UNKNOWN;
+    this.#modeState.mayReceiveBinaryFrames = false;
     this.#resetPlainProbe();
   }
 
@@ -282,11 +316,28 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
         continue;
       }
 
+      // Before binary mode is established, consume RESP plain frames so we can
+      // track frame boundaries across chunks and safely probe future header candidates.
+      if (
+        this.#mode !== InboundMode.BINARY &&
+        (
+          this.#plainFrameInProgress ||
+          this.#shouldConsumePreBinaryAsPlain(data[offset])
+        )
+      ) {
+        const plainFrameEnd = this.#consumePreBinaryPlainFrame(data, offset, emit);
+        if (plainFrameEnd === -1) {
+          return;
+        }
+        offset = plainFrameEnd;
+        continue;
+      }
+
       // Once binary mode is observed, plain RESP and binhdr frames may coalesce in one chunk.
       // Consume exactly one plain RESP frame, then continue scanning for the next header.
       // This path also handles the continuation of plain frames split across chunks.
       if (this.#mode === InboundMode.BINARY && (this.#plainFrameInProgress || data[offset] !== DESIGNATOR)) {
-        const plainFrameEnd = this.#consumeBinaryModePlainFrame(data, offset, emit);
+        const plainFrameEnd = this.#consumePlainFrame(data, offset, emit);
         if (plainFrameEnd === -1) {
           return;
         }
@@ -299,8 +350,10 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
         return;
       }
 
-      // Pre-binary mode was already classified as plain: never probe header candidates.
-      if (this.#mode === InboundMode.PLAIN) {
+      // Plain mode can recover to binary only after outbound emitted at least one
+      // binary request frame. Otherwise, keep passthrough behavior to avoid false
+      // header probes in plain traffic.
+      if (this.#mode === InboundMode.PLAIN && !this.#modeState.mayReceiveBinaryFrames) {
         emit(data.subarray(offset));
         return;
       }
@@ -314,6 +367,18 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
       }
       offset += HEADER_LENGTH;
     }
+  }
+
+  #shouldConsumePreBinaryAsPlain(byte: number): boolean {
+    if (byte !== DESIGNATOR) {
+      return true;
+    }
+
+    if (this.#mode === InboundMode.UNKNOWN) {
+      return false;
+    }
+
+    return !this.#modeState.mayReceiveBinaryFrames;
   }
 
   #forwardPayload(data: Buffer, offset: number, emit: (data: Buffer) => void): number {
@@ -332,7 +397,14 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     emit(data.subarray(offset));
   }
 
-  #consumeBinaryModePlainFrame(data: Buffer, offset: number, emit: (data: Buffer) => void): number {
+  #consumePreBinaryPlainFrame(data: Buffer, offset: number, emit: (data: Buffer) => void): number {
+    if (this.#mode === InboundMode.UNKNOWN) {
+      this.#mode = InboundMode.PLAIN;
+    }
+    return this.#consumePlainFrame(data, offset, emit);
+  }
+
+  #consumePlainFrame(data: Buffer, offset: number, emit: (data: Buffer) => void): number {
     const plainFrameEnd = this.#consumePlainFrameEnd(data, offset);
     if (plainFrameEnd === -1) {
       emit(data.subarray(offset));
@@ -624,8 +696,24 @@ export class BinaryHeadersInterceptor implements WireInterceptor {
 
   constructor(options: BinaryHeadersInterceptorOptions = {}) {
     this.#statsCounter = options.statsCounter ?? disabledBinaryHeaderStatsCounter();
-    this.outbound = new BinaryHeadersOutboundInterceptor(options.outbound, this.#statsCounter);
-    this.inbound = new BinaryHeadersInboundInterceptor(options.inbound);
+    const modeState: BinaryResponseModeState = {
+      mayReceiveBinaryFrames: false
+    };
+    const inboundOptions: InternalInboundOptions = {
+      ...(options.inbound ?? {})
+    };
+    inboundOptions[INTERNAL_INBOUND_MODE_STATE] = modeState;
+    this.inbound = new BinaryHeadersInboundInterceptor(inboundOptions);
+    const outboundOptions: InternalOutboundOptions = {
+      ...(options.outbound ?? {})
+    };
+    outboundOptions[INTERNAL_BINARY_FRAME_PRODUCED] = () => {
+      modeState.mayReceiveBinaryFrames = true;
+    };
+    this.outbound = new BinaryHeadersOutboundInterceptor(
+      outboundOptions,
+      this.#statsCounter
+    );
   }
 
   stats(): BinaryHeaderStats {
