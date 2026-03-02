@@ -1137,6 +1137,25 @@ describe('Codec Queue [codec-queue]', function () {
       assert.equal(emitted[0].toString(), ':100\r\n');
       assert.deepEqual(emitted[1], binaryFrame);
     });
+
+    it('handles plain response before first binary response on mixed outbound traffic', async function () {
+      const queue = createBinhdrQueue();
+
+      const infoPromise = queue.addCommand<string>(['INFO']); // ineligible -> plain passthrough
+      const pingPromise = queue.addCommand<string>(['PING']); // eligible -> binary header
+
+      const writes = collectYielded(queue);
+      assert.equal(writes.length, 2, 'expected one plain write and one binary write');
+
+      // Plain response arrives first.
+      queue.processIncomingData(respBulkString('server-info'));
+      // Regression: this used to throw "Unknown RESP type 128" due to plain-mode lock.
+      queue.processIncomingData(createBinhdrFrame(respSimpleString('PONG')));
+
+      const [info, ping] = await Promise.all([infoPromise, pingPromise]);
+      assert.equal(info, 'server-info');
+      assert.equal(ping, 'PONG');
+    });
   });
 
   describe('inbound codec callbacks', function () {
