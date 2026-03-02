@@ -1118,24 +1118,30 @@ describe('Codec Queue [codec-queue]', function () {
       ]);
     });
 
-    it('state flow: UNKNOWN -> PLAIN lock, later 0x80 designator is not probed as header', function () {
-      const seenHeaders: Array<unknown> = [];
+    it('state flow: plain frame at boundary can be followed by binary header frame', function () {
+      const seenHeaders: Array<{ length: number; commandCount: number; clientIdx: number }> = [];
       const interceptor = new BinaryHeadersInboundInterceptor({
-        onHeader: (header) => seenHeaders.push(header)
+        onHeader: (header) => seenHeaders.push({
+          length: header.length,
+          commandCount: header.commandCount,
+          clientIdx: header.clientIdx
+        })
       });
 
       const emitted: Buffer[] = [];
       const emit = (data: Buffer) => emitted.push(Buffer.from(data));
 
-      // 1) UNKNOWN -> PLAIN (first byte is non-designator)
+      // 1) First frame is plain RESP.
       interceptor.intercept(Buffer.from(':100\r\n'), emit);
-      // 2) In PLAIN mode, even a valid binary frame is passthrough (not parsed).
+      // 2) Next frame at boundary is binary header framed.
       const binaryFrame = createBinhdrFrame(Buffer.from(':2\r\n'), 1, 42);
       interceptor.intercept(binaryFrame, emit);
 
-      assert.equal(seenHeaders.length, 0, 'header parser must stay disabled in locked plain mode');
       assert.equal(emitted[0].toString(), ':100\r\n');
-      assert.deepEqual(emitted[1], binaryFrame);
+      assert.equal(emitted[1].toString(), ':2\r\n');
+      assert.deepEqual(seenHeaders, [
+        { length: 4, commandCount: 1, clientIdx: 42 }
+      ]);
     });
 
     it('handles plain response before first binary response on mixed outbound traffic', async function () {
