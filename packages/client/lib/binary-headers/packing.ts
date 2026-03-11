@@ -52,10 +52,6 @@ function areSlotsCompatible(slotA: number, slotB: number): boolean {
   return slotA === slotB;
 }
 
-function toWireSlot(slot: number): number {
-  return slot === NULL_SLOT ? 0 : slot;
-}
-
 export function calculatePayloadLength(resp: SocketChunk): number {
   let length = 0;
   for (let i = 0; i < resp.length; i++) {
@@ -171,7 +167,7 @@ export class CommandPacker {
     const header = RequestHeaderEncoder.allocateAndEncode(
       this.#totalPayloadLength,
       count,
-      toWireSlot(this.#resolvedSlot),
+      this.#resolvedSlot,
       0  // clientIdx - not used in current implementation
     );
 

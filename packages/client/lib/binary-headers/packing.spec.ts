@@ -213,13 +213,13 @@ describe('Packing', () => {
         assertPackedHeader(packed, { commandCount: 3, slot: 5000 });
       });
 
-      it('uses slot 0 on wire when all commands are keyless', () => {
+      it('uses NULL_SLOT on wire when all commands are keyless', () => {
         const packer = new CommandPacker();
         packer.add(['resp1'], NULL_SLOT, 5);
         packer.add(['resp2'], NULL_SLOT, 5);
 
         const packed = packer.drain(FlushReason.DRAIN);
-        assertPackedHeader(packed, { commandCount: 2, slot: 0 });
+        assertPackedHeader(packed, { commandCount: 2, slot: NULL_SLOT });
       });
 
       it('keyless commands can join any existing slot batch', () => {
