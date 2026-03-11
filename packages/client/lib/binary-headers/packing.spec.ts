@@ -15,7 +15,7 @@ const MAX_COMMANDS = RequestHeaderEncoder.commandCountMaxValue();
 
 function assertPackedHeader(
   packed: ReadonlyArray<unknown> | null,
-  expected: { commandCount?: number; slot?: number }
+  expected: { commandCount?: number; slot?: number; clientIdx?: number }
 ): void {
   assert.ok(packed !== null, 'Expected packed data to be non-null');
   assert.ok(packed[0] instanceof Buffer, 'Expected first element to be a Buffer');
@@ -28,6 +28,9 @@ function assertPackedHeader(
   }
   if (expected.slot !== undefined) {
     assert.equal(decoder.slot(), expected.slot);
+  }
+  if (expected.clientIdx !== undefined) {
+    assert.equal(decoder.clientIdx(), expected.clientIdx);
   }
 }
 
@@ -199,6 +202,47 @@ describe('Packing', () => {
         const flushed = packer.add(['*1\r\n$4\r\nPING\r\n'], 1000, 14);
         assertPackedHeader(flushed, { commandCount: MAX_COMMANDS });
         assert.equal(packer.bufferSize, 1);
+      });
+    });
+
+    describe('client_idx handling', () => {
+      it('increments client_idx for each flushed frame', () => {
+        const packer = new CommandPacker();
+
+        packer.add(['cmd1'], 1000, 4);
+        const first = packer.drain(FlushReason.DRAIN);
+        assertPackedHeader(first, { commandCount: 1, slot: 1000, clientIdx: 0 });
+
+        packer.add(['cmd2'], 1000, 4);
+        const second = packer.drain(FlushReason.DRAIN);
+        assertPackedHeader(second, { commandCount: 1, slot: 1000, clientIdx: 1 });
+      });
+
+      it('wraps client_idx from 0xFFFF to 0', () => {
+        const packer = new CommandPacker(undefined, { initialClientIdx: 0xFFFF });
+
+        packer.add(['cmd1'], 1000, 4);
+        const first = packer.drain(FlushReason.DRAIN);
+        assertPackedHeader(first, { commandCount: 1, slot: 1000, clientIdx: 0xFFFF });
+
+        packer.add(['cmd2'], 1000, 4);
+        const second = packer.drain(FlushReason.DRAIN);
+        assertPackedHeader(second, { commandCount: 1, slot: 1000, clientIdx: 0 });
+      });
+
+      it('rejects invalid initialClientIdx values', () => {
+        assert.throws(
+          () => new CommandPacker(undefined, { initialClientIdx: -1 }),
+          /initialClientIdx/
+        );
+        assert.throws(
+          () => new CommandPacker(undefined, { initialClientIdx: 0x10000 }),
+          /initialClientIdx/
+        );
+        assert.throws(
+          () => new CommandPacker(undefined, { initialClientIdx: 1.5 }),
+          /initialClientIdx/
+        );
       });
     });
 
