@@ -27,6 +27,13 @@ export interface CommandPackerOptions {
    * Defaults to RequestHeaderEncoder.lengthMaxValue().
    */
   maxPayloadLength?: number;
+
+  /**
+   * Initial clientIdx value for request headers.
+   * Must be between 0 and RequestHeaderEncoder.clientIdxMaxValue().
+   * Defaults to 0.
+   */
+  initialClientIdx?: number;
 }
 
 export function createTimeoutScheduler(): Scheduler {
@@ -74,6 +81,7 @@ export class CommandPacker {
 
   #resolvedSlot: number = NULL_SLOT;
   #totalPayloadLength: number = 0;
+  #nextClientIdx: number;
 
   constructor(
     statsCounter?: BinaryHeaderStatsCounter,
@@ -94,6 +102,17 @@ export class CommandPacker {
     if (this.#maxPayloadLength < 1 || this.#maxPayloadLength > codecMaxPayloadLength) {
       throw new Error(`maxPayloadLength must be between 1 and ${codecMaxPayloadLength}, got ${this.#maxPayloadLength}`);
     }
+
+    const initialClientIdx = options?.initialClientIdx ?? 0;
+    const codecMaxClientIdx = RequestHeaderEncoder.clientIdxMaxValue();
+    if (
+      !Number.isInteger(initialClientIdx) ||
+      initialClientIdx < 0 ||
+      initialClientIdx > codecMaxClientIdx
+    ) {
+      throw new Error(`initialClientIdx must be an integer between 0 and ${codecMaxClientIdx}, got ${initialClientIdx}`);
+    }
+    this.#nextClientIdx = initialClientIdx;
 
     // Pre-allocate array to max size to avoid reallocations
     this.#resps = new Array(this.#maxCommandCount);
@@ -163,12 +182,14 @@ export class CommandPacker {
   #flush(reason: FlushReason): SocketChunk {
     const count = this.#respCount;
     this.#statsCounter.recordFlush(reason);
+    const clientIdx = this.#nextClientIdx;
+    this.#nextClientIdx = (this.#nextClientIdx + 1) & RequestHeaderEncoder.clientIdxMaxValue();
 
     const header = RequestHeaderEncoder.allocateAndEncode(
       this.#totalPayloadLength,
       count,
       this.#resolvedSlot,
-      0  // clientIdx - not used in current implementation
+      clientIdx
     );
 
     // Calculate total parts needed
