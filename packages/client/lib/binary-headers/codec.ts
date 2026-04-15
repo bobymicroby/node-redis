@@ -1,13 +1,13 @@
 import type {
-  OutboundInterceptor,
-  InboundInterceptor,
-  WireInterceptor,
+  OutboundCodec,
+  InboundCodec,
+  WireCodec,
   SocketChunk,
   CommandArguments,
   CommandToWrite,
-  OutboundBatch,
-  OutboundCommandMeta,
-  OutboundSink,
+  WriteBatch,
+  WriteCommandMeta,
+  WriteSink,
   Scheduler,
   Cancellable
 } from '../client/commands-queue';
@@ -56,16 +56,16 @@ export interface BinaryHeadersInboundOptions {
   readonly onProtocolError?: OnProtocolError;
 }
 
-export interface BinaryHeadersInterceptorOptions {
+export interface BinaryHeadersCodecOptions {
   readonly outbound?: BinaryHeadersOutboundOptions;
   readonly inbound?: BinaryHeadersInboundOptions;
   readonly statsCounter?: BinaryHeaderStatsCounter;
 }
 
 /**
- * Binary headers outbound interceptor.
+ * Binary headers outbound codec.
  *
- * Intercepts outbound commands to batch eligible ones with binary headers.
+ * Encodes outbound commands into binary-header batches when they are eligible.
  * Uses the resolver to determine eligibility and the packer to batch by slot.
  *
  * Batching behavior:
@@ -74,13 +74,13 @@ export interface BinaryHeadersInterceptorOptions {
  * - Ineligible commands always pass through unchanged, but first flush any pending batch
  * - This preserves command ordering while maximizing batching opportunities
  *
- * What write() returns in different scenarios:
- * - Eligible, still buffering        → [] (nothing to send yet)
- * - Eligible, triggers flush         → [packed] (batch with binary header)
- * - Ineligible, nothing pending      → [encoded] (passthrough as-is)
- * - Ineligible, pending batch exists → [pending, encoded] (flush first, then passthrough)
+ * What `push()` / `drain()` return in different scenarios:
+ * - Eligible, still buffering        -> null
+ * - Eligible, triggers batch emit    -> { writes: [packed], emittedCommands: [...] }
+ * - Ineligible, nothing buffered     -> { writes: [encoded], emittedCommands: [command] }
+ * - Ineligible with buffered batch   -> { writes: [pending, encoded], emittedCommands: [...] }
  */
-export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
+export class BinaryHeadersOutboundCodec implements OutboundCodec {
   readonly #resolver: EligibilityResolver;
   readonly #packer: CommandPacker;
   readonly #statsCounter: BinaryHeaderStatsCounter;
@@ -91,7 +91,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   #pendingChainId: symbol | undefined;
   #pendingRequiresDrainAtEnd = false;
   #pendingFlush: Cancellable | null = null;
-  #sink: OutboundSink | null = null;
+  #sink: WriteSink | null = null;
   readonly maxWaitMs: number;
 
   constructor(
@@ -120,7 +120,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     this.#pendingRequiresDrainAtEnd = false;
   }
 
-  #markPendingSegment(meta?: OutboundCommandMeta): void {
+  #markPendingSegment(meta?: WriteCommandMeta): void {
     this.#pendingChainId = meta?.chainId;
     if (meta?.chainId !== undefined) {
       this.#pendingRequiresDrainAtEnd = true;
@@ -142,7 +142,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     if (
       this.#sink === null ||
       this.#pendingFlush !== null ||
-      !this.hasPending() ||
+      !this.hasBuffered() ||
       !this.#shouldUseTimer()
     ) {
       return;
@@ -161,40 +161,40 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     });
   }
 
-  #flushBuffered(reason: FlushReason): OutboundBatch | null {
+  #flushBuffered(reason: FlushReason): WriteBatch | null {
     const packed = this.#packer.drain(reason);
     if (packed === null) return null;
     this.#cancelPendingFlush();
-    const sent = this.#takeBufferedCommands();
+    const emittedCommands = this.#takeBufferedCommands();
     this.#resetPendingSegment();
     return {
       writes: [packed],
-      sent
+      emittedCommands
     };
   }
 
-  bind(sink: OutboundSink): void {
+  bind(sink: WriteSink): void {
     this.#sink = sink;
     this.#scheduleFlushIfNeeded();
   }
 
-  static #mergeBatches(left: OutboundBatch | null, right: OutboundBatch | null): OutboundBatch | null {
+  static #mergeBatches(left: WriteBatch | null, right: WriteBatch | null): WriteBatch | null {
     if (left === null) return right;
     if (right === null) return left;
     return {
       writes: [...left.writes, ...right.writes],
-      sent: [...left.sent, ...right.sent]
+      emittedCommands: [...left.emittedCommands, ...right.emittedCommands]
     };
   }
 
-  #interceptEncoded(
+  #pushEncoded(
     command: CommandToWrite,
     encoded: SocketChunk,
     args: CommandArguments,
     byteLength?: number,
     chainId?: symbol,
-    meta?: OutboundCommandMeta
-  ): OutboundBatch | null {
+    meta?: WriteCommandMeta
+  ): WriteBatch | null {
     let slot: number;
 
     // Fast path: reuse cached slot for same chain (multi/pipeline)
@@ -218,12 +218,12 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
       if (pending === null) {
         return {
           writes: [encoded],
-          sent: [command]
+          emittedCommands: [command]
         };
       }
       return {
         writes: [...pending.writes, encoded],
-        sent: [...pending.sent, command]
+        emittedCommands: [...pending.emittedCommands, command]
       };
     }
 
@@ -238,23 +238,23 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     }
 
     this.#cancelPendingFlush();
-    const sent = this.#takeBufferedCommands();
+    const emittedCommands = this.#takeBufferedCommands();
     this.#resetPendingSegment();
     this.#bufferedCommands.push(command);
     this.#markPendingSegment(meta);
     return {
       writes: [packed],
-      sent
+      emittedCommands
     };
   }
 
-  intercept(
+  push(
     command: CommandToWrite,
     encoded: SocketChunk,
     args: CommandArguments,
     byteLength?: number,
-    meta?: OutboundCommandMeta
-  ): OutboundBatch | null {
+    meta?: WriteCommandMeta
+  ): WriteBatch | null {
     this.#statsCounter.recordCommand();
     const chainId = meta?.chainId;
 
@@ -266,24 +266,24 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
       this.#lastChainId = chainId;
     }
 
-    let batch: OutboundBatch | null = null;
+    let batch: WriteBatch | null = null;
 
     // Flush on chain boundary only when the pending segment already belongs to an explicit pipeline.
     // This preserves the existing behavior where auto-pipelined commands can be absorbed into a later
     // explicit pipeline segment, but explicit segments never leak into the following segment.
-    if (this.hasPending() && this.#pendingChainId !== undefined && chainId !== this.#pendingChainId) {
-      batch = this.flush(FlushReason.DRAIN);
+    if (this.hasBuffered() && this.#pendingChainId !== undefined && chainId !== this.#pendingChainId) {
+      batch = this.drain(FlushReason.DRAIN);
     }
 
-    batch = BinaryHeadersOutboundInterceptor.#mergeBatches(
+    batch = BinaryHeadersOutboundCodec.#mergeBatches(
       batch,
-      this.#interceptEncoded(command, encoded, args, byteLength, chainId, meta)
+      this.#pushEncoded(command, encoded, args, byteLength, chainId, meta)
     );
 
-    if (meta?.forceImmediate && this.hasPending()) {
-      batch = BinaryHeadersOutboundInterceptor.#mergeBatches(
+    if (meta?.forceImmediate && this.hasBuffered()) {
+      batch = BinaryHeadersOutboundCodec.#mergeBatches(
         batch,
-        this.flush(FlushReason.DRAIN)
+        this.drain(FlushReason.DRAIN)
       );
     }
 
@@ -291,21 +291,21 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     return batch;
   }
 
-  flush(reason: FlushReason): OutboundBatch | null {
+  drain(reason: FlushReason): WriteBatch | null {
     this.#cancelPendingFlush();
     return this.#flushBuffered(reason);
   }
 
-  endIteration(): OutboundBatch | null {
-    if (!this.hasPending()) return null;
+  endWritePass(): WriteBatch | null {
+    if (!this.hasBuffered()) return null;
     if (!this.#shouldUseTimer()) {
-      return this.flush(FlushReason.DRAIN);
+      return this.drain(FlushReason.DRAIN);
     }
     this.#scheduleFlushIfNeeded();
     return null;
   }
 
-  hasPending(): boolean {
+  hasBuffered(): boolean {
     return this.#packer.bufferSize > 0;
   }
 
@@ -345,13 +345,13 @@ const enum HeaderParseResult {
  */
 
 /**
- * Binary headers inbound interceptor.
+ * Binary headers inbound codec.
  *
  * - Parses binary header frames from incoming data
  * - Strips headers and forwards payload to decoder
  * - Falls back to passthrough for non-binary-header data
  */
-export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
+export class BinaryHeadersInboundCodec implements InboundCodec {
   readonly #headerDecoder = new ResponseHeaderDecoder();
   readonly #onHeader: OnHeader | undefined;
   readonly #onProtocolError: OnProtocolError | undefined;
@@ -364,7 +364,7 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
     this.#onProtocolError = options.onProtocolError;
   }
 
-  intercept(chunk: Buffer, next: (data: Buffer) => void): void {
+  decode(chunk: Buffer, next: (data: Buffer) => void): void {
     this.#decode(chunk, next);
   }
 
@@ -457,18 +457,18 @@ export class BinaryHeadersInboundInterceptor implements InboundInterceptor {
 }
 
 /**
- * Binary headers interceptor combining outbound and inbound processing.
+ * Binary headers codec combining outbound and inbound processing.
  * This is the main entry point for binary headers support.
  */
-export class BinaryHeadersInterceptor implements WireInterceptor {
-  readonly outbound: BinaryHeadersOutboundInterceptor;
-  readonly inbound: BinaryHeadersInboundInterceptor;
+export class BinaryHeadersCodec implements WireCodec {
+  readonly outbound: BinaryHeadersOutboundCodec;
+  readonly inbound: BinaryHeadersInboundCodec;
   readonly #statsCounter: BinaryHeaderStatsCounter;
 
-  constructor(options: BinaryHeadersInterceptorOptions = {}) {
+  constructor(options: BinaryHeadersCodecOptions = {}) {
     this.#statsCounter = options.statsCounter ?? disabledBinaryHeaderStatsCounter();
-    this.inbound = new BinaryHeadersInboundInterceptor(options.inbound);
-    this.outbound = new BinaryHeadersOutboundInterceptor(options.outbound, this.#statsCounter);
+    this.inbound = new BinaryHeadersInboundCodec(options.inbound);
+    this.outbound = new BinaryHeadersOutboundCodec(options.outbound, this.#statsCounter);
   }
 
   stats(): BinaryHeaderStats {
@@ -477,17 +477,17 @@ export class BinaryHeadersInterceptor implements WireInterceptor {
 }
 
 /**
- * Factory function to create a WireInterceptor for binary headers.
+ * Factory function to create a WireCodec for binary headers.
  */
-export function createBinaryHeadersInterceptor(
+export function createBinaryHeadersCodec(
   resolver: EligibilityResolver,
   options?: {
     onHeader?: OnHeader;
     onProtocolError?: OnProtocolError;
     statsCounter?: BinaryHeaderStatsCounter;
   }
-): WireInterceptor {
-  return new BinaryHeadersInterceptor({
+): WireCodec {
+  return new BinaryHeadersCodec({
     outbound: {
       resolver,
     },

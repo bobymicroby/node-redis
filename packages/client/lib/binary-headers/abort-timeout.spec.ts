@@ -310,12 +310,12 @@ describe('Binary Headers Abort and Timeout', function () {
   });
 
   describe('Binary headers option normalization', function () {
-    function countReadyToWriteCallbackWiring(binaryHeaders: boolean | { enabled: true }): number {
-      const original = RedisCommandsQueue.prototype.setReadyToWriteCallback;
+    function countWriteHandlerWiring(binaryHeaders: boolean | { enabled: true }): number {
+      const original = RedisCommandsQueue.prototype.setWriteHandler;
       let calls = 0;
 
       try {
-        (RedisCommandsQueue.prototype as unknown as { setReadyToWriteCallback: typeof original }).setReadyToWriteCallback =
+        (RedisCommandsQueue.prototype as unknown as { setWriteHandler: typeof original }).setWriteHandler =
           function (this: RedisCommandsQueue, callback: (writes: ReadonlyArray<ReadonlyArray<unknown>>) => void): void {
             calls++;
             original.call(this, callback as Parameters<typeof original>[0]);
@@ -326,25 +326,25 @@ describe('Binary Headers Abort and Timeout', function () {
           disableClientInfo: true,
         }).on('error', () => {});
       } finally {
-        (RedisCommandsQueue.prototype as unknown as { setReadyToWriteCallback: typeof original }).setReadyToWriteCallback = original;
+        (RedisCommandsQueue.prototype as unknown as { setWriteHandler: typeof original }).setWriteHandler = original;
       }
 
       return calls;
     }
 
-    it('binaryHeaders object form wires ready-to-write callback (control)', function () {
+    it('binaryHeaders object form wires write handler (control)', function () {
       assert.equal(
-        countReadyToWriteCallbackWiring({ enabled: true }),
+        countWriteHandlerWiring({ enabled: true }),
         1,
-        'Expected ready-to-write callback to be wired for binaryHeaders: { enabled: true }'
+        'Expected write handler to be wired for binaryHeaders: { enabled: true }'
       );
     });
 
-    it('binaryHeaders: true wires ready-to-write callback', function () {
+    it('binaryHeaders: true wires write handler', function () {
       assert.equal(
-        countReadyToWriteCallbackWiring(true),
+        countWriteHandlerWiring(true),
         1,
-        'Expected ready-to-write callback to be wired for binaryHeaders: true'
+        'Expected write handler to be wired for binaryHeaders: true'
       );
     });
   });

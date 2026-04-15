@@ -1182,7 +1182,7 @@ async function createBenchClient(
  * Commands are issued synchronously in a for loop. Because node-redis uses
  * setImmediate to schedule writes, all commands issued beforeatches of bulk-size using client.multi().execAsPipeline().
  * This guarantees all commands in a bulk are written to the socket together,
- * enabling the binary headers interceptor to batch them under one header.
+ * enabling the binary headers codec to batch them under one header.
  *
  * When bulk-size responses arrive, another batch is issued to maintain pipeline depth.
  */
@@ -1210,7 +1210,7 @@ function runPipelinedConnection(
     /**
      * Issue a batch of bulk-size commands using multi().execAsPipeline().
      * This guarantees all commands are written to the socket in one batch,
-     * enabling the binary headers interceptor to batch them under one header.
+     * enabling the binary headers codec to batch them under one header.
      */
     function issueBulk(): void {
       if (signal.aborted) {

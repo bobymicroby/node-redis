@@ -6,7 +6,7 @@
 Phase 1: done
 Phase 2: done
 Phase 3: done
-Phase 4: pending
+Phase 4: done
 ```
 
 Current green validation:
@@ -70,7 +70,7 @@ Original intentional failures:
 ```text
 1. flushWaitingForReply clears pending outbound data and cancels scheduled timer
 2. flushAll clears pending outbound data and cancels scheduled timer
-3. OutboundInterceptor intercept errors reject the command and leave the queue usable
+3. OutboundCodec intercept errors reject the command and leave the queue usable
 ```
 
 Those failures were useful because they pinned the ownership bug before refactoring.
@@ -83,7 +83,7 @@ Historical shape:
 
 ```ts
 this.#waitingForReply.push(toSend);
-let outputs = outbound.intercept(encoded, args, byteLength, currentChainId);
+let outputs = outbound.push(encoded, args, byteLength, currentChainId);
 ```
 
 Visual model:
@@ -163,22 +163,22 @@ Make the outbound codec return not only bytes, but also the exact commands that 
 The transitional outbound protocol now includes batch metadata:
 
 ```ts
-export interface OutboundBatch {
+export interface WriteBatch {
   writes: SocketChunks;
-  sent: ReadonlyArray<CommandToWrite>;
+  emittedCommands: ReadonlyArray<CommandToWrite>;
 }
 
-export interface OutboundInterceptor {
+export interface OutboundCodec {
   intercept(
     command: CommandToWrite,
     encoded: SocketChunk,
     args: CommandArguments,
     byteLength?: number,
-    meta?: OutboundCommandMeta
-  ): OutboundBatch | null;
+    meta?: WriteCommandMeta
+  ): WriteBatch | null;
 
-  flush(reason: FlushReason): OutboundBatch | null;
-  hasPending(): boolean;
+  flush(reason: FlushReason): WriteBatch | null;
+  hasBuffered(): boolean;
   reset?(): CommandToWrite[];
 }
 ```
@@ -196,7 +196,7 @@ The codec now buffers command objects alongside payload chunks:
 
 ```text
 - eligible buffered commands stay codec-owned until emitted
-- flush() returns both writes and the exact sent commands
+- drain() returns both writes and the exact emitted commands
 - reset() clears buffered payload and returns buffered commands for rejection
 ```
 
@@ -239,7 +239,7 @@ Before this phase, the queue still owned:
 The queue now passes command metadata instead of running segment policy itself:
 
 ```ts
-export interface OutboundCommandMeta {
+export interface WriteCommandMeta {
   chainId?: symbol;
   forceImmediate?: boolean;
 }
@@ -248,18 +248,18 @@ export interface OutboundCommandMeta {
 The outbound boundary grows two transitional helpers:
 
 ```ts
-export interface OutboundInterceptor {
+export interface OutboundCodec {
   intercept(
     command: CommandToWrite,
     encoded: SocketChunk,
     args: CommandArguments,
     byteLength?: number,
-    meta?: OutboundCommandMeta
-  ): OutboundBatch | null;
+    meta?: WriteCommandMeta
+  ): WriteBatch | null;
 
-  flush(reason: FlushReason): OutboundBatch | null;
-  endIteration?(): OutboundBatch | null;
-  hasPending(): boolean;
+  flush(reason: FlushReason): WriteBatch | null;
+  endWritePass?(): WriteBatch | null;
+  hasBuffered(): boolean;
   reset?(): CommandToWrite[];
 }
 ```
@@ -295,7 +295,7 @@ added to codec.ts:
   - pendingRequiresDrainAtEnd
   - chain-boundary drain for explicit segment transitions
   - forceImmediate drain for abort/timeout commands
-  - endIteration() for "drain now vs wait for timer"
+  - endWritePass() for "drain now vs wait for timer"
 ```
 
 Important behavior preserved:
@@ -339,7 +339,7 @@ Open decision left for Phase 3:
 
 ```text
 the queue still has fallback behavior for codecs that do not implement
-endIteration(). That can stay as a compatibility bridge.
+endWritePass(). That can stay as a compatibility bridge.
 ```
 
 ## Phase 3: Move Timer Ownership Into The Codec
@@ -355,8 +355,8 @@ Delete queue-owned timer state and callback plumbing.
 ```text
 queue
   - no longer owns scheduler / pendingFlush / scheduleFlush / cancelPendingFlush
-  - binds the outbound codec once via OutboundSink
-  - exposes a generic ReadyToWriteCallback instead of a timer-specific callback
+  - binds the outbound codec once via WriteSink
+  - exposes a generic WriteHandler instead of a timer-specific callback
 
 codec
   - owns scheduler / pendingFlush / scheduleFlushIfNeeded / cancelPendingFlush
@@ -365,18 +365,18 @@ codec
 
 index
   - passes timer config into BinaryHeadersOutboundOptions.timer
-  - wires queue.setReadyToWriteCallback(...) to socket.write(...)
+  - wires queue.setWriteHandler(...) to socket.write(...)
 ```
 
 Landed queue/codec bridge:
 
 ```ts
-interface OutboundSink {
-  emit(batch: OutboundBatch): void;
+interface WriteSink {
+  emit(batch: WriteBatch): void;
   onError(err: unknown): void;
 }
 
-type ReadyToWriteCallback = (writes: SocketChunks) => void;
+type WriteHandler = (writes: SocketChunks) => void;
 ```
 
 Visual model:
@@ -389,9 +389,9 @@ before Phase 3
 
 after Phase 3
   codec timer fires
-    -> codec creates OutboundBatch
+    -> codec creates WriteBatch
     -> codec calls sink.emit(batch)
-    -> queue marks batch.sent as waitingForReply
+    -> queue marks batch.emittedCommands as waitingForReply
     -> queue callback writes batch.writes
 ```
 
@@ -408,7 +408,7 @@ after Phase 3
 Compatibility shims intentionally kept for now:
 
 ```text
-- setTimerFlushCallback(...)
+- setWriteHandler(...)
 - maxWaitMs
 - hasPendingOutbound()
 - drainPendingOutbound()
@@ -445,7 +445,7 @@ Without that cancel, these tests failed:
 
 ## Phase 4: Clean-Up / Naming Pass
 
-Status: pending
+Status: done
 
 ### Goal
 
@@ -454,9 +454,13 @@ Make the outward-facing abstractions read like a transport plugin instead of a h
 ### Naming Work Already Landed
 
 ```text
-- setReadyToWriteCallback(...) exists and is the preferred generic name
-- setTimerFlushCallback(...) remains as a compatibility alias
+- setWriteHandler(...) is the queue callback name
 - queue/index wiring no longer talks about "timer flush callback"
+- sent -> emittedCommands
+- intercept() -> push() / decode()
+- flush() -> drain()
+- hasPending() -> hasBuffered()
+- BinaryHeaders*Interceptor -> BinaryHeaders*Codec
 ```
 
 This is a useful midpoint because the callback semantics are now accurate:
@@ -466,38 +470,39 @@ the queue callback is not timer-only anymore
 it is the generic path for ready socket writes
 ```
 
-### Candidate Renames Still Deferred
+### Breaking Renames That Landed
 
 ```text
 OutboundInterceptor -> OutboundCodec
 InboundInterceptor  -> InboundCodec
 WireInterceptor     -> WireCodec
-intercept()         -> push() / decode()
-flush()             -> drain()
+OutboundBatch       -> WriteBatch
+OutboundCommandMeta -> WriteCommandMeta
+OutboundSink        -> WriteSink
+ReadyToWriteCallback -> WriteHandler
+setReadyToWriteCallback(...) -> setWriteHandler(...)
+setTimerFlushCallback(...)   -> removed
+BinaryHeadersInterceptor -> BinaryHeadersCodec
+BinaryHeadersOutboundInterceptor -> BinaryHeadersOutboundCodec
+BinaryHeadersInboundInterceptor  -> BinaryHeadersInboundCodec
+BinaryHeadersInterceptorOptions  -> BinaryHeadersCodecOptions
+createBinaryHeadersInterceptor() -> createBinaryHeadersCodec()
+intercept() -> push() / decode()
+flush()     -> drain()
+hasPending() -> hasBuffered()
+sent -> emittedCommands
 ```
 
-Recommended order for the rename work:
+### Validation
 
-```text
-1. add alias types first
-   OutboundCodec = OutboundInterceptor
-   InboundCodec = InboundInterceptor
-   WireCodec = WireInterceptor
+Green:
 
-2. add alias methods second
-   intercept() <-> push()
-   flush() <-> drain()
-
-3. switch tests/helpers/docs to the new names
-
-4. only then remove the old names
-```
-
-Reason:
-
-```text
-the architecture is now stable enough for renames,
-but broad churn should stay separate from the timer-ownership change
+```sh
+npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/memtier-bench.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats-e2e.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/**.spec.ts' 2>&1
 ```
 
 ### Acceptance

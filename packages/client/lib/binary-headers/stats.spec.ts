@@ -6,7 +6,7 @@ import {
   DefaultBinaryHeaderStatsCounter,
   disabledBinaryHeaderStatsCounter,
 } from './stats';
-import { BinaryHeadersInterceptor } from './codec';
+import { BinaryHeadersCodec } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 import { assertStats, type ExpectedStats } from './test-utils';
 import type { CommandToWrite } from '../client/commands-queue';
@@ -385,11 +385,11 @@ describe('Binary Headers Stats', function () {
   });
 
   // ==========================================================================
-  // Integration with BinaryHeadersInterceptor
+  // Integration with BinaryHeadersCodec
   // ==========================================================================
-  describe('BinaryHeadersInterceptor integration', function () {
+  describe('BinaryHeadersCodec integration', function () {
     it('stats() returns empty when no statsCounter provided', function () {
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
       });
 
@@ -398,9 +398,9 @@ describe('Binary Headers Stats', function () {
       assert.equal(stats.batchedCommandCount, 0);
     });
 
-    it('stats() tracks commands through interceptor', function () {
+    it('stats() tracks commands through codec', function () {
       const statsCounter = DefaultBinaryHeaderStatsCounter.create();
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
         statsCounter,
       });
@@ -409,8 +409,8 @@ describe('Binary Headers Stats', function () {
       const encoded1 = ['*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$5\r\nvalue\r\n'];
       const encoded2 = ['*2\r\n$3\r\nGET\r\n$4\r\nkey1\r\n'];
 
-      interceptor.outbound.intercept(fakeCommand(['SET', 'key1', 'value']), encoded1, ['SET', 'key1', 'value']);
-      interceptor.outbound.intercept(fakeCommand(['GET', 'key1']), encoded2, ['GET', 'key1']);
+      interceptor.outbound.push(fakeCommand(['SET', 'key1', 'value']), encoded1, ['SET', 'key1', 'value']);
+      interceptor.outbound.push(fakeCommand(['GET', 'key1']), encoded2, ['GET', 'key1']);
 
       const stats = interceptor.stats();
       assert.equal(stats.totalCommandCount, 2);
@@ -420,13 +420,13 @@ describe('Binary Headers Stats', function () {
 
     it('stats() tracks ineligible commands', function () {
       const statsCounter = DefaultBinaryHeaderStatsCounter.create();
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: NOOP_RESOLVER }, // All commands ineligible
         statsCounter,
       });
 
       const encoded = ['*1\r\n$4\r\nPING\r\n'];
-      interceptor.outbound.intercept(fakeCommand(['PING']), encoded, ['PING']);
+      interceptor.outbound.push(fakeCommand(['PING']), encoded, ['PING']);
 
       const stats = interceptor.stats();
       assert.equal(stats.totalCommandCount, 1);
@@ -437,21 +437,21 @@ describe('Binary Headers Stats', function () {
 
     it('stats() tracks flush on drain', function () {
       const statsCounter = DefaultBinaryHeaderStatsCounter.create();
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
         statsCounter,
       });
 
       // Add a command (gets buffered)
       const encoded = ['*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$5\r\nvalue\r\n'];
-      interceptor.outbound.intercept(fakeCommand(['SET', 'key1', 'value']), encoded, ['SET', 'key1', 'value']);
+      interceptor.outbound.push(fakeCommand(['SET', 'key1', 'value']), encoded, ['SET', 'key1', 'value']);
 
       // Before drain
       let stats = interceptor.stats();
       assert.equal(stats.batchCount, 0);
 
       // Drain the buffer
-      interceptor.outbound.flush(FlushReason.DRAIN);
+      interceptor.outbound.drain(FlushReason.DRAIN);
 
       // After drain
       stats = interceptor.stats();
@@ -461,7 +461,7 @@ describe('Binary Headers Stats', function () {
 
     it('stats() tracks slot mismatch flush', function () {
       const statsCounter = DefaultBinaryHeaderStatsCounter.create();
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
         statsCounter,
       });
@@ -470,8 +470,8 @@ describe('Binary Headers Stats', function () {
       const encoded1 = ['*3\r\n$3\r\nSET\r\n$9\r\n{slot1}k1\r\n$1\r\nv\r\n'];
       const encoded2 = ['*3\r\n$3\r\nSET\r\n$9\r\n{slot2}k2\r\n$1\r\nv\r\n'];
 
-      interceptor.outbound.intercept(fakeCommand(['SET', '{slot1}k1', 'v']), encoded1, ['SET', '{slot1}k1', 'v']);
-      interceptor.outbound.intercept(fakeCommand(['SET', '{slot2}k2', 'v']), encoded2, ['SET', '{slot2}k2', 'v']); // Different slot triggers flush
+      interceptor.outbound.push(fakeCommand(['SET', '{slot1}k1', 'v']), encoded1, ['SET', '{slot1}k1', 'v']);
+      interceptor.outbound.push(fakeCommand(['SET', '{slot2}k2', 'v']), encoded2, ['SET', '{slot2}k2', 'v']); // Different slot triggers flush
 
       const stats = interceptor.stats();
       assert.equal(stats.totalCommandCount, 2);
@@ -480,15 +480,15 @@ describe('Binary Headers Stats', function () {
       assert.equal(stats.slotMismatchFlushCount, 1);
     });
 
-    it('outbound.stats() and interceptor.stats() return same values', function () {
+    it('outbound.stats() and codec.stats() return same values', function () {
       const statsCounter = DefaultBinaryHeaderStatsCounter.create();
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
         statsCounter,
       });
 
       const encoded = ['*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$5\r\nvalue\r\n'];
-      interceptor.outbound.intercept(fakeCommand(['SET', 'key1', 'value']), encoded, ['SET', 'key1', 'value']);
+      interceptor.outbound.push(fakeCommand(['SET', 'key1', 'value']), encoded, ['SET', 'key1', 'value']);
 
       const interceptorStats = interceptor.stats();
       const outboundStats = interceptor.outbound.stats();

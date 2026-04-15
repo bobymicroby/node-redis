@@ -1,8 +1,8 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
-import RedisCommandsQueue, { type WireInterceptor } from '../client/commands-queue';
+import RedisCommandsQueue, { type WireCodec } from '../client/commands-queue';
 import { RESP_TYPES } from '../RESP/decoder';
-import { BinaryHeadersInterceptor, BinaryHeadersInboundInterceptor } from './codec';
+import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
 import {
   // Async utilities
   delay,
@@ -113,7 +113,7 @@ describe('Codec Queue [codec-queue]', function () {
     });
   });
 
-  describe('with BinaryHeadersInterceptor (static resolver)', function () {
+  describe('with BinaryHeadersCodec (static resolver)', function () {
     // Table-driven tests for batching behavior
     const batchingCases = [
       { name: 'single command is batched with header', commands: [['PING']], expectedYields: 1, expectedCommandCount: 1 },
@@ -196,7 +196,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('destroy cancels pending flush', function () {
       const queue = createQueueWithTimer(1000);
       let called = false;
-      queue.setTimerFlushCallback(() => { called = true; });
+      queue.setWriteHandler(() => { called = true; });
 
       queue.destroy();
       // After destroy, callback should be reset to noop
@@ -245,9 +245,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('timer fires and flushes buffered commands via callback', async function () {
       const queue = createQueueWithTimer(10, false);
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => {
-        flushedData.push(encoded);
-      });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       // Add command and consume generator (yields nothing due to scheduler)
       queue.addCommand(['SET', 'key', 'value']);
@@ -269,9 +267,9 @@ describe('Codec Queue [codec-queue]', function () {
       const queue = createQueueWithTimer(50, false);
       let callbackCount = 0;
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => {
+      queue.setWriteHandler((writes) => {
         callbackCount++;
-        flushedData.push(encoded);
+        flushedData.push(...writes);
       });
 
       // Add first command - buffered, timer scheduled
@@ -304,9 +302,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('multiple commands buffered, timer fires with all packed together', async function () {
       const queue = createQueueWithTimer(15, false);
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => {
-        flushedData.push(encoded);
-      });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       // Add multiple commands with same slot (all buffered)
       queue.addCommand(['SET', 'key', 'value1']);
@@ -330,7 +326,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('destroy during active timer prevents callback', async function () {
       const queue = createQueueWithTimer(30, false);
       let called = false;
-      queue.setTimerFlushCallback(() => { called = true; });
+      queue.setWriteHandler(() => { called = true; });
 
       // Add command to start timer
       queue.addCommand(['SET', 'key', 'value']);
@@ -349,9 +345,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('uses immediate scheduler for synchronous flush', async function () {
       const queue = createQueueWithTimer(1000, true); // useImmediate = true
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => {
-        flushedData.push(encoded);
-      });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue);
@@ -456,7 +450,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('manual drainPendingOutbound before timer fires prevents double-flush', async function () {
       const queue = createQueueWithTimer(30);
       let callbackCount = 0;
-      queue.setTimerFlushCallback(() => { callbackCount++; });
+      queue.setWriteHandler(() => { callbackCount++; });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue); // buffer command, timer scheduled
@@ -482,7 +476,7 @@ describe('Codec Queue [codec-queue]', function () {
       activeQueues.push(queue);
 
       let callbackCount = 0;
-      queue.setTimerFlushCallback(() => { callbackCount++; });
+      queue.setWriteHandler(() => { callbackCount++; });
 
       const commandPromise = queue.addCommand(['SET', 'key', 'value']).catch(err => err);
       collectYielded(queue); // buffer command, timer scheduled
@@ -509,7 +503,7 @@ describe('Codec Queue [codec-queue]', function () {
       activeQueues.push(queue);
 
       let callbackCount = 0;
-      queue.setTimerFlushCallback(() => { callbackCount++; });
+      queue.setWriteHandler(() => { callbackCount++; });
 
       const commandPromise = queue.addCommand(['SET', 'key', 'value']).catch(err => err);
       collectYielded(queue); // buffer command, timer scheduled
@@ -528,17 +522,17 @@ describe('Codec Queue [codec-queue]', function () {
       assert.equal(callbackCount, 0, 'Timer callback should not fire after flushAll');
     });
 
-    it('setTimerFlushCallback replaced mid-flight: new callback receives data', async function () {
+    it('setWriteHandler replaced mid-flight: new callback receives data', async function () {
       const queue = createQueueWithTimer(15);
       let oldCalled = false;
-      queue.setTimerFlushCallback(() => { oldCalled = true; });
+      queue.setWriteHandler(() => { oldCalled = true; });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue); // timer scheduled
 
       // Replace callback before timer fires
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       await delay(25);
       assert.equal(oldCalled, false, 'Old callback should not be called');
@@ -549,7 +543,7 @@ describe('Codec Queue [codec-queue]', function () {
       });
     });
 
-    it('setTimerFlushCallback after destroy: callback is not invoked', async function () {
+    it('setWriteHandler after destroy: callback is not invoked', async function () {
       const queue = createQueueWithTimer(15);
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue); // timer scheduled
@@ -558,7 +552,7 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Try to set a new callback after destroy
       let called = false;
-      queue.setTimerFlushCallback(() => { called = true; });
+      queue.setWriteHandler(() => { called = true; });
 
       await delay(25);
       // Timer was cancelled by destroy, so even the new callback shouldn't fire
@@ -568,7 +562,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('commands added after destroy are silently lost (timer is noop)', async function () {
       const queue = createQueueWithTimer(15);
       let callbackCount = 0;
-      queue.setTimerFlushCallback(() => { callbackCount++; });
+      queue.setWriteHandler(() => { callbackCount++; });
 
       queue.destroy();
 
@@ -584,7 +578,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('maxWaitMs of 0 still triggers timer asynchronously', async function () {
       const queue = createQueueWithTimer(0);
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue);
@@ -603,7 +597,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('rapid add/destroy/add cycle: first batch lost, second batch also lost', async function () {
       const queue = createQueueWithTimer(15);
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       // First batch
       queue.addCommand(['SET', 'k1', 'v1']);
@@ -624,7 +618,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('multiple generators in sequence maintain consistent timer state', async function () {
       const queue = createQueueWithTimer(30);
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       // First generator: buffer command, timer scheduled
       queue.addCommand(['SET', 'key', 'v1']);
@@ -647,7 +641,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('timer does not re-schedule itself after firing', async function () {
       const queue = createQueueWithTimer(10);
       let callbackCount = 0;
-      queue.setTimerFlushCallback(() => { callbackCount++; });
+      queue.setWriteHandler(() => { callbackCount++; });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue);
@@ -663,7 +657,7 @@ describe('Codec Queue [codec-queue]', function () {
 
     it('hasPendingOutbound is false after timer fires', async function () {
       const queue = createQueueWithTimer(10);
-      queue.setTimerFlushCallback(() => {});
+      queue.setWriteHandler(() => {});
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue);
@@ -676,7 +670,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('destroy between addCommand and commandsToWrite prevents timer scheduling', async function () {
       const queue = createQueueWithTimer(15);
       let callbackCount = 0;
-      queue.setTimerFlushCallback(() => { callbackCount++; });
+      queue.setWriteHandler(() => { callbackCount++; });
 
       queue.addCommand(['SET', 'key', 'value']);
       // Don't consume generator - command is in toWrite, not in codec buffer
@@ -693,7 +687,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('slot flush mid-generator cancels existing timer and schedules new one', async function () {
       const queue = createQueueWithTimer(50);
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       // Add two commands: first gets buffered, timer scheduled
       queue.addCommand(['SET', 'key1', 'v1']);
@@ -731,7 +725,7 @@ describe('Codec Queue [codec-queue]', function () {
         }
       };
 
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: {
           resolver: STATIC_RESOLVER,
           timer: {
@@ -744,7 +738,7 @@ describe('Codec Queue [codec-queue]', function () {
       activeQueues.push(queue as unknown as TestableQueueWithTimer);
 
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue);
@@ -771,7 +765,7 @@ describe('Codec Queue [codec-queue]', function () {
         }
       };
 
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: {
           resolver: STATIC_RESOLVER,
           timer: {
@@ -807,7 +801,7 @@ describe('Codec Queue [codec-queue]', function () {
         }
       };
 
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: {
           resolver: STATIC_RESOLVER,
           timer: {
@@ -836,7 +830,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('timer callback never fires when timer is NOT configured', async function () {
       const queue = createBinhdrQueue(); // No timer config
       let callbackCalled = false;
-      (queue as RedisCommandsQueue).setTimerFlushCallback(() => { callbackCalled = true; });
+      (queue as RedisCommandsQueue).setWriteHandler(() => { callbackCalled = true; });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue);
@@ -849,7 +843,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('timer does NOT fire before maxWaitMs elapses', async function () {
       const queue = createQueueWithTimer(100);
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       queue.addCommand(['SET', 'key', 'value']);
       collectYielded(queue);
@@ -867,7 +861,7 @@ describe('Codec Queue [codec-queue]', function () {
     it('commands are flushed via drain when no timer configured, not via callback', async function () {
       const queue = createBinhdrQueue(); // No timer config
       let callbackCalled = false;
-      (queue as RedisCommandsQueue).setTimerFlushCallback(() => { callbackCalled = true; });
+      (queue as RedisCommandsQueue).setWriteHandler(() => { callbackCalled = true; });
 
       queue.addCommand(['SET', 'key', 'value']);
       const results = collectYielded(queue);
@@ -1048,7 +1042,7 @@ describe('Codec Queue [codec-queue]', function () {
     });
 
     it('does not mis-detect header when plain RESP bulk payload chunk starts with 0x80 before binary mode is established', async function () {
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
@@ -1147,7 +1141,7 @@ describe('Codec Queue [codec-queue]', function () {
 
     it('state flow: UNKNOWN -> BINARY -> mixed plain frame -> BINARY, with exact output order', function () {
       const seenHeaders: Array<{ length: number; commandCount: number; clientIdx: number }> = [];
-      const interceptor = new BinaryHeadersInboundInterceptor({
+      const interceptor = new BinaryHeadersInboundCodec({
         onHeader: (header) => {
           seenHeaders.push({
             length: header.length,
@@ -1161,9 +1155,9 @@ describe('Codec Queue [codec-queue]', function () {
       const emit = (data: Buffer) => emitted.push(Buffer.from(data));
 
       // 1) UNKNOWN -> BINARY (valid header)
-      interceptor.intercept(createBinhdrFrame(Buffer.from('+OK\r\n'), 1, 7), emit);
+      interceptor.decode(createBinhdrFrame(Buffer.from('+OK\r\n'), 1, 7), emit);
       // 2) In BINARY mode, consume one plain RESP frame and then resume binary header parsing.
-      interceptor.intercept(
+      interceptor.decode(
         Buffer.concat([
           Buffer.from(':1\r\n'),
           createBinhdrFrame(Buffer.from(':2\r\n'), 1, 9),
@@ -1183,7 +1177,7 @@ describe('Codec Queue [codec-queue]', function () {
 
     it('state flow: plain frame at boundary can be followed by binary header frame', function () {
       const seenHeaders: Array<{ length: number; commandCount: number; clientIdx: number }> = [];
-      const interceptor = new BinaryHeadersInboundInterceptor({
+      const interceptor = new BinaryHeadersInboundCodec({
         onHeader: (header) => seenHeaders.push({
           length: header.length,
           commandCount: header.commandCount,
@@ -1195,10 +1189,10 @@ describe('Codec Queue [codec-queue]', function () {
       const emit = (data: Buffer) => emitted.push(Buffer.from(data));
 
       // 1) First frame is plain RESP.
-      interceptor.intercept(Buffer.from(':100\r\n'), emit);
+      interceptor.decode(Buffer.from(':100\r\n'), emit);
       // 2) Next frame at boundary is binary header framed.
       const binaryFrame = createBinhdrFrame(Buffer.from(':2\r\n'), 1, 42);
-      interceptor.intercept(binaryFrame, emit);
+      interceptor.decode(binaryFrame, emit);
 
       assert.equal(emitted[0].toString(), ':100\r\n');
       assert.equal(emitted[1].toString(), ':2\r\n');
@@ -1230,7 +1224,7 @@ describe('Codec Queue [codec-queue]', function () {
   describe('inbound codec callbacks', function () {
     it('calls onProtocolError when flag is set', async function () {
       const errors: number[] = [];
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
         inbound: { onProtocolError: (header) => errors.push(header.clientIdx) }
       });
@@ -1249,7 +1243,7 @@ describe('Codec Queue [codec-queue]', function () {
 
     it('does not call onProtocolError when flag is not set', async function () {
       let called = false;
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
         inbound: { onProtocolError: () => { called = true; } }
       });
@@ -1292,7 +1286,7 @@ describe('Codec Queue [codec-queue]', function () {
     });
 
     it('resetDecoder clears buffered inbound codec state', async function () {
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
@@ -1339,9 +1333,9 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
     });
   });
 
-  describe('with BinaryHeadersInterceptor', function () {
+  describe('with BinaryHeadersCodec', function () {
     function createQueueWithInterceptor(): RedisCommandsQueue {
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER }
       });
       return new RedisCommandsQueue(2, null, () => {}, interceptor);
@@ -1358,18 +1352,18 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
     });
   });
 
-  describe('interceptor interface compliance', function () {
-    it('OutboundInterceptor intercept can return empty array to buffer', function () {
-      let interceptCalls = 0;
-      const mockInterceptor: WireInterceptor = {
+  describe('codec interface compliance', function () {
+    it('OutboundCodec push can return null to buffer', function () {
+      let pushCalls = 0;
+      const mockInterceptor: WireCodec = {
         outbound: {
-          intercept: () => { interceptCalls++; return null; },
-          flush: () => null,
-          hasPending: () => false,
+          push: () => { pushCalls++; return null; },
+          drain: () => null,
+          hasBuffered: () => false,
           reset: () => []
         },
         inbound: {
-          intercept: (chunk, next) => next(chunk)
+          decode: (chunk, next) => next(chunk)
         }
       };
 
@@ -1381,28 +1375,28 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         results.push(encoded);
       }
 
-      assert.equal(interceptCalls, 1);
-      assert.equal(results.length, 0); // Nothing yielded because intercept returned empty array
+      assert.equal(pushCalls, 1);
+      assert.equal(results.length, 0); // Nothing yielded because push returned null
     });
 
-    it('OutboundInterceptor flush is called at end of iteration', function () {
-      let flushCalls = 0;
+    it('OutboundCodec drain is called at end of iteration', function () {
+      let drainCalls = 0;
       const flushResult = ['flushed-data'];
-      const mockInterceptor: WireInterceptor = {
+      const mockInterceptor: WireCodec = {
         outbound: {
-          intercept: () => null,
-          flush: () => {
-            flushCalls++;
+          push: () => null,
+          drain: () => {
+            drainCalls++;
             return {
               writes: [flushResult],
-              sent: []
+              emittedCommands: []
             };
           },
-          hasPending: () => flushCalls === 0,
+          hasBuffered: () => drainCalls === 0,
           reset: () => []
         },
         inbound: {
-          intercept: (chunk, next) => next(chunk)
+          decode: (chunk, next) => next(chunk)
         }
       };
 
@@ -1414,26 +1408,26 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         results.push(encoded);
       }
 
-      assert.equal(flushCalls, 1);
+      assert.equal(drainCalls, 1);
       assert.deepEqual(results, [flushResult]);
     });
 
-    it('InboundInterceptor intercept receives chunk and next callback', function () {
+    it('InboundCodec decode receives chunk and next callback', function () {
       let receivedChunk: Buffer | null = null;
       let receivedNext: ((data: Buffer) => void) | null = null;
 
-      const mockInterceptor: WireInterceptor = {
+      const mockInterceptor: WireCodec = {
         outbound: {
-          intercept: (command, encoded) => ({
+          push: (command, encoded) => ({
             writes: [encoded],
-            sent: [command]
+            emittedCommands: [command]
           }),
-          flush: () => null,
-          hasPending: () => false,
+          drain: () => null,
+          hasBuffered: () => false,
           reset: () => []
         },
         inbound: {
-          intercept: (chunk, next) => {
+          decode: (chunk, next) => {
             receivedChunk = chunk;
             receivedNext = next;
             next(chunk);
@@ -1452,27 +1446,27 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       assert.ok(typeof receivedNext === 'function');
     });
 
-    it('OutboundInterceptor intercept errors reject the command and leave the queue usable', async function () {
-      const interceptError = new Error('intercept boom');
+    it('OutboundCodec push errors reject the command and leave the queue usable', async function () {
+      const pushError = new Error('push boom');
       let shouldThrow = true;
-      const mockInterceptor: WireInterceptor = {
+      const mockInterceptor: WireCodec = {
         outbound: {
-          intercept: (command, encoded) => {
+          push: (command, encoded) => {
             if (shouldThrow) {
               shouldThrow = false;
-              throw interceptError;
+              throw pushError;
             }
             return {
               writes: [encoded],
-              sent: [command]
+              emittedCommands: [command]
             };
           },
-          flush: () => null,
-          hasPending: () => false,
+          drain: () => null,
+          hasBuffered: () => false,
           reset: () => []
         },
         inbound: {
-          intercept: (chunk, next) => next(chunk)
+          decode: (chunk, next) => next(chunk)
         }
       };
 
@@ -1497,7 +1491,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       await delay(0);
 
       assert.equal(settled, true, 'Command promise should be settled after interceptor failure');
-      assert.equal(rejection, interceptError, 'Command should reject with the interceptor error');
+      assert.equal(rejection, pushError, 'Command should reject with the codec error');
       assert.equal(queue.isEmpty(), true, 'Failed command should not leave queue state behind');
 
       queue.addCommand(['ECHO', 'ok']);
@@ -1523,7 +1517,7 @@ describe('Auto-pipelining behavior', function () {
   describe('codec WITHOUT scheduler (should drain at end)', function () {
     it('batches same-slot commands and drains at generator end', function () {
       // Create queue with interceptor but NO scheduler
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER }
         // Note: no maxWaitMs, no scheduler
       });
@@ -1545,7 +1539,7 @@ describe('Auto-pipelining behavior', function () {
     });
 
     it('flushes on slot change and drains remaining at end', function () {
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER }
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
@@ -1572,7 +1566,7 @@ describe('Auto-pipelining behavior', function () {
     });
 
     it('generator completes with nothing pending after drain', function () {
-      const interceptor = new BinaryHeadersInterceptor({
+      const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER }
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
@@ -1638,9 +1632,7 @@ describe('Auto-pipelining behavior', function () {
       });
 
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((encoded) => {
-        flushedData.push(encoded);
-      });
+      queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       // 3 commands with alternating slots: A, B, A
       queue.addCommand(['SET', '{slot1}key1', 'value1']); // slot A
@@ -1717,7 +1709,7 @@ describe('Auto-pipelining behavior', function () {
       });
 
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((data) => flushedData.push(data));
+      queue.setWriteHandler((writes) => flushedData.push(...writes));
 
       queue.addCommand(['SET', 'key', '1']);
       queue.addCommand(['SET', 'key', '2']);
@@ -2455,7 +2447,7 @@ describe('Stats-Timer Integration (table-driven)', function () {
   for (const tc of statsTimerCases) {
     it(tc.name, async function () {
       const queue = createQueueWithTimerAndStats(15);
-      queue.setTimerFlushCallback(() => {}); // required for timer to work
+      queue.setWriteHandler(() => {}); // required for timer to work
 
       await tc.setup(queue);
       await tc.action(queue);
@@ -2563,7 +2555,7 @@ describe('Timer Precision and Accumulation', function () {
       activeQueues.push(queue);
 
       let fired = false;
-      queue.setTimerFlushCallback(() => { fired = true; });
+      queue.setWriteHandler(() => { fired = true; });
 
       queue.addCommand(['PING']);
       collectYielded(queue);
@@ -2578,7 +2570,7 @@ describe('Timer Precision and Accumulation', function () {
       timer: { maxWaitMs: 10, scheduler: createTimeoutScheduler() },
     });
     activeQueues.push(queue as TestableQueueWithTimer);
-    queue.setTimerFlushCallback(() => {});
+    queue.setWriteHandler(() => {});
 
     for (let i = 0; i < 5; i++) {
       queue.addCommand(['SET', `key${i}`, `value${i}`]);
@@ -2684,7 +2676,7 @@ describe('Partial Generator Consumption', function () {
     activeQueues.push(queue);
 
     const flushedData: ReadonlyArray<unknown>[] = [];
-    queue.setTimerFlushCallback((encoded) => { flushedData.push(encoded); });
+    queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
     // Add commands that will cause slot flush
     queue.addCommand(['SET', '{a}k1', 'v']);
@@ -2825,7 +2817,7 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       });
 
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((data) => flushedData.push(data));
+      queue.setWriteHandler((writes) => flushedData.push(...writes));
 
       const chainId = Symbol('Pipeline Chain');
 
@@ -2865,7 +2857,7 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       });
 
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((data) => flushedData.push(data));
+      queue.setWriteHandler((writes) => flushedData.push(...writes));
 
       const chainId = Symbol('Pipeline Chain');
 
@@ -2903,7 +2895,7 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       });
 
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((data) => flushedData.push(data));
+      queue.setWriteHandler((writes) => flushedData.push(...writes));
 
       const chainId = Symbol('Pipeline Chain');
 
@@ -3290,7 +3282,7 @@ describe('Explicit Pipeline Behavior (chainId)', function () {
       });
 
       const flushedData: ReadonlyArray<unknown>[] = [];
-      queue.setTimerFlushCallback((data) => flushedData.push(data));
+      queue.setWriteHandler((writes) => flushedData.push(...writes));
 
       const chainId = Symbol('Pipeline');
 

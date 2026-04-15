@@ -53,33 +53,34 @@ export {
   createEligibilityResolver,
 } from './eligibility';
 
-// Wire Interceptor interfaces
+// Wire codec interfaces
 export type {
-  OutboundInterceptor,
-  InboundInterceptor,
-  WireInterceptor,
+  OutboundCodec,
+  InboundCodec,
+  WireCodec,
   SocketChunk,
   SocketChunks,
-  ReadyToWriteCallback,
-  TimerFlushCallback,
-  OutboundSink,
+  WriteHandler,
+  WriteSink,
+  WriteBatch,
+  WriteCommandMeta,
 } from '../client/commands-queue';
 
-// Binary Headers Interceptor (integrates with commands-queue)
+// Binary Headers Codec (integrates with commands-queue)
 export type {
   OnHeader,
   OnProtocolError,
-  BinaryHeadersInterceptorOptions,
+  BinaryHeadersCodecOptions,
   BinaryHeadersOutboundOptions,
   BinaryHeadersOutboundTimerOptions,
   BinaryHeadersInboundOptions,
 } from './codec';
 
 export {
-  BinaryHeadersInterceptor,
-  BinaryHeadersOutboundInterceptor,
-  BinaryHeadersInboundInterceptor,
-  createBinaryHeadersInterceptor,
+  BinaryHeadersCodec,
+  BinaryHeadersOutboundCodec,
+  BinaryHeadersInboundCodec,
+  createBinaryHeadersCodec,
 } from './codec';
 
 // Statistics

@@ -5,7 +5,7 @@ import { Decoder } from '../RESP/decoder';
 import type { RespVersions } from '../RESP/types';
 import RedisCommandsQueue, { type SocketChunk, type CommandArguments, type CommandOptions } from '../client/commands-queue';
 import MasterQueue from './master-queue';
-import { BinaryHeadersInterceptor } from './codec';
+import { BinaryHeadersCodec } from './codec';
 import { STATIC_RESOLVER, NOOP_RESOLVER } from './eligibility';
 
 import type { BinaryHeaderStatsCounter, BinaryHeaderStats } from './stats';
@@ -404,8 +404,7 @@ export interface TestableQueue {
  * Extended interface for queues with timer support.
  */
 export interface TestableQueueWithTimer extends TestableQueue {
-  setReadyToWriteCallback(callback: (writes: ReadonlyArray<SocketChunk>) => void): void;
-  setTimerFlushCallback(callback: (encoded: SocketChunk) => void): void;
+  setWriteHandler(callback: (writes: ReadonlyArray<SocketChunk>) => void): void;
   destroy(): void;
   readonly maxWaitMs: number;
   hasPendingOutbound(): boolean;
@@ -472,8 +471,8 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
     statsCounter,
   } = options;
 
-  const interceptor = (resolver || onProtocolError || statsCounter || timer)
-    ? new BinaryHeadersInterceptor({
+  const codec = (resolver || onProtocolError || statsCounter || timer)
+    ? new BinaryHeadersCodec({
         outbound: resolver || timer
           ? {
               resolver,
@@ -487,7 +486,7 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
       })
     : undefined;
 
-  return new RedisCommandsQueue(respVersion, maxLength, onShardedChannelMoved, interceptor);
+  return new RedisCommandsQueue(respVersion, maxLength, onShardedChannelMoved, codec);
 }
 
 function createCodecQueueWithTimer(options: QueueFactoryOptions = {}): TestableQueueWithTimer {
