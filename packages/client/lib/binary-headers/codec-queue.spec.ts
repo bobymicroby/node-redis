@@ -1,10 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
 import encodeCommand from '../RESP/encoder';
-import RedisCommandsQueue, { type CommandToWrite, type WireCodec } from '../client/commands-queue';
+import RedisCommandsQueue, { type CommandToWrite } from '../client/commands-queue';
 import { RESP_TYPES } from '../RESP/decoder';
 import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
 import { DefaultBinaryHeaderStatsCounter, FlushReason } from './stats';
+import type { WireCodec } from './wire-codec';
 import {
   // Async utilities
   delay,

@@ -4,13 +4,13 @@ import type {
   WireCodec,
   SocketChunk,
   CommandArguments,
-  CommandToWrite,
   WriteBatch,
   WriteCommandMeta,
   WriteSink,
   Scheduler,
   Cancellable
-} from '../client/commands-queue';
+} from './wire-codec';
+import type { CommandToWrite } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength as calcPayloadLength, type CommandPackerOptions } from './packing';

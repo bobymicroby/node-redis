@@ -6,7 +6,7 @@ import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, Pu
 import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, TimeoutError } from '../errors';
 import { MonitorCallback } from '../client';
 import { dbgMaintenance } from '../client/enterprise-maintenance-manager';
-import type { CommandArguments, SocketChunk } from '../client/commands-queue';
+import type { CommandArguments, SocketChunk } from './wire-codec';
 
 export interface CommandOptions<T = TypeMapping> {
   chainId?: symbol;

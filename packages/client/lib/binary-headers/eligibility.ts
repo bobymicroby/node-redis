@@ -1,5 +1,5 @@
 import type { RedisArgument } from '../RESP/types';
-import type { CommandArguments } from '../client/commands-queue';
+import type { CommandArguments } from './wire-codec';
 import { RequestHeaderEncoder } from './generated/request-header-codec';
 import { calculateSlot } from './new-slot-calulator';
 

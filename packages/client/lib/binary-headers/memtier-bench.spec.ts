@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
-import RedisCommandsQueue, { type Scheduler } from '../client/commands-queue';
+import RedisCommandsQueue from '../client/commands-queue';
+import type { Scheduler } from './wire-codec';
 import { BinaryHeadersCodec } from './codec';
 import { STATIC_RESOLVER } from './eligibility';
 import { RequestHeaderDecoder } from './generated/request-header-codec';

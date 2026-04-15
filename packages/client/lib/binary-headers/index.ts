@@ -20,11 +20,6 @@ export {
 } from './generated/response-header-codec';
 
 // Packing
-export type {
-  Scheduler,
-  Cancellable,
-} from './packing';
-
 export {
   CommandPacker,
   createTimeoutScheduler,
@@ -58,13 +53,16 @@ export type {
   OutboundCodec,
   InboundCodec,
   WireCodec,
+  Cancellable,
+  Scheduler,
+  CommandArguments,
   SocketChunk,
   SocketChunks,
   WriteHandler,
   WriteSink,
   WriteBatch,
   WriteCommandMeta,
-} from '../client/commands-queue';
+} from './wire-codec';
 
 // Binary Headers Codec (integrates with commands-queue)
 export type {

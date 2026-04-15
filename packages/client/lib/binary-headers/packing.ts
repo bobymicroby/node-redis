@@ -1,11 +1,10 @@
 import type { RedisArgument } from '../RESP/types';
 import { RequestHeaderEncoder } from './generated/request-header-codec';
-import type { SocketChunk } from '../client/commands-queue';
-import type { Cancellable, Scheduler } from '../client/commands-queue';
+import type { SocketChunk, Cancellable, Scheduler } from './wire-codec';
 import { FlushReason, disabledBinaryHeaderStatsCounter } from './stats';
 import type { BinaryHeaderStatsCounter } from './stats';
 
-// Re-export for convenience (canonical source is commands-queue.ts)
+// Re-export for convenience (canonical source is wire-codec.ts)
 export type { Cancellable, Scheduler };
 
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
