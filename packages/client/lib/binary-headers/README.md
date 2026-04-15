@@ -19,29 +19,29 @@
 │   │                                                                                 │   │
 │   │   1. encodeCommand(args)  ───────────────────────────────►  RESP-encoded       │   │
 │   │                                                                                 │   │
-│   │   2. command ───► #waitingForReply                                             │   │
-│   │                                                                                 │   │
-│   │   3. if (codec) ────┬────────────────────────────────────────────────────────┐  │   │
+│   │   2. if (codec) ────┬──────────────────────────────────────────────────────┐  │   │
 │   │                     │                                                        │  │   │
 │   │                     ▼                                                       │  │   │
-│   │       codec.outbound.process({ args, encoded })                              │  │   │
+│   │       codec.outbound.push(command, encoded, args)                            │  │   │
 │   │                     │                                                        │  │   │
 │   │           ┌─────────┴─────────┐                                              │  │   │
 │   │           │                   │                                              │  │   │
 │   │           ▼                   ▼                                            │  │   │
 │   │       ┌────────┐        ┌──────────┐                                         │  │   │
-│   │       │  null  │        │  packed  │                                         │  │   │
-│   │       │        │        │  payload │                                         │  │   │
+│   │       │  null  │        │ WriteBatch│                                         │  │   │
+│   │       │        │        │           │                                         │  │   │
 │   │       └───┬────┘        └────┬─────┘                                         │  │   │
 │   │           │                  │                                               │  │   │
 │   │           │ (buffered,       │                                               │  │   │
-│   │           │  continue)       └─────────────────────────►  yield ────────────┼──┼───►
+│   │           │  continue)       └────► mark emittedCommands ─► yield writes ───┼──┼───►
 │   │           ▼                                                                 │  │   │
 │   │      next iteration                                                          │  │   │
 │   │                                                                              │  │   │
-│   │   4. end of loop: codec.outbound.drain()  ─────────────►  yield ────────────┼──┼───►
+│   │   3. end of loop: codec.outbound.completePushes()                            │  │   │
+│   │                     │                                                        │  │   │
+│   │                     └────────────────► mark emittedCommands ─► yield writes ─┼──┼───►
 │   │                                                                              │  │   │
-│   │      else (no codec)  ─────────────────────────────────►  yield ────────────┼──┼───►
+│   │      else (no codec)  ─────────────────────────────────► yield + mark sent ─┼──┼───►
 │   │                                                                              │  │   │
 │   └──────────────────────────────────────────────────────────────────────────────┘  │   │
 │                                                                                     │   │

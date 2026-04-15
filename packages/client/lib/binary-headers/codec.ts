@@ -85,6 +85,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
   readonly #packer: CommandPacker;
   readonly #statsCounter: BinaryHeaderStatsCounter;
   readonly #scheduler: Scheduler | null;
+  readonly #maxWaitMs: number;
   #chainSlotCache: Map<symbol, number> = new Map();
   #lastChainId: symbol | undefined;
   #bufferedCommands: CommandToWrite[] = [];
@@ -92,7 +93,6 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
   #pendingRequiresDrainAtEnd = false;
   #pendingFlush: Cancellable | null = null;
   #sink: WriteSink | null = null;
-  readonly maxWaitMs: number;
 
   constructor(
     options: BinaryHeadersOutboundOptions = {},
@@ -101,7 +101,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
     this.#resolver = options.resolver ?? NOOP_RESOLVER;
     this.#scheduler = options.timer?.scheduler ?? null;
-    this.maxWaitMs = options.timer?.maxWaitMs ?? 0;
+    this.#maxWaitMs = options.timer?.maxWaitMs ?? 0;
     const packerOptions: CommandPackerOptions = {
       maxCommandCount: options.maxCommandCount,
       maxPayloadLength: options.maxPayloadLength,
@@ -148,7 +148,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
       return;
     }
 
-    this.#pendingFlush = this.#scheduler!.schedule(this.maxWaitMs, () => {
+    this.#pendingFlush = this.#scheduler!.schedule(this.#maxWaitMs, () => {
       this.#pendingFlush = null;
       try {
         const batch = this.#flushBuffered(FlushReason.TIMER_EXPIRED);
@@ -296,7 +296,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     return this.#flushBuffered(reason);
   }
 
-  endWritePass(): WriteBatch | null {
+  completePushes(): WriteBatch | null {
     if (!this.hasBuffered()) return null;
     if (!this.#shouldUseTimer()) {
       return this.drain(FlushReason.DRAIN);

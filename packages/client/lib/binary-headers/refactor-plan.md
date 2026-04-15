@@ -169,7 +169,7 @@ export interface WriteBatch {
 }
 
 export interface OutboundCodec {
-  intercept(
+  push(
     command: CommandToWrite,
     encoded: SocketChunk,
     args: CommandArguments,
@@ -177,9 +177,9 @@ export interface OutboundCodec {
     meta?: WriteCommandMeta
   ): WriteBatch | null;
 
-  flush(reason: FlushReason): WriteBatch | null;
+  drain(reason: FlushReason): WriteBatch | null;
   hasBuffered(): boolean;
-  reset?(): CommandToWrite[];
+  reset(): CommandToWrite[];
 }
 ```
 
@@ -249,7 +249,7 @@ The outbound boundary grows two transitional helpers:
 
 ```ts
 export interface OutboundCodec {
-  intercept(
+  push(
     command: CommandToWrite,
     encoded: SocketChunk,
     args: CommandArguments,
@@ -257,10 +257,10 @@ export interface OutboundCodec {
     meta?: WriteCommandMeta
   ): WriteBatch | null;
 
-  flush(reason: FlushReason): WriteBatch | null;
-  endWritePass?(): WriteBatch | null;
+  drain(reason: FlushReason): WriteBatch | null;
+  completePushes(): WriteBatch | null;
   hasBuffered(): boolean;
-  reset?(): CommandToWrite[];
+  reset(): CommandToWrite[];
 }
 ```
 
@@ -295,7 +295,7 @@ added to codec.ts:
   - pendingRequiresDrainAtEnd
   - chain-boundary drain for explicit segment transitions
   - forceImmediate drain for abort/timeout commands
-  - endWritePass() for "drain now vs wait for timer"
+  - completePushes() for "drain now vs wait for timer"
 ```
 
 Important behavior preserved:
@@ -338,8 +338,8 @@ Current broad result:
 Open decision left for Phase 3:
 
 ```text
-the queue still has fallback behavior for codecs that do not implement
-endWritePass(). That can stay as a compatibility bridge.
+the queue/codec boundary has a dedicated
+completePushes() hook for "no more push() calls for now".
 ```
 
 ## Phase 3: Move Timer Ownership Into The Codec
@@ -409,9 +409,7 @@ Compatibility shims intentionally kept for now:
 
 ```text
 - setWriteHandler(...)
-- maxWaitMs
 - hasPendingOutbound()
-- drainPendingOutbound()
 ```
 
 These are wrappers over codec state for tests/diagnostics, not queue-owned timer machinery.

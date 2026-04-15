@@ -1,8 +1,10 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
-import RedisCommandsQueue, { type WireCodec } from '../client/commands-queue';
+import encodeCommand from '../RESP/encoder';
+import RedisCommandsQueue, { type CommandToWrite, type WireCodec } from '../client/commands-queue';
 import { RESP_TYPES } from '../RESP/decoder';
 import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
+import { DefaultBinaryHeaderStatsCounter, FlushReason } from './stats';
 import {
   // Async utilities
   delay,
@@ -53,6 +55,23 @@ import {
 // ============================================================================
 // Tests for RedisCommandsQueue with codec support
 // ============================================================================
+
+function fakeCommand(args: string[]): CommandToWrite {
+  return {
+    args,
+    chainId: undefined,
+    abort: undefined,
+    timeout: undefined,
+    channelsCounter: undefined,
+    typeMapping: undefined,
+    resolve: () => {},
+    reject: () => {}
+  };
+}
+
+function pushThroughOutboundCodec(codec: BinaryHeadersCodec, args: string[]) {
+  return codec.outbound.push(fakeCommand(args), encodeCommand(args), args);
+}
 
 describe('Codec Queue [codec-queue]', function () {
   describe('without codec (master vs no-codec verification)', function () {
@@ -188,7 +207,7 @@ describe('Codec Queue [codec-queue]', function () {
     // 3. For each command: transform() may buffer (return null) and schedule timer
     // 4. Socket may stop consuming early (backpressure: writableNeedDrain)
     // 5. If scheduler is configured, generator does NOT drain at end - timer handles it
-    // 6. Timer fires after maxWaitMs, calls timerFlushCallback with packed data
+    // 6. Timer fires after maxWaitMs and emits packed data through the write handler
     //
     // Key insight: When scheduler is configured, the generator leaves buffered
     // commands for the timer to flush. Without scheduler, drain happens immediately.
@@ -201,11 +220,6 @@ describe('Codec Queue [codec-queue]', function () {
       queue.destroy();
       // After destroy, callback should be reset to noop
       assert.equal(called, false);
-    });
-
-    it('exposes maxWaitMs', function () {
-      const queue = createQueueWithTimer(42);
-      assert.equal(queue.maxWaitMs, 42);
     });
 
     it('with scheduler: generator does not drain, leaves commands for timer', function () {
@@ -370,22 +384,33 @@ describe('Codec Queue [codec-queue]', function () {
       assert.equal(queue.hasPendingOutbound(), true, 'Command now in codec buffer');
     });
 
-    it('drainPendingOutbound manually drains buffered commands', function () {
-      const queue = createQueueWithTimer(100, false) as RedisCommandsQueue;
+    it('BinaryHeadersOutboundCodec drain manually drains buffered commands', function () {
+      const codec = new BinaryHeadersCodec({
+        outbound: {
+          resolver: STATIC_RESOLVER,
+          timer: {
+            maxWaitMs: 100,
+            scheduler: createTimeoutScheduler(),
+          }
+        }
+      });
 
-      queue.addCommand(['SET', 'key', 'value']);
-      collectYielded(queue); // Moves to codec buffer, not drained due to scheduler
+      const buffered = pushThroughOutboundCodec(codec, ['SET', 'key', 'value']);
+      assert.equal(buffered, null, 'Eligible command should stay buffered before manual drain');
+      assert.equal(codec.outbound.hasBuffered(), true, 'Command should be pending in codec');
 
-      assert.equal(queue.hasPendingOutbound(), true, 'Command should be pending');
-
-      const drained = queue.drainPendingOutbound();
+      const drained = codec.outbound.drain(FlushReason.DRAIN);
       assert.ok(drained !== null, 'Should have drained data');
-      assertPackedData(drained, {
+      assertPackedData(drained.writes[0], {
         commandCount: 1,
         commands: [['SET', 'key', 'value']]
       });
-
-      assert.equal(queue.hasPendingOutbound(), false, 'No longer pending after drain');
+      assert.deepEqual(
+        drained.emittedCommands.map(command => command.args),
+        [['SET', 'key', 'value']],
+        'Manual drain should return the emitted command records'
+      );
+      assert.equal(codec.outbound.hasBuffered(), false, 'No longer pending after drain');
     });
 
     it('slot incompatibility causes flush mid-generator', function () {
@@ -447,25 +472,42 @@ describe('Codec Queue [codec-queue]', function () {
       assert.doesNotThrow(() => queue.destroy());
     });
 
-    it('manual drainPendingOutbound before timer fires prevents double-flush', async function () {
-      const queue = createQueueWithTimer(30);
+    it('manual drain on BinaryHeadersOutboundCodec before timer fires prevents double-flush', async function () {
+      const codec = new BinaryHeadersCodec({
+        outbound: {
+          resolver: STATIC_RESOLVER,
+          timer: {
+            maxWaitMs: 30,
+            scheduler: createTimeoutScheduler(),
+          }
+        }
+      });
       let callbackCount = 0;
-      queue.setWriteHandler(() => { callbackCount++; });
+      codec.outbound.bind({
+        emit: () => { callbackCount++; },
+        onError: err => { throw err; }
+      });
 
-      queue.addCommand(['SET', 'key', 'value']);
-      collectYielded(queue); // buffer command, timer scheduled
+      const buffered = pushThroughOutboundCodec(codec, ['SET', 'key', 'value']);
+      assert.equal(buffered, null, 'Eligible command should be buffered for timer');
 
-      // Manually drain before timer fires
-      const drained = (queue as RedisCommandsQueue).drainPendingOutbound();
+      const drained = codec.outbound.drain(FlushReason.DRAIN);
       assert.ok(drained !== null, 'Manual drain should return data');
-      assertPackedData(drained, {
+      assertPackedData(drained.writes[0], {
         commandCount: 1,
         commands: [['SET', 'key', 'value']]
       });
+      assert.deepEqual(
+        drained.emittedCommands.map(command => command.args),
+        [['SET', 'key', 'value']],
+        'Manual drain should return the emitted command records'
+      );
 
       // Wait past the timer - it should fire but find nothing to flush
       await delay(50);
       assert.equal(callbackCount, 0, 'Timer callback should NOT fire when buffer already drained');
+
+      codec.outbound.destroy();
     });
 
     it('flushWaitingForReply clears pending outbound data and cancels scheduled timer', async function () {
@@ -1325,12 +1367,6 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       queue.addCommand(['PING']);
       assert.equal(queue.hasPendingOutbound(), false);
     });
-
-    it('drainPendingOutbound returns null', function () {
-      const queue = createQueue();
-      queue.addCommand(['PING']);
-      assert.equal(queue.drainPendingOutbound(), null);
-    });
   });
 
   describe('with BinaryHeadersCodec', function () {
@@ -1357,13 +1393,16 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       let pushCalls = 0;
       const mockInterceptor: WireCodec = {
         outbound: {
+          bind: () => {},
           push: () => { pushCalls++; return null; },
-          drain: () => null,
+          completePushes: () => null,
           hasBuffered: () => false,
-          reset: () => []
+          reset: () => [],
+          destroy: () => {}
         },
         inbound: {
-          decode: (chunk, next) => next(chunk)
+          decode: (chunk, next) => next(chunk),
+          reset: () => {}
         }
       };
 
@@ -1379,24 +1418,27 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       assert.equal(results.length, 0); // Nothing yielded because push returned null
     });
 
-    it('OutboundCodec drain is called at end of iteration', function () {
-      let drainCalls = 0;
+    it('OutboundCodec completePushes is called at end of iteration', function () {
+      let completePushesCalls = 0;
       const flushResult = ['flushed-data'];
       const mockInterceptor: WireCodec = {
         outbound: {
+          bind: () => {},
           push: () => null,
-          drain: () => {
-            drainCalls++;
+          completePushes: () => {
+            completePushesCalls++;
             return {
               writes: [flushResult],
               emittedCommands: []
             };
           },
-          hasBuffered: () => drainCalls === 0,
-          reset: () => []
+          hasBuffered: () => true,
+          reset: () => [],
+          destroy: () => {}
         },
         inbound: {
-          decode: (chunk, next) => next(chunk)
+          decode: (chunk, next) => next(chunk),
+          reset: () => {}
         }
       };
 
@@ -1408,7 +1450,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         results.push(encoded);
       }
 
-      assert.equal(drainCalls, 1);
+      assert.equal(completePushesCalls, 1);
       assert.deepEqual(results, [flushResult]);
     });
 
@@ -1418,20 +1460,23 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
 
       const mockInterceptor: WireCodec = {
         outbound: {
+          bind: () => {},
           push: (command, encoded) => ({
             writes: [encoded],
             emittedCommands: [command]
           }),
-          drain: () => null,
+          completePushes: () => null,
           hasBuffered: () => false,
-          reset: () => []
+          reset: () => [],
+          destroy: () => {}
         },
         inbound: {
           decode: (chunk, next) => {
             receivedChunk = chunk;
             receivedNext = next;
             next(chunk);
-          }
+          },
+          reset: () => {}
         }
       };
 
@@ -1451,6 +1496,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       let shouldThrow = true;
       const mockInterceptor: WireCodec = {
         outbound: {
+          bind: () => {},
           push: (command, encoded) => {
             if (shouldThrow) {
               shouldThrow = false;
@@ -1461,12 +1507,14 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
               emittedCommands: [command]
             };
           },
-          drain: () => null,
+          completePushes: () => null,
           hasBuffered: () => false,
-          reset: () => []
+          reset: () => [],
+          destroy: () => {}
         },
         inbound: {
-          decode: (chunk, next) => next(chunk)
+          decode: (chunk, next) => next(chunk),
+          reset: () => {}
         }
       };
 
@@ -1578,7 +1626,6 @@ describe('Auto-pipelining behavior', function () {
 
       // Nothing should be pending after drain
       assert.equal(queue.hasPendingOutbound(), false, 'Nothing pending after drain');
-      assert.equal(queue.drainPendingOutbound(), null, 'Drain returns null');
     });
   });
 
@@ -2389,23 +2436,6 @@ describe('Stats-Timer Integration (table-driven)', function () {
       },
     },
     {
-      name: 'manual drain increments drainFlushCount',
-      setup: (queue) => {
-        queue.addCommand(['SET', 'key', 'value']);
-        collectYielded(queue);
-      },
-      action: (queue) => {
-        queue.drainPendingOutbound();
-      },
-      expectedStats: {
-        totalCommandCount: 1,
-        batchedCommandCount: 1,
-        batchCount: 1,
-        drainFlushCount: 1,
-        timerFlushCount: 0,
-      },
-    },
-    {
       name: 'batched commands in single timer flush',
       setup: () => {},
       action: async (queue) => {
@@ -2456,6 +2486,46 @@ describe('Stats-Timer Integration (table-driven)', function () {
       assertStats(stats, tc.expectedStats);
     });
   }
+
+  it('manual drain on BinaryHeadersOutboundCodec increments drainFlushCount', function () {
+    const statsCounter = DefaultBinaryHeaderStatsCounter.create();
+    const codec = new BinaryHeadersCodec({
+      outbound: {
+        resolver: STATIC_RESOLVER,
+        timer: {
+          maxWaitMs: 15,
+          scheduler: createTimeoutScheduler(),
+        }
+      },
+      statsCounter,
+    });
+
+    codec.outbound.bind({
+      emit: () => {},
+      onError: err => { throw err; }
+    });
+
+    const buffered = pushThroughOutboundCodec(codec, ['SET', 'key', 'value']);
+    assert.equal(buffered, null, 'Eligible command should buffer before manual drain');
+
+    const batch = codec.outbound.drain(FlushReason.DRAIN);
+    assert.ok(batch !== null, 'Manual drain should emit one batch');
+    assert.deepEqual(
+      batch.emittedCommands.map(command => command.args),
+      [['SET', 'key', 'value']],
+      'Manual drain should return the emitted command record'
+    );
+
+    assertStats(codec.stats(), {
+      totalCommandCount: 1,
+      batchedCommandCount: 1,
+      batchCount: 1,
+      drainFlushCount: 1,
+      timerFlushCount: 0,
+    });
+
+    codec.outbound.destroy();
+  });
 
   describe('stats without timer (drain at generator end)', function () {
     const noTimerCases: StatsTimerTestCase[] = [

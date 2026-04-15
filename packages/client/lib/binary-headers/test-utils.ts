@@ -406,9 +406,7 @@ export interface TestableQueue {
 export interface TestableQueueWithTimer extends TestableQueue {
   setWriteHandler(callback: (writes: ReadonlyArray<SocketChunk>) => void): void;
   destroy(): void;
-  readonly maxWaitMs: number;
   hasPendingOutbound(): boolean;
-  drainPendingOutbound(): SocketChunk | null;
 }
 
 /**
