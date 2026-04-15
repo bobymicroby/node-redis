@@ -310,13 +310,13 @@ describe('Binary Headers Abort and Timeout', function () {
   });
 
   describe('Binary headers option normalization', function () {
-    function countTimerFlushCallbackWiring(binaryHeaders: boolean | { enabled: true }): number {
-      const original = RedisCommandsQueue.prototype.setTimerFlushCallback;
+    function countReadyToWriteCallbackWiring(binaryHeaders: boolean | { enabled: true }): number {
+      const original = RedisCommandsQueue.prototype.setReadyToWriteCallback;
       let calls = 0;
 
       try {
-        (RedisCommandsQueue.prototype as unknown as { setTimerFlushCallback: typeof original }).setTimerFlushCallback =
-          function (this: RedisCommandsQueue, callback: (encoded: ReadonlyArray<unknown>) => void): void {
+        (RedisCommandsQueue.prototype as unknown as { setReadyToWriteCallback: typeof original }).setReadyToWriteCallback =
+          function (this: RedisCommandsQueue, callback: (writes: ReadonlyArray<ReadonlyArray<unknown>>) => void): void {
             calls++;
             original.call(this, callback as Parameters<typeof original>[0]);
           };
@@ -326,25 +326,25 @@ describe('Binary Headers Abort and Timeout', function () {
           disableClientInfo: true,
         }).on('error', () => {});
       } finally {
-        (RedisCommandsQueue.prototype as unknown as { setTimerFlushCallback: typeof original }).setTimerFlushCallback = original;
+        (RedisCommandsQueue.prototype as unknown as { setReadyToWriteCallback: typeof original }).setReadyToWriteCallback = original;
       }
 
       return calls;
     }
 
-    it('binaryHeaders object form wires timer flush callback (control)', function () {
+    it('binaryHeaders object form wires ready-to-write callback (control)', function () {
       assert.equal(
-        countTimerFlushCallbackWiring({ enabled: true }),
+        countReadyToWriteCallbackWiring({ enabled: true }),
         1,
-        'Expected timer flush callback to be wired for binaryHeaders: { enabled: true }'
+        'Expected ready-to-write callback to be wired for binaryHeaders: { enabled: true }'
       );
     });
 
-    it('binaryHeaders: true wires timer flush callback', function () {
+    it('binaryHeaders: true wires ready-to-write callback', function () {
       assert.equal(
-        countTimerFlushCallbackWiring(true),
+        countReadyToWriteCallbackWiring(true),
         1,
-        'Expected timer flush callback to be wired for binaryHeaders: true'
+        'Expected ready-to-write callback to be wired for binaryHeaders: true'
       );
     });
   });

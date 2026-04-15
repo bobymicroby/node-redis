@@ -732,12 +732,15 @@ describe('Codec Queue [codec-queue]', function () {
       };
 
       const interceptor = new BinaryHeadersInterceptor({
-        outbound: { resolver: STATIC_RESOLVER }
+        outbound: {
+          resolver: STATIC_RESOLVER,
+          timer: {
+            maxWaitMs: 1000,
+            scheduler: syncScheduler,
+          }
+        }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor, {
-        maxWaitMs: 1000,
-        scheduler: syncScheduler,
-      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
       activeQueues.push(queue as unknown as TestableQueueWithTimer);
 
       const flushedData: ReadonlyArray<unknown>[] = [];
@@ -769,12 +772,15 @@ describe('Codec Queue [codec-queue]', function () {
       };
 
       const interceptor = new BinaryHeadersInterceptor({
-        outbound: { resolver: STATIC_RESOLVER }
+        outbound: {
+          resolver: STATIC_RESOLVER,
+          timer: {
+            maxWaitMs: 100,
+            scheduler: countingScheduler,
+          }
+        }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor, {
-        maxWaitMs: 100,
-        scheduler: countingScheduler,
-      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
       activeQueues.push(queue as unknown as TestableQueueWithTimer);
 
       queue.addCommand(['SET', 'key', 'value']);
@@ -802,12 +808,15 @@ describe('Codec Queue [codec-queue]', function () {
       };
 
       const interceptor = new BinaryHeadersInterceptor({
-        outbound: { resolver: STATIC_RESOLVER }
+        outbound: {
+          resolver: STATIC_RESOLVER,
+          timer: {
+            maxWaitMs: 100,
+            scheduler: countingScheduler,
+          }
+        }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor, {
-        maxWaitMs: 100,
-        scheduler: countingScheduler,
-      });
+      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
       activeQueues.push(queue as unknown as TestableQueueWithTimer);
 
       // First command buffers + schedules timer

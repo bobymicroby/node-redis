@@ -60,8 +60,9 @@ export type {
   WireInterceptor,
   SocketChunk,
   SocketChunks,
+  ReadyToWriteCallback,
   TimerFlushCallback,
-  TimerOptions,
+  OutboundSink,
 } from '../client/commands-queue';
 
 // Binary Headers Interceptor (integrates with commands-queue)
@@ -70,6 +71,7 @@ export type {
   OnProtocolError,
   BinaryHeadersInterceptorOptions,
   BinaryHeadersOutboundOptions,
+  BinaryHeadersOutboundTimerOptions,
   BinaryHeadersInboundOptions,
 } from './codec';
 

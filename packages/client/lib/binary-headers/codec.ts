@@ -3,10 +3,13 @@ import type {
   InboundInterceptor,
   WireInterceptor,
   SocketChunk,
-  SocketChunks,
   CommandArguments,
   CommandToWrite,
-  OutboundBatch
+  OutboundBatch,
+  OutboundCommandMeta,
+  OutboundSink,
+  Scheduler,
+  Cancellable
 } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
@@ -36,6 +39,16 @@ export interface BinaryHeadersOutboundOptions {
    * Default: RequestHeaderEncoder.lengthMaxValue()
    */
   readonly maxPayloadLength?: number;
+  /**
+   * Optional timer used for auto-pipelining segments.
+   * Explicit pipeline segments always drain at iteration end instead.
+   */
+  readonly timer?: BinaryHeadersOutboundTimerOptions;
+}
+
+export interface BinaryHeadersOutboundTimerOptions {
+  readonly maxWaitMs: number;
+  readonly scheduler: Scheduler;
 }
 
 export interface BinaryHeadersInboundOptions {
@@ -71,9 +84,15 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   readonly #resolver: EligibilityResolver;
   readonly #packer: CommandPacker;
   readonly #statsCounter: BinaryHeaderStatsCounter;
+  readonly #scheduler: Scheduler | null;
   #chainSlotCache: Map<symbol, number> = new Map();
   #lastChainId: symbol | undefined;
   #bufferedCommands: CommandToWrite[] = [];
+  #pendingChainId: symbol | undefined;
+  #pendingRequiresDrainAtEnd = false;
+  #pendingFlush: Cancellable | null = null;
+  #sink: OutboundSink | null = null;
+  readonly maxWaitMs: number;
 
   constructor(
     options: BinaryHeadersOutboundOptions = {},
@@ -81,6 +100,8 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   ) {
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
     this.#resolver = options.resolver ?? NOOP_RESOLVER;
+    this.#scheduler = options.timer?.scheduler ?? null;
+    this.maxWaitMs = options.timer?.maxWaitMs ?? 0;
     const packerOptions: CommandPackerOptions = {
       maxCommandCount: options.maxCommandCount,
       maxPayloadLength: options.maxPayloadLength,
@@ -94,32 +115,86 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     return buffered;
   }
 
+  #resetPendingSegment(): void {
+    this.#pendingChainId = undefined;
+    this.#pendingRequiresDrainAtEnd = false;
+  }
+
+  #markPendingSegment(meta?: OutboundCommandMeta): void {
+    this.#pendingChainId = meta?.chainId;
+    if (meta?.chainId !== undefined) {
+      this.#pendingRequiresDrainAtEnd = true;
+    }
+  }
+
+  #cancelPendingFlush(): void {
+    if (this.#pendingFlush !== null) {
+      this.#pendingFlush.cancel();
+      this.#pendingFlush = null;
+    }
+  }
+
+  #shouldUseTimer(): boolean {
+    return this.#scheduler !== null && !this.#pendingRequiresDrainAtEnd;
+  }
+
+  #scheduleFlushIfNeeded(): void {
+    if (
+      this.#sink === null ||
+      this.#pendingFlush !== null ||
+      !this.hasPending() ||
+      !this.#shouldUseTimer()
+    ) {
+      return;
+    }
+
+    this.#pendingFlush = this.#scheduler!.schedule(this.maxWaitMs, () => {
+      this.#pendingFlush = null;
+      try {
+        const batch = this.#flushBuffered(FlushReason.TIMER_EXPIRED);
+        if (batch !== null) {
+          this.#sink!.emit(batch);
+        }
+      } catch (err) {
+        this.#sink?.onError(err);
+      }
+    });
+  }
+
   #flushBuffered(reason: FlushReason): OutboundBatch | null {
     const packed = this.#packer.drain(reason);
     if (packed === null) return null;
+    this.#cancelPendingFlush();
+    const sent = this.#takeBufferedCommands();
+    this.#resetPendingSegment();
     return {
       writes: [packed],
-      sent: this.#takeBufferedCommands()
+      sent
     };
   }
 
-  intercept(
+  bind(sink: OutboundSink): void {
+    this.#sink = sink;
+    this.#scheduleFlushIfNeeded();
+  }
+
+  static #mergeBatches(left: OutboundBatch | null, right: OutboundBatch | null): OutboundBatch | null {
+    if (left === null) return right;
+    if (right === null) return left;
+    return {
+      writes: [...left.writes, ...right.writes],
+      sent: [...left.sent, ...right.sent]
+    };
+  }
+
+  #interceptEncoded(
     command: CommandToWrite,
     encoded: SocketChunk,
     args: CommandArguments,
     byteLength?: number,
-    chainId?: symbol
+    chainId?: symbol,
+    meta?: OutboundCommandMeta
   ): OutboundBatch | null {
-    this.#statsCounter.recordCommand();
-
-    // Clear cache when chain changes (to avoid memory leak)
-    if (chainId !== this.#lastChainId) {
-      if (this.#lastChainId !== undefined) {
-        this.#chainSlotCache.delete(this.#lastChainId);
-      }
-      this.#lastChainId = chainId;
-    }
-
     let slot: number;
 
     // Fast path: reuse cached slot for same chain (multi/pipeline)
@@ -158,18 +233,76 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     const packed = this.#packer.add(encoded, slot, payloadLength);
     if (!packed) {
       this.#bufferedCommands.push(command);
+      this.#markPendingSegment(meta);
       return null;
     }
+
+    this.#cancelPendingFlush();
     const sent = this.#takeBufferedCommands();
+    this.#resetPendingSegment();
     this.#bufferedCommands.push(command);
+    this.#markPendingSegment(meta);
     return {
       writes: [packed],
       sent
     };
   }
 
+  intercept(
+    command: CommandToWrite,
+    encoded: SocketChunk,
+    args: CommandArguments,
+    byteLength?: number,
+    meta?: OutboundCommandMeta
+  ): OutboundBatch | null {
+    this.#statsCounter.recordCommand();
+    const chainId = meta?.chainId;
+
+    // Clear cache when chain changes (to avoid memory leak)
+    if (chainId !== this.#lastChainId) {
+      if (this.#lastChainId !== undefined) {
+        this.#chainSlotCache.delete(this.#lastChainId);
+      }
+      this.#lastChainId = chainId;
+    }
+
+    let batch: OutboundBatch | null = null;
+
+    // Flush on chain boundary only when the pending segment already belongs to an explicit pipeline.
+    // This preserves the existing behavior where auto-pipelined commands can be absorbed into a later
+    // explicit pipeline segment, but explicit segments never leak into the following segment.
+    if (this.hasPending() && this.#pendingChainId !== undefined && chainId !== this.#pendingChainId) {
+      batch = this.flush(FlushReason.DRAIN);
+    }
+
+    batch = BinaryHeadersOutboundInterceptor.#mergeBatches(
+      batch,
+      this.#interceptEncoded(command, encoded, args, byteLength, chainId, meta)
+    );
+
+    if (meta?.forceImmediate && this.hasPending()) {
+      batch = BinaryHeadersOutboundInterceptor.#mergeBatches(
+        batch,
+        this.flush(FlushReason.DRAIN)
+      );
+    }
+
+    this.#scheduleFlushIfNeeded();
+    return batch;
+  }
+
   flush(reason: FlushReason): OutboundBatch | null {
+    this.#cancelPendingFlush();
     return this.#flushBuffered(reason);
+  }
+
+  endIteration(): OutboundBatch | null {
+    if (!this.hasPending()) return null;
+    if (!this.#shouldUseTimer()) {
+      return this.flush(FlushReason.DRAIN);
+    }
+    this.#scheduleFlushIfNeeded();
+    return null;
   }
 
   hasPending(): boolean {
@@ -177,10 +310,16 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   }
 
   reset(): CommandToWrite[] {
+    this.#cancelPendingFlush();
     this.#packer.reset();
     this.#chainSlotCache.clear();
     this.#lastChainId = undefined;
+    this.#resetPendingSegment();
     return this.#takeBufferedCommands();
+  }
+
+  destroy(): void {
+    this.#cancelPendingFlush();
   }
 
   stats(): BinaryHeaderStats {

@@ -404,6 +404,7 @@ export interface TestableQueue {
  * Extended interface for queues with timer support.
  */
 export interface TestableQueueWithTimer extends TestableQueue {
+  setReadyToWriteCallback(callback: (writes: ReadonlyArray<SocketChunk>) => void): void;
   setTimerFlushCallback(callback: (encoded: SocketChunk) => void): void;
   destroy(): void;
   readonly maxWaitMs: number;
@@ -471,19 +472,22 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
     statsCounter,
   } = options;
 
-  const interceptor = (resolver || onProtocolError || statsCounter)
+  const interceptor = (resolver || onProtocolError || statsCounter || timer)
     ? new BinaryHeadersInterceptor({
-        outbound: resolver ? { resolver } : undefined,
+        outbound: resolver || timer
+          ? {
+              resolver,
+              timer: timer
+                ? { maxWaitMs: timer.maxWaitMs, scheduler: timer.scheduler ?? createTimeoutScheduler() }
+                : undefined
+            }
+          : undefined,
         inbound: onProtocolError ? { onProtocolError: (header) => onProtocolError(header.clientIdx) } : undefined,
         statsCounter,
       })
     : undefined;
 
-  const timerOptions = timer
-    ? { maxWaitMs: timer.maxWaitMs, scheduler: timer.scheduler ?? createTimeoutScheduler() }
-    : undefined;
-
-  return new RedisCommandsQueue(respVersion, maxLength, onShardedChannelMoved, interceptor, timerOptions);
+  return new RedisCommandsQueue(respVersion, maxLength, onShardedChannelMoved, interceptor);
 }
 
 function createCodecQueueWithTimer(options: QueueFactoryOptions = {}): TestableQueueWithTimer {

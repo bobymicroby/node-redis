@@ -1,14 +1,71 @@
 # Binary Headers Refactor Plan
 
-## Baseline
+## Status
 
-Current red test command:
+```text
+Phase 1: done
+Phase 2: done
+Phase 3: done
+Phase 4: pending
+```
+
+Current green validation:
+
+```sh
+npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/memtier-bench.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/abort-timeout.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats-e2e.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/**.spec.ts' 2>&1
+```
+
+Current broad result:
+
+```text
+444 passing
+23 pending
+```
+
+Environment note:
+
+```text
+abort-timeout.spec.ts opens a local listener.
+In a restricted sandbox it can fail before reaching queue logic with:
+  listen EPERM: operation not permitted 0.0.0.0
+```
+
+Important test harness note:
+
+```text
+stats-e2e.spec.ts must import ../../index, not ../..
+```
+
+Why:
+
+```text
+../.. from packages/client/lib/binary-headers/stats-e2e.spec.ts
+  -> packages/client/package.json
+  -> main = ./dist/index.js
+
+That bypasses source changes in lib/.
+```
+
+Current source import:
+
+```ts
+import { createClient, RedisClientType } from '../../index';
+```
+
+## Historical Baseline
+
+Original red test command:
 
 ```sh
 npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
 ```
 
-Current intentional failures:
+Original intentional failures:
 
 ```text
 1. flushWaitingForReply clears pending outbound data and cancels scheduled timer
@@ -16,29 +73,23 @@ Current intentional failures:
 3. OutboundInterceptor intercept errors reject the command and leave the queue usable
 ```
 
-These failures are good. They pin the boundary bug before refactoring.
+Those failures were useful because they pinned the ownership bug before refactoring.
 
 ## Root Problem
 
-The queue currently moves a command into `waitingForReply` too early.
+The queue used to move a command into `waitingForReply` too early.
 
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `677-683`
+Historical shape:
 
 ```ts
-this.#chainInExecution = toSend.chainId;
-toSend.chainId = undefined;
 this.#waitingForReply.push(toSend);
-
-if (outbound !== null) {
-  const hadPending = outbound.hasPending();
-  let outputs = outbound.intercept(encoded, args, byteLength, currentChainId);
+let outputs = outbound.intercept(encoded, args, byteLength, currentChainId);
 ```
 
 Visual model:
 
 ```text
-today
+today-before-refactor
 
   toWrite
     |
@@ -51,23 +102,19 @@ today
            +--> maybe timer flushes later
 ```
 
-That breaks the old invariant:
+That broke the old invariant:
 
 ```text
 waitingForReply should mean:
   "these commands were actually emitted to the socket"
 ```
 
-Right now it means:
+It also caused the two concrete failure modes we pinned first:
 
 ```text
-"these commands are somewhere between queue state and codec state"
+- queue flush paths could reject commands but still leave bytes buffered
+- outbound interceptor exceptions could strand commands in queue state
 ```
-
-That is why:
-
-- queue flush paths can reject a command but still leave bytes buffered in the codec
-- outbound interceptor exceptions can strand commands in `waitingForReply`
 
 ## Refactor Goal
 
@@ -81,17 +128,17 @@ after emit:
   queue owns waitingForReply commands
 ```
 
-The queue should remain responsible for:
+Queue should remain responsible for:
 
 ```text
 - toWrite
 - waitingForReply
-- abort/timeout listeners
+- abort/timeout listener lifecycle
 - decoder / pubsub / reset
 - queue length / offline queue semantics
 ```
 
-The outbound codec should own:
+Outbound codec should own:
 
 ```text
 - batching
@@ -103,54 +150,22 @@ The outbound codec should own:
 
 Inbound is already close to the right shape and should mostly stay alone in this refactor.
 
-## Concrete Phases
-
----
-
 ## Phase 1: Fix Ownership Without Moving Timers Yet
+
+Status: done
 
 ### Goal
 
 Make the outbound codec return not only bytes, but also the exact commands that became "sent".
 
-This is the smallest step that fixes the ownership bug.
+### What Landed
 
-### Files
-
-```text
-packages/client/lib/client/commands-queue.ts
-packages/client/lib/binary-headers/codec.ts
-packages/client/lib/binary-headers/packing.ts          (only if needed)
-packages/client/lib/binary-headers/codec-queue.spec.ts
-```
-
-### New Protocol
-
-Replace the current outbound "bytes only" protocol:
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `46-74`
-
-```ts
-export interface OutboundInterceptor {
-  intercept(
-    encoded: SocketChunk,
-    args: CommandArguments,
-    byteLength?: number,
-    chainId?: symbol
-  ): SocketChunks;
-
-  flush(reason: FlushReason): SocketChunk | null;
-  hasPending(): boolean;
-}
-```
-
-with a transitional protocol like:
+The transitional outbound protocol now includes batch metadata:
 
 ```ts
 export interface OutboundBatch {
   writes: SocketChunks;
-  sent: CommandToWrite[];
+  sent: ReadonlyArray<CommandToWrite>;
 }
 
 export interface OutboundInterceptor {
@@ -159,509 +174,299 @@ export interface OutboundInterceptor {
     encoded: SocketChunk,
     args: CommandArguments,
     byteLength?: number,
-    chainId?: symbol
-  ): OutboundBatch | null; // null => buffered, nothing emitted
+    meta?: OutboundCommandMeta
+  ): OutboundBatch | null;
 
   flush(reason: FlushReason): OutboundBatch | null;
-
   hasPending(): boolean;
-
   reset?(): CommandToWrite[];
 }
 ```
 
-### Queue Changes
-
-#### 1. Add a single helper that performs the "sent" transition
-
-File: `packages/client/lib/client/commands-queue.ts`
-
-Add something like:
+Queue-side ownership helpers now exist:
 
 ```ts
-#markSent(command: CommandToWrite) {
-  (command as any).args = undefined;
-
-  if (command.abort) {
-    RedisCommandsQueue.#removeAbortListener(command);
-    command.abort = undefined;
-  }
-
-  if (command.timeout) {
-    RedisCommandsQueue.#removeTimeoutListener(command);
-    command.timeout = undefined;
-  }
-
-  this.#chainInExecution = command.chainId;
-  command.chainId = undefined;
-  this.#waitingForReply.push(command);
-}
+#markSent(command)
+#markBatchSent(batch)
+#resetPendingOutbound(err)
+#handleOutboundError(err, current?)
 ```
 
-#### 2. Stop pushing into `waitingForReply` before outbound success
-
-Replace the current ordering:
-
-```ts
-this.#waitingForReply.push(toSend);
-let outputs = outbound.intercept(...);
-```
-
-with:
-
-```ts
-const batch = outbound.intercept(toSend, encoded, args, byteLength, currentChainId);
-if (batch !== null) {
-  for (const sent of batch.sent) {
-    this.#markSent(sent);
-  }
-
-  for (const output of batch.writes) {
-    yield output;
-  }
-}
-```
-
-#### 3. Wrap outbound calls in `try/catch`
-
-Current unguarded call:
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `681-689`
-
-```ts
-const hadPending = outbound.hasPending();
-let outputs = outbound.intercept(encoded, args, byteLength, currentChainId);
-```
-
-Needs to become guarded:
-
-```ts
-try {
-  const batch = outbound.intercept(...);
-  ...
-} catch (err) {
-  RedisCommandsQueue.#flushToWrite(toSend, err as Error);
-  throw? // no
-}
-```
-
-Important behavior:
+The codec now buffers command objects alongside payload chunks:
 
 ```text
-interceptor failure should reject the command
-interceptor failure should not throw out of the generator
-interceptor failure should leave the queue reusable
+- eligible buffered commands stay codec-owned until emitted
+- flush() returns both writes and the exact sent commands
+- reset() clears buffered payload and returns buffered commands for rejection
 ```
 
-#### 4. Clear codec-owned buffered commands on queue flush/reset paths
-
-Current code only resets queue-owned structures:
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `789-815`
-
-```ts
-flushWaitingForReply(err: Error): void {
-  this.resetDecoder();
-  this.#pubSub.reset();
-
-  this.#flushWaitingForReply(err);
-  ...
-}
-
-flushAll(err: Error): void {
-  this.resetDecoder();
-  this.#pubSub.reset();
-  this.#flushWaitingForReply(err);
-  ...
-}
-```
-
-Add:
-
-```ts
-this.#cancelPendingFlush();
-const buffered = this.#outbound?.reset?.() ?? [];
-for (const command of buffered) {
-  RedisCommandsQueue.#flushToWrite(command, err);
-}
-```
-
-Also do the same in `destroy()` if buffered outbound state still exists.
-
-### Codec Changes
-
-#### 1. Buffer commands inside the codec together with payload
-
-Today the codec owns bytes but not command objects.
-
-File: `packages/client/lib/binary-headers/codec.ts`
-Lines: `81-129`
-
-```ts
-const packed = this.#packer.add(encoded, slot, payloadLength);
-if (!packed) {
-  return [];
-}
-return [packed];
-```
-
-It should instead also track the associated `CommandToWrite`.
-
-Implementation options:
+### Acceptance
 
 ```text
-Option A:
-  keep a parallel array of buffered commands inside codec.ts
-
-Option B:
-  extend CommandPacker to store metadata
+- the 3 original red regression tests are green
+- waitingForReply means emitted-to-socket commands only
+- interceptor failures reject commands without throwing from the generator
 ```
 
-Preferred for Phase 1:
+### Validation
 
-```text
-Option A
+```sh
+npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats.spec.ts' 2>&1
 ```
-
-Reason:
-
-```text
-smaller change surface
-easier to verify
-lets packing.ts stay payload-focused for now
-```
-
-Sketch:
-
-```ts
-#bufferedCommands: CommandToWrite[] = [];
-
-intercept(command, encoded, args, byteLength, chainId) {
-  ...
-  const packed = this.#packer.add(encoded, slot, payloadLength);
-  this.#bufferedCommands.push(command);
-
-  if (!packed) {
-    return null;
-  }
-
-  const sent = this.#bufferedCommands;
-  this.#bufferedCommands = [];
-  return { writes: [packed], sent };
-}
-```
-
-When an ineligible command forces a drain:
-
-```ts
-const pending = this.#packer.drain(FlushReason.DRAIN);
-if (!pending) {
-  return { writes: [encoded], sent: [command] };
-}
-
-const sent = [...this.#bufferedCommands, command];
-this.#bufferedCommands = [];
-return { writes: [pending, encoded], sent };
-```
-
-#### 2. Add `reset()` to the outbound codec
-
-Sketch:
-
-```ts
-reset(): CommandToWrite[] {
-  this.#packer.drain(FlushReason.DRAIN); // discard bytes
-  const buffered = this.#bufferedCommands;
-  this.#bufferedCommands = [];
-  this.#chainSlotCache.clear();
-  this.#lastChainId = undefined;
-  return buffered;
-}
-```
-
-### Acceptance For Phase 1
-
-```text
-- the 3 red regression tests go green
-- existing queue tests stay green
-- invariant restored:
-    waitingForReply == emitted-to-socket commands only
-```
-
----
 
 ## Phase 2: Move Segment / Explicit-Pipeline Policy Into The Codec
+
+Status: done
 
 ### Goal
 
 Delete queue-side batching policy branches and move them behind outbound codec calls.
 
-### Files
+### Queue Policy That Needed To Move
+
+Before this phase, the queue still owned:
 
 ```text
-packages/client/lib/client/commands-queue.ts
-packages/client/lib/binary-headers/codec.ts
-packages/client/lib/binary-headers/codec-queue.spec.ts
-packages/client/lib/binary-headers/memtier-bench.spec.ts
+- chain-boundary flush logic
+- force-immediate flush for abort/timeout commands
+- pendingIsExplicitPipeline bookkeeping
+- end-of-iteration "drain now vs let timer handle it" logic
 ```
 
-### Queue Code To Delete
+### Transitional Protocol For Phase 2
 
-#### 1. Chain-boundary flush logic
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `633-645`
-
-```ts
-if (outbound !== null && outbound.hasPending()) {
-  const chainChanged = currentChainId !== undefined && toSend.chainId !== currentChainId;
-  if (chainChanged) {
-    this.#cancelPendingFlush();
-    const drained = outbound.flush(FlushReason.DRAIN);
-    if (drained !== null) {
-      yield drained;
-    }
-    pendingIsExplicitPipeline = false;
-  }
-}
-```
-
-#### 2. Force-immediate flush logic
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `685-692`
-
-```ts
-if (needsImmediateFlush && outbound.hasPending()) {
-  this.#cancelPendingFlush();
-  const drained = outbound.flush(FlushReason.DRAIN);
-  if (drained !== null) {
-    outputs = outputs.length > 0 ? [...outputs, drained] : [drained];
-  }
-}
-```
-
-#### 3. End-of-iteration drain policy
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `727-744`
-
-```ts
-if (outbound !== null && outbound.hasPending()) {
-  if (this.#scheduler === null || pendingIsExplicitPipeline) {
-    this.#cancelPendingFlush();
-    const drained = outbound.flush(FlushReason.DRAIN);
-    if (drained !== null) {
-      yield drained;
-    }
-  }
-}
-```
-
-### Replace With Command Metadata
-
-Introduce a small metadata object:
+The queue now passes command metadata instead of running segment policy itself:
 
 ```ts
 export interface OutboundCommandMeta {
   chainId?: symbol;
   forceImmediate?: boolean;
-  endOfIteration?: boolean;
 }
 ```
 
-Then change the outbound entrypoint to:
+The outbound boundary grows two transitional helpers:
 
 ```ts
-push(
-  command: CommandToWrite,
-  encoded: SocketChunk,
-  args: CommandArguments,
-  byteLength: number,
-  meta: OutboundCommandMeta
-): OutboundBatch | null;
+export interface OutboundInterceptor {
+  intercept(
+    command: CommandToWrite,
+    encoded: SocketChunk,
+    args: CommandArguments,
+    byteLength?: number,
+    meta?: OutboundCommandMeta
+  ): OutboundBatch | null;
+
+  flush(reason: FlushReason): OutboundBatch | null;
+  endIteration?(): OutboundBatch | null;
+  hasPending(): boolean;
+  reset?(): CommandToWrite[];
+}
 ```
 
-### Why
-
-This changes the relationship from:
-
-```text
-queue tells codec:
-  "I inspected your hidden state and decided when you flush"
-```
-
-to:
+Visual model:
 
 ```text
 queue tells codec:
   "here is the next command and its metadata"
 
 codec decides:
-  "buffer / flush / start new segment / force immediate send"
+  "buffer / flush / start new segment / force immediate send / whether timer applies"
+```
+
+### What Has Landed So Far
+
+Queue loop simplification:
+
+```text
+removed from commands-queue.ts:
+  - currentChainId
+  - pendingIsExplicitPipeline
+  - queue-side chain boundary drain
+  - queue-side force-immediate drain merge
+  - queue-side end-of-iteration explicit drain decision
+```
+
+Codec-owned segment state:
+
+```text
+added to codec.ts:
+  - pendingChainId
+  - pendingRequiresDrainAtEnd
+  - chain-boundary drain for explicit segment transitions
+  - forceImmediate drain for abort/timeout commands
+  - endIteration() for "drain now vs wait for timer"
+```
+
+Important behavior preserved:
+
+```text
+- auto commands can still be absorbed into a later explicit segment
+- explicit segments never leak into the following segment
+- explicit pipelines still drain immediately even when a scheduler exists
+- timer scheduling still happens only for auto-pipelining segments
 ```
 
 ### Acceptance For Phase 2
 
 ```text
-- remove queue-side chain/pipeline batching branches
-- codec queue tests still green
-- queue becomes transport-agnostic again
+- queue no longer owns segment / explicit-pipeline batching policy
+- queue no longer owns force-immediate drain policy
+- codec queue tests stay green
+- integration-heavy queue specs stay green
 ```
 
----
+### Validation
+
+Green:
+
+```sh
+npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/memtier-bench.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats-e2e.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/**.spec.ts' 2>&1
+```
+
+Current broad result:
+
+```text
+444 passing
+23 pending
+```
+
+Open decision left for Phase 3:
+
+```text
+the queue still has fallback behavior for codecs that do not implement
+endIteration(). That can stay as a compatibility bridge.
+```
 
 ## Phase 3: Move Timer Ownership Into The Codec
+
+Status: done
 
 ### Goal
 
 Delete queue-owned timer state and callback plumbing.
 
-### Queue Code To Delete
+### What Landed
 
-#### 1. Queue timer state
+```text
+queue
+  - no longer owns scheduler / pendingFlush / scheduleFlush / cancelPendingFlush
+  - binds the outbound codec once via OutboundSink
+  - exposes a generic ReadyToWriteCallback instead of a timer-specific callback
 
-File: `packages/client/lib/client/commands-queue.ts`
-Lines around:
+codec
+  - owns scheduler / pendingFlush / scheduleFlushIfNeeded / cancelPendingFlush
+  - owns timer expiry -> flush -> emit(batch) flow
+  - owns the "reschedule after slot-change flush" behavior
 
-```ts
-#scheduler
-#maxWaitMs
-#pendingFlush
-#timerFlushCallback
+index
+  - passes timer config into BinaryHeadersOutboundOptions.timer
+  - wires queue.setReadyToWriteCallback(...) to socket.write(...)
 ```
 
-#### 2. Queue timer scheduling
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `284-296`
-
-```ts
-#scheduleFlush(): void {
-  if (this.#pendingFlush !== null || this.#scheduler === null) {
-    return;
-  }
-
-  this.#pendingFlush = this.#scheduler.schedule(this.#maxWaitMs, () => {
-    this.#pendingFlush = null;
-    const packed = this.drainPendingOutbound(FlushReason.TIMER_EXPIRED);
-    if (packed !== null) {
-      this.#timerFlushCallback(packed);
-    }
-  });
-}
-```
-
-#### 3. Queue public timer helpers
-
-File: `packages/client/lib/client/commands-queue.ts`
-Lines: `755-760`
-
-```ts
-hasPendingOutbound(): boolean {
-  return this.#outbound?.hasPending() ?? false;
-}
-
-drainPendingOutbound(reason: FlushReason = FlushReason.DRAIN): SocketChunk | null {
-  return this.#outbound?.flush(reason) ?? null;
-}
-```
-
-#### 4. Index callback wiring
-
-File: `packages/client/lib/client/index.ts`
-Lines: `729-735`
-
-```ts
-#setupBinhdrFlushCallback(): void {
-  const binaryHeadersOpts = this.#normalizedBinaryHeadersOptions();
-  if (binaryHeadersOpts?.enabled && binaryHeadersOpts.timer !== false) {
-    this.#queue.setTimerFlushCallback(encoded => {
-      this.#socket.write([encoded]);
-    });
-  }
-}
-```
-
-### Target Shape
-
-Bind the outbound codec to a queue-owned emit sink once:
+Landed queue/codec bridge:
 
 ```ts
 interface OutboundSink {
   emit(batch: OutboundBatch): void;
+  onError(err: unknown): void;
 }
 
-interface OutboundInterceptor {
-  bind(sink: OutboundSink): void;
-  push(...): OutboundBatch | null;
-  endIteration(): OutboundBatch | null;
-  reset(): CommandToWrite[];
-  stats?(): BinaryHeaderStats;
-}
+type ReadyToWriteCallback = (writes: SocketChunks) => void;
 ```
 
-Then timer behavior becomes codec-internal:
+Visual model:
 
 ```text
-codec timer fires
-  -> codec creates OutboundBatch
-  -> codec calls sink.emit(batch)
-  -> queue marks batch.sent as waitingForReply
-  -> socket writes batch.writes
+before Phase 3
+  queue timer fires
+    -> queue asks codec to drain
+    -> queue callback writes bytes
+
+after Phase 3
+  codec timer fires
+    -> codec creates OutboundBatch
+    -> codec calls sink.emit(batch)
+    -> queue marks batch.sent as waitingForReply
+    -> queue callback writes batch.writes
 ```
 
-### Constructor Shape After Phase 3
-
-Instead of:
-
-```ts
-new RedisCommandsQueue(..., interceptor, timerOptions)
-```
-
-target:
-
-```ts
-new RedisCommandsQueue(..., interceptor)
-```
-
-with timer configuration living inside the outbound codec options:
-
-```ts
-new BinaryHeadersInterceptor({
-  outbound: {
-    resolver: STATIC_RESOLVER,
-    maxCommandCount,
-    maxPayloadLength,
-    timer: {
-      maxWaitMs,
-      scheduler
-    }
-  },
-  ...
-})
-```
-
-### Acceptance For Phase 3
+### Acceptance
 
 ```text
-- delete queue timer helpers
-- delete queue timer callback wiring from index.ts
+- queue timer state is gone
+- timer scheduling/cancellation lives in the codec
+- timer callback wiring in index.ts is now generic ready-to-write wiring
 - all timer tests pass against codec-owned scheduling
 - queue no longer knows whether outbound codec buffers or uses timers
 ```
 
----
+Compatibility shims intentionally kept for now:
+
+```text
+- setTimerFlushCallback(...)
+- maxWaitMs
+- hasPendingOutbound()
+- drainPendingOutbound()
+```
+
+These are wrappers over codec state for tests/diagnostics, not queue-owned timer machinery.
+
+### Validation
+
+Green:
+
+```sh
+npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/memtier-bench.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/abort-timeout.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/stats-e2e.spec.ts' 2>&1
+npm run test-single -- 'packages/client/lib/binary-headers/**.spec.ts' 2>&1
+```
+
+Important Phase 3 bug fix:
+
+```text
+slot-change flushes that happened inside codec packing needed to cancel
+the old timer before starting the new buffered segment
+```
+
+Without that cancel, these tests failed:
+
+```text
+- slot flush mid-generator cancels existing timer and schedules new one
+- scheduler cancel is called on slot-change flush
+- auto-pipelining with slot changes: timer scheduled for remaining
+```
 
 ## Phase 4: Clean-Up / Naming Pass
+
+Status: pending
 
 ### Goal
 
 Make the outward-facing abstractions read like a transport plugin instead of a half-queue.
 
-### Candidate Renames
+### Naming Work Already Landed
+
+```text
+- setReadyToWriteCallback(...) exists and is the preferred generic name
+- setTimerFlushCallback(...) remains as a compatibility alias
+- queue/index wiring no longer talks about "timer flush callback"
+```
+
+This is a useful midpoint because the callback semantics are now accurate:
+
+```text
+the queue callback is not timer-only anymore
+it is the generic path for ready socket writes
+```
+
+### Candidate Renames Still Deferred
 
 ```text
 OutboundInterceptor -> OutboundCodec
@@ -671,9 +476,31 @@ intercept()         -> push() / decode()
 flush()             -> drain()
 ```
 
-This phase is optional. Do it only after the ownership and timer moves are stable.
+Recommended order for the rename work:
 
-### Acceptance For Phase 4
+```text
+1. add alias types first
+   OutboundCodec = OutboundInterceptor
+   InboundCodec = InboundInterceptor
+   WireCodec = WireInterceptor
+
+2. add alias methods second
+   intercept() <-> push()
+   flush() <-> drain()
+
+3. switch tests/helpers/docs to the new names
+
+4. only then remove the old names
+```
+
+Reason:
+
+```text
+the architecture is now stable enough for renames,
+but broad churn should stay separate from the timer-ownership change
+```
+
+### Acceptance
 
 ```text
 - no semantic changes
@@ -682,36 +509,12 @@ This phase is optional. Do it only after the ownership and timer moves are stabl
 
 ## Implementation Order
 
-Do not skip the order.
-
 ```text
-1. Keep the red regression tests
-2. Implement Phase 1 and make tests green
-3. Re-run codec queue + memtier queue tests
-4. Only then start deleting queue-side batching logic in Phase 2
-5. Move timer ownership in Phase 3
-6. Naming cleanup last
-```
-
-## Suggested Commands Per Phase
-
-### Phase 1
-
-```sh
-npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
-```
-
-### Phase 2
-
-```sh
-npm run test-single -- 'packages/client/lib/binary-headers/codec-queue.spec.ts' 2>&1
-npm run test-single -- 'packages/client/lib/binary-headers/memtier-bench.spec.ts' 2>&1
-```
-
-### Phase 3
-
-```sh
-npm run test-single -- 'packages/client/lib/binary-headers/**.spec.ts' 2>&1
+1. Phase 1 ownership fix
+2. Phase 2 segment-policy move
+3. Phase 2 verification on heavy integration suites
+4. Phase 3 timer move
+5. Phase 4 naming cleanup
 ```
 
 ## Done Criteria

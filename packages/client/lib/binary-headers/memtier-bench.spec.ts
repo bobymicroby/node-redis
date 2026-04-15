@@ -661,17 +661,19 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
     schedulerStats: SchedulerStats;
   } {
     const statsCounter = DefaultBinaryHeaderStatsCounter.create();
+    const { scheduler, stats: schedulerStats } = createTrackingScheduler();
     const interceptor = new BinaryHeadersInterceptor({
-      outbound: { resolver: STATIC_RESOLVER },
+      outbound: {
+        resolver: STATIC_RESOLVER,
+        timer: { maxWaitMs, scheduler }
+      },
       statsCounter
     });
-    const { scheduler, stats: schedulerStats } = createTrackingScheduler();
     const queue = new RedisCommandsQueue(
       2,
       null,
       () => {},
-      interceptor,
-      { maxWaitMs, scheduler }
+      interceptor
     );
     activeQueues.push(queue);
     return { queue, schedulerStats };
