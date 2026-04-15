@@ -485,7 +485,13 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
       })
     : undefined;
 
-  return new RedisCommandsQueue(respVersion, maxLength, onShardedChannelMoved, codec);
+  return new RedisCommandsQueue(
+    respVersion,
+    maxLength,
+    onShardedChannelMoved,
+    '',
+    codec
+  );
 }
 
 function createCodecQueueWithTimer(options: QueueFactoryOptions = {}): TestableQueueWithTimer {
@@ -517,7 +523,8 @@ export function createNoCodecQueue(options: Omit<QueueFactoryOptions, 'resolver'
   return new RedisCommandsQueue(
     options.respVersion ?? 2,
     options.maxLength ?? null,
-    options.onShardedChannelMoved ?? (() => {})
+    options.onShardedChannelMoved ?? (() => {}),
+    ''
   );
 }
 

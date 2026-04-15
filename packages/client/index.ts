@@ -13,8 +13,8 @@ export { defineScript } from './lib/lua-script';
 export { digest } from './lib/utils/digest';
 export * from './lib/errors';
 
-import RedisClient, { RedisClientOptions, RedisClientType } from './lib/client';
-export { RedisClientOptions, RedisClientType };
+import RedisClient, { type BinaryHeadersOptions, type RedisClientOptions, type RedisClientType } from './lib/client';
+export { BinaryHeadersOptions, RedisClientOptions, RedisClientType };
 export const createClient = RedisClient.create;
 export { CommandParser } from './lib/client/parser';
 

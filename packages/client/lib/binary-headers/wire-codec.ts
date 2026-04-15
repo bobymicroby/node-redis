@@ -1,5 +1,4 @@
 import type { RedisArgument } from '../RESP/types';
-import type { BinaryHeaderStats } from './stats';
 import type { CommandToWrite } from '../client/commands-queue';
 
 export interface Cancellable {
@@ -133,11 +132,6 @@ export interface InboundCodec {
 export interface WireCodec {
   readonly outbound?: OutboundCodec;
   readonly inbound?: InboundCodec;
-  /**
-   * Returns a snapshot of codec statistics.
-   * Statistics tracking is optional - implementations may return empty stats.
-   */
-  stats?(): BinaryHeaderStats;
 }
 
 /**

@@ -777,7 +777,7 @@ describe('Codec Queue [codec-queue]', function () {
           }
         }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
       activeQueues.push(queue as unknown as TestableQueueWithTimer);
 
       const flushedData: ReadonlyArray<unknown>[] = [];
@@ -817,7 +817,7 @@ describe('Codec Queue [codec-queue]', function () {
           }
         }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
       activeQueues.push(queue as unknown as TestableQueueWithTimer);
 
       queue.addCommand(['SET', 'key', 'value']);
@@ -853,7 +853,7 @@ describe('Codec Queue [codec-queue]', function () {
           }
         }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
       activeQueues.push(queue as unknown as TestableQueueWithTimer);
 
       // First command buffers + schedules timer
@@ -1088,7 +1088,7 @@ describe('Codec Queue [codec-queue]', function () {
       const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       const promise = queue.addCommand<Buffer>(['GET', 'k'], {
         typeMapping: {
@@ -1271,7 +1271,7 @@ describe('Codec Queue [codec-queue]', function () {
         outbound: { resolver: STATIC_RESOLVER },
         inbound: { onProtocolError: (header) => errors.push(header.clientIdx) }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       const promise = queue.addCommand<string>(['PING']);
       for (const _ of queue.commandsToWrite()) {}
@@ -1290,7 +1290,7 @@ describe('Codec Queue [codec-queue]', function () {
         outbound: { resolver: STATIC_RESOLVER },
         inbound: { onProtocolError: () => { called = true; } }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       const promise = queue.addCommand<string>(['PING']);
       for (const _ of queue.commandsToWrite()) {}
@@ -1332,7 +1332,7 @@ describe('Codec Queue [codec-queue]', function () {
       const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER },
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       const promise = queue.addCommand<string>(['PING']);
       for (const _ of queue.commandsToWrite()) {}
@@ -1360,7 +1360,7 @@ describe('Codec Queue [codec-queue]', function () {
 describe('Codec Queue Interface (CodecQueue specific)', function () {
   describe('without codec (baseline behavior)', function () {
     function createQueue(): RedisCommandsQueue {
-      return new RedisCommandsQueue(2, null, () => {});
+      return new RedisCommandsQueue(2, null, () => {}, '');
     }
 
     it('hasPendingOutbound returns false', function () {
@@ -1375,7 +1375,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER }
       });
-      return new RedisCommandsQueue(2, null, () => {}, interceptor);
+      return new RedisCommandsQueue(2, null, () => {}, '', interceptor);
     }
 
     it('hasPendingOutbound reflects buffered commands', function () {
@@ -1407,7 +1407,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         }
       };
 
-      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', mockInterceptor);
       queue.addCommand(['PING']);
 
       const results: unknown[] = [];
@@ -1443,7 +1443,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         }
       };
 
-      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', mockInterceptor);
       queue.addCommand(['PING']);
 
       const results: unknown[] = [];
@@ -1481,7 +1481,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         }
       };
 
-      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', mockInterceptor);
       queue.addCommand(['PING']);
       for (const _ of queue.commandsToWrite()) {}
 
@@ -1519,7 +1519,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         }
       };
 
-      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', mockInterceptor);
       let settled = false;
       let rejection: unknown;
       const firstCommand = queue.addCommand(['PING']);
@@ -1570,7 +1570,7 @@ describe('Auto-pipelining behavior', function () {
         outbound: { resolver: STATIC_RESOLVER }
         // Note: no maxWaitMs, no scheduler
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       // Same-tick commands with same slot
       queue.addCommand(['SET', 'key1', 'value1']);
@@ -1591,7 +1591,7 @@ describe('Auto-pipelining behavior', function () {
       const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       // Commands with different slots - use {hashtag} syntax to guarantee different slots
       queue.addCommand(['SET', '{slot1}key', 'value1']); // slot for {slot1}
@@ -1618,7 +1618,7 @@ describe('Auto-pipelining behavior', function () {
       const interceptor = new BinaryHeadersCodec({
         outbound: { resolver: STATIC_RESOLVER }
       });
-      const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+      const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       queue.addCommand(['PING']);
       queue.addCommand(['PING']);

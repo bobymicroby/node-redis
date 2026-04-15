@@ -416,7 +416,7 @@ describe('Integration: Binary Header Batching with Queue', function () {
     const interceptor = new BinaryHeadersCodec({
       outbound: { resolver: STATIC_RESOLVER }
     });
-    const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+    const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
     const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 0, 0);
 
@@ -437,7 +437,7 @@ describe('Integration: Binary Header Batching with Queue', function () {
     const interceptor = new BinaryHeadersCodec({
       outbound: { resolver: STATIC_RESOLVER }
     });
-    const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+    const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
     const keyGen = createBulkKeyGenerator('test-', 3, 10, 0, 999, 0, 0);
 
@@ -461,7 +461,7 @@ describe('Integration: Binary Header Batching with Queue', function () {
     const interceptor = new BinaryHeadersCodec({
       outbound: { resolver: STATIC_RESOLVER }
     });
-    const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+    const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
     queue.addCommand(['SET', 'key1', 'value']);
     queue.addCommand(['SET', 'key2', 'value']);
@@ -483,7 +483,7 @@ describe('Integration: Binary Header Batching with Queue', function () {
     const interceptor = new BinaryHeadersCodec({
       outbound: { resolver: STATIC_RESOLVER }
     });
-    const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+    const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
     const pipelineDepth = 10;
     const bulkSize = 5;
@@ -516,7 +516,7 @@ describe('Interceptor Stats Alignment', function () {
       outbound: { resolver: STATIC_RESOLVER },
       statsCounter
     });
-    const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+    const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
     const totalCommands = 15;
     const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 0, 0);
@@ -531,7 +531,7 @@ describe('Interceptor Stats Alignment', function () {
     collectYielded(queue);
 
     // Get stats from interceptor
-    const stats = queue.wireCodecStats();
+    const stats = interceptor.stats();
     assert(stats, 'Stats should be available');
 
     // Verify stats align with what we issued
@@ -551,7 +551,7 @@ describe('Interceptor Stats Alignment', function () {
       outbound: { resolver: STATIC_RESOLVER },
       statsCounter
     });
-    const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+    const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
     const keyGen = createBulkKeyGenerator('test-', 3, 10, 0, 999, 0, 0);
 
@@ -563,7 +563,7 @@ describe('Interceptor Stats Alignment', function () {
 
     collectYielded(queue);
 
-    const stats = queue.wireCodecStats();
+    const stats = interceptor.stats();
     assert(stats, 'Stats should be available');
 
     // First batch of 3 is flushed when slot changes
@@ -580,7 +580,7 @@ describe('Interceptor Stats Alignment', function () {
       outbound: { resolver: STATIC_RESOLVER },
       statsCounter
     });
-    const queue = new RedisCommandsQueue(2, null, () => {}, interceptor);
+    const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
     const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 0, 0);
 
@@ -591,7 +591,7 @@ describe('Interceptor Stats Alignment', function () {
 
     collectYielded(queue);
 
-    const stats = queue.wireCodecStats();
+    const stats = interceptor.stats();
     assert(stats, 'Stats should be available');
 
     assert.equal(stats.batchRate(), 1.0,
@@ -659,6 +659,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
   function createQueueWithTimer(maxWaitMs: number = 100): {
     queue: RedisCommandsQueue;
+    interceptor: BinaryHeadersCodec;
     schedulerStats: SchedulerStats;
   } {
     const statsCounter = DefaultBinaryHeaderStatsCounter.create();
@@ -674,15 +675,16 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       2,
       null,
       () => {},
+      '',
       interceptor
     );
     activeQueues.push(queue);
-    return { queue, schedulerStats };
+    return { queue, interceptor, schedulerStats };
   }
 
   describe('explicit pipeline detection', function () {
     it('commands with chainId do NOT schedule timer', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
       const chainId = Symbol('Pipeline Chain');
 
       // Simulate execAsPipeline: all commands have same chainId
@@ -703,7 +705,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
     });
 
     it('commands without chainId DO schedule timer (auto-pipelining)', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       // Auto-pipelining: no chainId
       const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 0, 0);
@@ -725,7 +727,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
   describe('stats verification', function () {
     it('explicit pipeline uses DRAIN flush, not TIMER flush', function () {
-      const { queue } = createQueueWithTimer();
+      const { queue, interceptor } = createQueueWithTimer();
       const chainId = Symbol('Pipeline Chain');
 
       const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 0, 0);
@@ -736,7 +738,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
       collectYielded(queue);
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       assert.equal(stats.timerFlushCount, 0,
@@ -746,7 +748,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
     });
 
     it('auto-pipelining uses TIMER flush after timer fires', async function () {
-      const { queue } = createQueueWithTimer(10); // Short timer for test
+      const { queue, interceptor } = createQueueWithTimer(10); // Short timer for test
 
       let flushedData: ReadonlyArray<unknown>[] = [];
       queue.setWriteHandler((writes) => { flushedData.push(...writes); });
@@ -762,7 +764,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       // Wait for timer to fire
       await new Promise(resolve => setTimeout(resolve, 20));
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       assert.equal(stats.timerFlushCount, 1,
@@ -775,7 +777,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
   describe('memtier bulk simulation', function () {
     it('multiple bulks with chainId (simulating execAsPipeline calls) - no timer flushes', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       // Simulate memtier behavior: multiple execAsPipeline calls
       // Each call creates its own chainId (like the real implementation)
@@ -801,7 +803,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       assert.equal(schedulerStats.scheduleCount, 0,
         'Timer should NOT be scheduled for any explicit pipeline bulk');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       // All flushes should be DRAIN (from explicit pipeline end) or SLOT_MISMATCH
@@ -811,7 +813,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
     });
 
     it('pipeline=10, bulk-size=10 with chainId: single bulk, no timer flush', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
       const chainId = Symbol('Pipeline Chain');
       const pipelineDepth = 10;
       const bulkSize = 10;
@@ -831,14 +833,14 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
       assert.equal(stats.drainFlushCount, 1, 'drainFlushCount should be 1');
     });
 
     it('interleaved auto and explicit: only auto commands trigger timer', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       // First: auto-pipelining command (no chainId) - different slot
       queue.addCommand(['SET', '{auto}key1', 'value']);
@@ -855,7 +857,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       // Explicit pipeline should flush: auto command (slot change) + explicit batch
       assert.equal(results.length, 2, 'Should yield 2 batches');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       // The auto command gets flushed by slot mismatch when explicit commands arrive
@@ -866,7 +868,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
   describe('edge cases', function () {
     it('single command with chainId flushes immediately', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
       const chainId = Symbol('Pipeline Chain');
 
       queue.addCommand(['PING'], { chainId });
@@ -876,13 +878,13 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       assert.equal(results.length, 1, 'Should yield 1 batch');
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
     });
 
     it('different slots within explicit pipeline all use cached slot - no slot mismatch flushes', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
       const chainId = Symbol('Pipeline Chain');
 
       // Different slots - but with chainId slot caching, all use the first command's cached slot
@@ -898,7 +900,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       // No timer scheduled - explicit pipeline flushes at drain
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
       // With chainId slot caching, all commands in the same chain use the cached slot
@@ -908,7 +910,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
     });
 
     it('different chainIds are all treated as explicit pipelines', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       const chainId1 = Symbol('Pipeline 1');
       const chainId2 = Symbol('Pipeline 2');
@@ -926,7 +928,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
       assert.equal(stats.timerFlushCount, 0, 'timerFlushCount should be 0');
       assert.equal(stats.drainFlushCount, 2, 'drainFlushCount should be 2 (one per chainId)');
@@ -947,7 +949,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
      * explicitPipeline detection fails, we'd see timer flushes instead of drain flushes.
      */
     it('simulates issueBulk() pattern: multiple execAsPipeline calls with separate chainIds', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       const pipelineDepth = 10;
       const bulkSize = 10;
@@ -977,7 +979,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       assert.equal(schedulerStats.scheduleCount, 0,
         'Timer should NOT be scheduled - explicit pipeline should flush immediately');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       // CRITICAL: Should be DRAIN flush, NOT timer flush
@@ -988,7 +990,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
     });
 
     it('simulates pipeline=100, bulk-size=10: 10 separate execAsPipeline calls', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       const pipelineDepth = 100;
       const bulkSize = 10;
@@ -1015,7 +1017,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       assert.equal(schedulerStats.scheduleCount, 0,
         'Timer should NOT be scheduled for explicit pipelines');
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       // All 100 commands processed
@@ -1082,7 +1084,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
      * And do slot mismatches occur between bulks?
      */
     it('pipeline=40, bulk-size=10: multiple bulks issued synchronously (SLOT MISMATCH INVESTIGATION)', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       const pipelineDepth = 40;
       const bulkSize = 10;
@@ -1124,7 +1126,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       const results = collectYielded(queue);
 
       // Get stats
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       // Each bulk has its own chainId, so we expect 4 drain flushes (one per explicit pipeline)
@@ -1149,7 +1151,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
      * Test with pipeline=10, bulk-size=10 (single bulk) for comparison
      */
     it('pipeline=10, bulk-size=10: single bulk, no slot mismatches expected', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       const pipelineDepth = 10;
       const bulkSize = 10;
@@ -1177,7 +1179,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
 
       const results = collectYielded(queue);
 
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       // With single bulk, no slot mismatches
@@ -1254,7 +1256,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
      * pipeline (execAsPipeline) is guaranteed to be sent as a complete batch.
      */
     it('demonstrates chainId boundary flushing: no slot mismatches needed', function () {
-      const { queue } = createQueueWithTimer();
+      const { queue, interceptor } = createQueueWithTimer();
 
       const pipelineDepth = 40;
       const bulkSize = 10;
@@ -1272,7 +1274,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       }
 
       const results = collectYielded(queue);
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       // With chainId boundary flushing: each chainId gets flushed when the next one starts
@@ -1290,7 +1292,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
     });
 
     it('full benchmark simulation: pipeline=10, bulk-size=10, continuous operation', function () {
-      const { queue, schedulerStats } = createQueueWithTimer();
+      const { queue, interceptor, schedulerStats } = createQueueWithTimer();
 
       const pipelineDepth = 10;
       const bulkSize = 10;
@@ -1314,7 +1316,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       }
 
       // After all rounds, check cumulative stats
-      const stats = queue.wireCodecStats();
+      const stats = interceptor.stats();
       assert(stats, 'Stats should be available');
 
       assert.equal(stats.totalCommandCount, rounds * bulkSize,

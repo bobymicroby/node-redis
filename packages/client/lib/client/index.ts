@@ -2,6 +2,10 @@ import COMMANDS from '../commands';
 import RedisSocket, { RedisSocketOptions } from './socket';
 import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
 import RedisCommandsQueue, { CommandOptions } from './commands-queue';
+import { BinaryHeadersCodec } from '../binary-headers/codec';
+import { STATIC_RESOLVER } from '../binary-headers/eligibility';
+import { createTimeoutScheduler } from '../binary-headers/packing';
+import { DefaultBinaryHeaderStatsCounter, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from '../binary-headers/stats';
 import { EventEmitter } from 'node:events';
 import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';
 import { ClientClosedError, ClientOfflineError, DisconnectsClientError, WatchError } from '../errors';
@@ -24,8 +28,24 @@ import EnterpriseMaintenanceManager, { MaintenanceUpdate, MovingEndpointType, SM
 import { ClientMetricsHandle, ClientRegistry } from '../opentelemetry';
 import { ClientIdentity, ClientRole, generateClientId } from './identity';
 import { trace, sanitizeArgs, publish, CHANNELS, type CommandTraceContext } from './tracing';
+import type { Scheduler } from '../binary-headers/wire-codec';
 
 const noop = () => {};
+const DEFAULT_MAX_WAIT_TIME_MS = 1;
+
+export interface BinaryHeadersTimerConfig {
+  maxWaitTime: number;
+  scheduler: Scheduler;
+}
+
+export interface BinaryHeadersOptions {
+  enabled: boolean;
+  timer?: BinaryHeadersTimerConfig | false;
+  maxCommandCount?: number;
+  maxPayloadLength?: number;
+  'stats-collector'?: 'noop' | 'enabled';
+  getStats?: () => BinaryHeaderStats;
+}
 
 export interface RedisClientOptions<
   M extends RedisModules = RedisModules,
@@ -194,6 +214,15 @@ export interface RedisClientOptions<
    * The default is 10000
    */
   maintRelaxedSocketTimeout?: number;
+  /**
+   * Enable binary headers for optimized cluster communication.
+   * Binary headers reduce protocol overhead by adding a compact binary prefix
+   * to commands, enabling faster routing through DMC proxies.
+   *
+   * Only effective in cluster mode. When enabled, eligible commands are
+   * automatically encoded with binary headers.
+   */
+  binaryHeaders?: boolean | BinaryHeadersOptions;
 };
 
 export type WithCommands<
@@ -584,6 +613,7 @@ export default class RedisClient<
 
     this.#queue = this.#initiateQueue(this.#clientIdentity.id);
     this.#socket = this.#initiateSocket(this.#clientIdentity.id);
+    this.#setupBinhdrWriteHandler();
 
     this.#registerForMetrics();
 
@@ -679,13 +709,73 @@ export default class RedisClient<
     return options;
   }
 
+  #normalizedBinaryHeadersOptions(): BinaryHeadersOptions | undefined {
+    if (this.#options.binaryHeaders === true) {
+      return { enabled: true };
+    }
+    if (this.#options.binaryHeaders === false) {
+      return undefined;
+    }
+    return this.#options.binaryHeaders;
+  }
+
   #initiateQueue(clientId: string): RedisCommandsQueue {
+    const binaryHeadersOpts = this.#normalizedBinaryHeadersOptions();
+
+    if (binaryHeadersOpts?.enabled) {
+      const statsCounter: BinaryHeaderStatsCounter = binaryHeadersOpts['stats-collector'] === 'enabled'
+        ? DefaultBinaryHeaderStatsCounter.create()
+        : disabledBinaryHeaderStatsCounter();
+
+      binaryHeadersOpts.getStats = () => statsCounter.snapshot();
+
+      const codec = new BinaryHeadersCodec({
+        outbound: {
+          resolver: STATIC_RESOLVER,
+          maxCommandCount: binaryHeadersOpts.maxCommandCount,
+          maxPayloadLength: binaryHeadersOpts.maxPayloadLength,
+          timer: binaryHeadersOpts.timer === false
+            ? undefined
+            : binaryHeadersOpts.timer
+              ? {
+                  maxWaitMs: binaryHeadersOpts.timer.maxWaitTime,
+                  scheduler: binaryHeadersOpts.timer.scheduler,
+                }
+              : {
+                  maxWaitMs: DEFAULT_MAX_WAIT_TIME_MS,
+                  scheduler: createTimeoutScheduler(),
+                },
+        },
+        inbound: {
+          onProtocolError: (header) => {
+            this.emit('error', new Error(`Binary header protocol error: clientIdx=${header.clientIdx}`));
+          },
+        },
+        statsCounter,
+      });
+
+      return new RedisCommandsQueue(
+        this.#options.RESP ?? 2,
+        this.#options.commandsQueueMaxLength,
+        (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
+        clientId,
+        codec
+      );
+    }
+
     return new RedisCommandsQueue(
       this.#options.RESP ?? 2,
       this.#options.commandsQueueMaxLength,
       (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
       clientId
     );
+  }
+
+  #setupBinhdrWriteHandler(): void {
+    const binaryHeadersOpts = this.#normalizedBinaryHeadersOptions();
+    if (binaryHeadersOpts?.enabled && binaryHeadersOpts.timer !== false) {
+      this.#queue.setWriteHandler((writes) => this.#socket.write(writes));
+    }
   }
 
   /**
@@ -866,7 +956,7 @@ export default class RedisClient<
   #attachListeners(socket: RedisSocket) {
     socket.on('data', chunk => {
       try {
-        this.#queue.decoder.write(chunk);
+        this.#queue.processIncomingData(chunk);
       } catch (err) {
         this.#queue.resetDecoder();
         this.emit('error', err);

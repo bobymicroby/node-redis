@@ -486,7 +486,7 @@ export function createBinaryHeadersCodec(
     onProtocolError?: OnProtocolError;
     statsCounter?: BinaryHeaderStatsCounter;
   }
-): WireCodec {
+): BinaryHeadersCodec {
   return new BinaryHeadersCodec({
     outbound: {
       resolver,

@@ -1,4 +1,5 @@
 import { RedisClientOptions, RedisClientType, WithFunctions, WithModules, WithScripts } from '../client';
+import type { BinaryHeadersOptions } from '../client';
 import { CommandOptions } from '../client/commands-queue';
 import { Command, CommandArguments, CommanderConfig, CommandSignature, TypeMapping, RedisArgument, RedisFunction, RedisFunctions, RedisModules, RedisScript, RedisScripts, ReplyUnion, RespVersions } from '../RESP/types';
 import { NON_STICKY_COMMANDS } from '../commands';
@@ -120,7 +121,7 @@ export interface RedisClusterOptions<
    * When enabled, eligible commands are automatically encoded with binary headers
    * for all node clients in the cluster.
    */
-  binaryHeaders?: boolean;
+  binaryHeaders?: boolean | BinaryHeadersOptions;
 }
 
 export type RedisClusterType<

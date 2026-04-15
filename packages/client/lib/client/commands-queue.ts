@@ -1,11 +1,25 @@
 import { DoublyLinkedNode, DoublyLinkedList, EmptyAwareSinglyLinkedList } from './linked-list';
-import encodeCommand from '../RESP/encoder';
 import { Decoder, PUSH_TYPE_MAPPING, RESP_TYPES } from '../RESP/decoder';
 import { TypeMapping, ReplyUnion, RespVersions, RedisArgument } from '../RESP/types';
 import { ChannelListeners, PubSub, PubSubCommand, PubSubListener, PubSubType, PubSubTypeListeners } from './pub-sub';
 import { AbortError, ErrorReply, CommandTimeoutDuringMaintenanceError, TimeoutError } from '../errors';
 import { MonitorCallback } from '.';
 import { dbgMaintenance } from './enterprise-maintenance-manager';
+import {
+  encodeCommandToWrite,
+  prepareCommandToWaitForReply,
+  pushCommandToOutbound,
+  rejectBufferedOutbound,
+} from './commands-queue-codec-utils';
+import type {
+  InboundCodec,
+  OutboundCodec,
+  WireCodec,
+  WriteBatch,
+  WriteHandler,
+} from '../binary-headers/wire-codec';
+
+const NOOP_WRITE_HANDLER: WriteHandler = () => {};
 
 export interface CommandOptions<T = TypeMapping> {
   chainId?: symbol;
@@ -76,6 +90,9 @@ export default class RedisCommandsQueue {
   readonly decoder;
   readonly #pubSub;
   readonly #clientId: string;
+  readonly #outbound: OutboundCodec | null;
+  readonly #inbound: InboundCodec | null;
+  #writeHandler: WriteHandler = NOOP_WRITE_HANDLER;
 
   #pushHandlers: PushHandler[] = [this.#onPush.bind(this)];
 
@@ -145,7 +162,8 @@ export default class RedisCommandsQueue {
     respVersion: RespVersions,
     maxLength: number | null | undefined,
     onShardedChannelMoved: OnShardedChannelMoved,
-    clientId: string
+    clientId: string,
+    codec?: WireCodec
   ) {
     this.#respVersion = respVersion;
     this.#maxLength = maxLength;
@@ -153,6 +171,12 @@ export default class RedisCommandsQueue {
     this.decoder = this.#initiateDecoder();
     this.#clientId = clientId;
     this.#pubSub = new PubSub(this.#clientId);
+    this.#outbound = codec?.outbound ?? null;
+    this.#inbound = codec?.inbound ?? null;
+    this.#outbound?.bind({
+      emit: (batch) => this.#emitWriteBatch(batch),
+      onError: (err) => this.#handleOutboundError(err),
+    });
   }
 
   #onReply(reply: ReplyUnion) {
@@ -502,6 +526,7 @@ export default class RedisCommandsQueue {
   resetDecoder() {
     this.#resetDecoderCallbacks();
     this.decoder.reset();
+    this.#inbound?.reset();
   }
 
   #resetFallbackOnReply?: Decoder["onReply"];
@@ -544,11 +569,13 @@ export default class RedisCommandsQueue {
   }
 
   *commandsToWrite() {
+    const outbound = this.#outbound;
     let toSend = this.#toWrite.shift();
     while (toSend) {
       let encoded: ReadonlyArray<RedisArgument>;
+      let byteLength: number | undefined;
       try {
-        encoded = encodeCommand(toSend.args);
+        ({ encoded, byteLength } = encodeCommandToWrite(toSend.args, outbound));
       } catch (err) {
         toSend.reject(err);
         toSend = this.#toWrite.shift();
@@ -556,21 +583,35 @@ export default class RedisCommandsQueue {
       }
 
       // TODO reuse `toSend` or create new object?
-      (toSend as any).args = undefined;
-      if (toSend.abort) {
-        RedisCommandsQueue.#removeAbortListener(toSend);
-        toSend.abort = undefined;
-      }
-      if (toSend.timeout) {
-        RedisCommandsQueue.#removeTimeoutListener(toSend);
-        toSend.timeout = undefined;
-      }
-      this.#chainInExecution = toSend.chainId;
-      toSend.chainId = undefined;
-      this.#waitingForReply.push(toSend);
+      if (outbound !== null) {
+        try {
+          const batch = pushCommandToOutbound(outbound, toSend, encoded, byteLength);
 
-      yield encoded;
+          if (batch !== null) {
+            this.#moveBatchToWaitingForReply(batch);
+            yield* batch.writes;
+          }
+        } catch (err) {
+          this.#handleOutboundError(err, toSend);
+        }
+      } else {
+        this.#moveToWaitingForReply(toSend);
+        yield encoded;
+      }
+
       toSend = this.#toWrite.shift();
+    }
+
+    if (outbound !== null) {
+      try {
+        const drained = outbound.completePushes();
+        if (drained !== null) {
+          this.#moveBatchToWaitingForReply(drained);
+          yield* drained.writes;
+        }
+      } catch (err) {
+        this.#handleOutboundError(err);
+      }
     }
   }
 
@@ -606,6 +647,7 @@ export default class RedisCommandsQueue {
   flushWaitingForReply(err: Error): void {
     this.resetDecoder();
     this.#pubSub.reset();
+    rejectBufferedOutbound(this.#outbound, err, RedisCommandsQueue.#flushToWrite);
 
     this.#flushWaitingForReply(err);
 
@@ -621,6 +663,7 @@ export default class RedisCommandsQueue {
   flushAll(err: Error): void {
     this.resetDecoder();
     this.#pubSub.reset();
+    rejectBufferedOutbound(this.#outbound, err, RedisCommandsQueue.#flushToWrite);
     this.#flushWaitingForReply(err);
     for (const node of this.#toWrite) {
       RedisCommandsQueue.#flushToWrite(node, err);
@@ -629,7 +672,11 @@ export default class RedisCommandsQueue {
   }
 
   isEmpty() {
-    return this.#toWrite.length === 0 && this.#waitingForReply.length === 0;
+    return (
+      this.#toWrite.length === 0 &&
+      this.#waitingForReply.length === 0 &&
+      !this.hasPendingOutbound()
+    );
   }
 
   /**
@@ -682,6 +729,59 @@ export default class RedisCommandsQueue {
 
     for (let i = commands.length - 1; i >= 0; i--) {
       this.#toWrite.unshift(commands[i]);
+    }
+  }
+
+  setWriteHandler(callback: WriteHandler): void {
+    this.#writeHandler = callback;
+  }
+
+  processIncomingData(chunk: Buffer): void {
+    if (this.#inbound !== null) {
+      this.#inbound.decode(chunk, (data) => this.decoder.write(data));
+    } else {
+      this.decoder.write(chunk);
+    }
+  }
+
+  hasPendingOutbound(): boolean {
+    return this.#outbound?.hasBuffered() ?? false;
+  }
+
+  destroy(): void {
+    this.#writeHandler = NOOP_WRITE_HANDLER;
+    this.#outbound?.destroy();
+  }
+
+  #moveToWaitingForReply(command: CommandToWrite): void {
+    this.#chainInExecution = prepareCommandToWaitForReply(
+      command,
+      RedisCommandsQueue.#removeAbortListener,
+      RedisCommandsQueue.#removeTimeoutListener,
+    );
+    this.#waitingForReply.push(command);
+  }
+
+  #moveBatchToWaitingForReply(batch: WriteBatch): void {
+    for (const command of batch.emittedCommands) {
+      this.#moveToWaitingForReply(command);
+    }
+  }
+
+  #emitWriteBatch(batch: WriteBatch): void {
+    this.#moveBatchToWaitingForReply(batch);
+    this.#writeHandler(batch.writes);
+  }
+
+  #handleOutboundError(err: unknown, current?: CommandToWrite): void {
+    const error = err instanceof Error ? err : new Error(String(err));
+    const buffered = rejectBufferedOutbound(
+      this.#outbound,
+      error,
+      RedisCommandsQueue.#flushToWrite,
+    );
+    if (current !== undefined && !buffered.includes(current)) {
+      RedisCommandsQueue.#flushToWrite(current, error);
     }
   }
 }

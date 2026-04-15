@@ -40,7 +40,8 @@ function createQueue(): RedisCommandsQueue {
   return new RedisCommandsQueue(
     2,
     null,
-    () => {}
+    () => {},
+    ''
   );
 }
 
@@ -49,6 +50,7 @@ function createQueueWithBinhdr(): RedisCommandsQueue {
     2,
     null,
     () => {},
+    '',
     new BinaryHeadersCodec()
   );
 }
@@ -58,6 +60,7 @@ function createQueueWithBinhdrAndStats(): RedisCommandsQueue {
     2,
     null,
     () => {},
+    '',
     new BinaryHeadersCodec({
       statsCounter: DefaultBinaryHeaderStatsCounter.create()
     })
