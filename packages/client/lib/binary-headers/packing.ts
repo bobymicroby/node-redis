@@ -147,6 +147,15 @@ export class CommandPacker {
     return this.#flush(reason);
   }
 
+  reset(): void {
+    for (let i = 0; i < this.#respCount; i++) {
+      this.#resps[i] = undefined;
+    }
+    this.#respCount = 0;
+    this.#resolvedSlot = NULL_SLOT;
+    this.#totalPayloadLength = 0;
+  }
+
   get bufferSize(): number {
     return this.#respCount;
   }

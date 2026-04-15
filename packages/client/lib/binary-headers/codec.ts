@@ -1,4 +1,13 @@
-import type { OutboundInterceptor, InboundInterceptor, WireInterceptor, SocketChunk, SocketChunks, CommandArguments } from '../client/commands-queue';
+import type {
+  OutboundInterceptor,
+  InboundInterceptor,
+  WireInterceptor,
+  SocketChunk,
+  SocketChunks,
+  CommandArguments,
+  CommandToWrite,
+  OutboundBatch
+} from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength as calcPayloadLength, type CommandPackerOptions } from './packing';
@@ -64,6 +73,7 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
   readonly #statsCounter: BinaryHeaderStatsCounter;
   #chainSlotCache: Map<symbol, number> = new Map();
   #lastChainId: symbol | undefined;
+  #bufferedCommands: CommandToWrite[] = [];
 
   constructor(
     options: BinaryHeadersOutboundOptions = {},
@@ -78,7 +88,28 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     this.#packer = new CommandPacker(this.#statsCounter, packerOptions);
   }
 
-  intercept(encoded: SocketChunk, args: CommandArguments, byteLength?: number, chainId?: symbol): SocketChunks {
+  #takeBufferedCommands(): CommandToWrite[] {
+    const buffered = this.#bufferedCommands;
+    this.#bufferedCommands = [];
+    return buffered;
+  }
+
+  #flushBuffered(reason: FlushReason): OutboundBatch | null {
+    const packed = this.#packer.drain(reason);
+    if (packed === null) return null;
+    return {
+      writes: [packed],
+      sent: this.#takeBufferedCommands()
+    };
+  }
+
+  intercept(
+    command: CommandToWrite,
+    encoded: SocketChunk,
+    args: CommandArguments,
+    byteLength?: number,
+    chainId?: symbol
+  ): OutboundBatch | null {
     this.#statsCounter.recordCommand();
 
     // Clear cache when chain changes (to avoid memory leak)
@@ -108,11 +139,17 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
 
     if (slot === SLOT_INELIGIBLE) {
       this.#statsCounter.recordIneligible();
-      const pending = this.#packer.drain(FlushReason.DRAIN);
-      if (!pending) {
-        return [encoded];
+      const pending = this.#flushBuffered(FlushReason.DRAIN);
+      if (pending === null) {
+        return {
+          writes: [encoded],
+          sent: [command]
+        };
       }
-      return [pending, encoded];
+      return {
+        writes: [...pending.writes, encoded],
+        sent: [...pending.sent, command]
+      };
     }
 
     this.#statsCounter.recordBatchedCommand();
@@ -120,17 +157,30 @@ export class BinaryHeadersOutboundInterceptor implements OutboundInterceptor {
     const payloadLength = byteLength ?? calcPayloadLength(encoded);
     const packed = this.#packer.add(encoded, slot, payloadLength);
     if (!packed) {
-      return [];
+      this.#bufferedCommands.push(command);
+      return null;
     }
-    return [packed];
+    const sent = this.#takeBufferedCommands();
+    this.#bufferedCommands.push(command);
+    return {
+      writes: [packed],
+      sent
+    };
   }
 
-  flush(reason: FlushReason): SocketChunk | null {
-    return this.#packer.drain(reason);
+  flush(reason: FlushReason): OutboundBatch | null {
+    return this.#flushBuffered(reason);
   }
 
   hasPending(): boolean {
     return this.#packer.bufferSize > 0;
+  }
+
+  reset(): CommandToWrite[] {
+    this.#packer.reset();
+    this.#chainSlotCache.clear();
+    this.#lastChainId = undefined;
+    return this.#takeBufferedCommands();
   }
 
   stats(): BinaryHeaderStats {

@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { once } from 'node:events';
 import net from 'node:net';
-import { createClient, RedisClientType } from '../..';
+import { createClient, RedisClientType } from '../../index';
 import { createBinhdrResponse, assertStats, type ExpectedStats } from './test-utils';
 import { RequestHeaderDecoder } from './generated/request-header-codec';
 import type { BinaryHeaderStats } from './stats';

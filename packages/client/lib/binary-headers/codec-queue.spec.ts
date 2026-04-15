@@ -474,6 +474,60 @@ describe('Codec Queue [codec-queue]', function () {
       assert.equal(callbackCount, 0, 'Timer callback should NOT fire when buffer already drained');
     });
 
+    it('flushWaitingForReply clears pending outbound data and cancels scheduled timer', async function () {
+      const { scheduler, stats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 30, scheduler }
+      });
+      activeQueues.push(queue);
+
+      let callbackCount = 0;
+      queue.setTimerFlushCallback(() => { callbackCount++; });
+
+      const commandPromise = queue.addCommand(['SET', 'key', 'value']).catch(err => err);
+      collectYielded(queue); // buffer command, timer scheduled
+
+      assert.equal(queue.hasPendingOutbound(), true, 'Command should be buffered before flush');
+      assert.equal(stats.scheduleCount, 1, 'Timer should be scheduled');
+
+      queue.flushWaitingForReply(new Error('boom'));
+
+      const rejection = await commandPromise;
+      assert.ok(rejection instanceof Error, 'Buffered command should be rejected');
+      assert.equal(queue.hasPendingOutbound(), false, 'Buffered outbound data should be cleared');
+      assert.equal(stats.cancelCount, 1, 'Scheduled timer should be cancelled');
+
+      await delay(50);
+      assert.equal(callbackCount, 0, 'Timer callback should not fire after queue flush');
+    });
+
+    it('flushAll clears pending outbound data and cancels scheduled timer', async function () {
+      const { scheduler, stats } = createTrackingScheduler();
+      const queue = createBinhdrQueueWithTimer({
+        timer: { maxWaitMs: 30, scheduler }
+      });
+      activeQueues.push(queue);
+
+      let callbackCount = 0;
+      queue.setTimerFlushCallback(() => { callbackCount++; });
+
+      const commandPromise = queue.addCommand(['SET', 'key', 'value']).catch(err => err);
+      collectYielded(queue); // buffer command, timer scheduled
+
+      assert.equal(queue.hasPendingOutbound(), true, 'Command should be buffered before flushAll');
+      assert.equal(stats.scheduleCount, 1, 'Timer should be scheduled');
+
+      queue.flushAll(new Error('boom'));
+
+      const rejection = await commandPromise;
+      assert.ok(rejection instanceof Error, 'Buffered command should be rejected');
+      assert.equal(queue.hasPendingOutbound(), false, 'Buffered outbound data should be cleared');
+      assert.equal(stats.cancelCount, 1, 'Scheduled timer should be cancelled');
+
+      await delay(50);
+      assert.equal(callbackCount, 0, 'Timer callback should not fire after flushAll');
+    });
+
     it('setTimerFlushCallback replaced mid-flight: new callback receives data', async function () {
       const queue = createQueueWithTimer(15);
       let oldCalled = false;
@@ -1300,9 +1354,10 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       let interceptCalls = 0;
       const mockInterceptor: WireInterceptor = {
         outbound: {
-          intercept: () => { interceptCalls++; return []; },
+          intercept: () => { interceptCalls++; return null; },
           flush: () => null,
-          hasPending: () => false
+          hasPending: () => false,
+          reset: () => []
         },
         inbound: {
           intercept: (chunk, next) => next(chunk)
@@ -1326,9 +1381,16 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
       const flushResult = ['flushed-data'];
       const mockInterceptor: WireInterceptor = {
         outbound: {
-          intercept: () => [],
-          flush: () => { flushCalls++; return flushResult; },
-          hasPending: () => flushCalls === 0
+          intercept: () => null,
+          flush: () => {
+            flushCalls++;
+            return {
+              writes: [flushResult],
+              sent: []
+            };
+          },
+          hasPending: () => flushCalls === 0,
+          reset: () => []
         },
         inbound: {
           intercept: (chunk, next) => next(chunk)
@@ -1353,9 +1415,13 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
 
       const mockInterceptor: WireInterceptor = {
         outbound: {
-          intercept: (encoded) => [encoded],
+          intercept: (command, encoded) => ({
+            writes: [encoded],
+            sent: [command]
+          }),
           flush: () => null,
-          hasPending: () => false
+          hasPending: () => false,
+          reset: () => []
         },
         inbound: {
           intercept: (chunk, next) => {
@@ -1375,6 +1441,58 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
 
       assert.deepEqual(receivedChunk, testChunk);
       assert.ok(typeof receivedNext === 'function');
+    });
+
+    it('OutboundInterceptor intercept errors reject the command and leave the queue usable', async function () {
+      const interceptError = new Error('intercept boom');
+      let shouldThrow = true;
+      const mockInterceptor: WireInterceptor = {
+        outbound: {
+          intercept: (command, encoded) => {
+            if (shouldThrow) {
+              shouldThrow = false;
+              throw interceptError;
+            }
+            return {
+              writes: [encoded],
+              sent: [command]
+            };
+          },
+          flush: () => null,
+          hasPending: () => false,
+          reset: () => []
+        },
+        inbound: {
+          intercept: (chunk, next) => next(chunk)
+        }
+      };
+
+      const queue = new RedisCommandsQueue(2, null, () => {}, mockInterceptor);
+      let settled = false;
+      let rejection: unknown;
+      const firstCommand = queue.addCommand(['PING']);
+      firstCommand.then(
+        () => {
+          settled = true;
+        },
+        err => {
+          settled = true;
+          rejection = err;
+        }
+      );
+
+      assert.doesNotThrow(() => {
+        assert.deepEqual(collectYielded(queue), []);
+      }, 'Queue should reject the command instead of throwing from the generator');
+
+      await delay(0);
+
+      assert.equal(settled, true, 'Command promise should be settled after interceptor failure');
+      assert.equal(rejection, interceptError, 'Command should reject with the interceptor error');
+      assert.equal(queue.isEmpty(), true, 'Failed command should not leave queue state behind');
+
+      queue.addCommand(['ECHO', 'ok']);
+      assert.deepEqual(collectYieldedParsed(queue), [[['ECHO', 'ok']]]);
     });
   });
 });
