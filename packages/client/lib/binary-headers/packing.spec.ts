@@ -8,35 +8,11 @@ import {
   calculatePayloadLength,
 } from './packing';
 import { FlushReason } from './stats';
-import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
+import { RequestHeaderEncoder } from './generated/request-header-codec';
+import { assertPackedHeader, delay } from './test-utils';
 
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
 const MAX_COMMANDS = RequestHeaderEncoder.commandCountMaxValue();
-
-function assertPackedHeader(
-  packed: ReadonlyArray<unknown> | null,
-  expected: { commandCount?: number; slot?: number; clientIdx?: number }
-): void {
-  assert.ok(packed !== null, 'Expected packed data to be non-null');
-  assert.ok(packed[0] instanceof Buffer, 'Expected first element to be a Buffer');
-
-  const decoder = new RequestHeaderDecoder().wrap(packed[0] as Buffer, 0);
-  assert.ok(decoder.isValid(), 'Expected valid header');
-
-  if (expected.commandCount !== undefined) {
-    assert.equal(decoder.commandCount(), expected.commandCount);
-  }
-  if (expected.slot !== undefined) {
-    assert.equal(decoder.slot(), expected.slot);
-  }
-  if (expected.clientIdx !== undefined) {
-    assert.equal(decoder.clientIdx(), expected.clientIdx);
-  }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 describe('Packing', () => {
   describe('calculatePayloadLength', () => {

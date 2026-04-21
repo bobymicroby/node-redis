@@ -4,34 +4,60 @@ import { once } from 'node:events';
 import net from 'node:net';
 import RedisClient, { BinaryHeadersOptions, RedisClientType } from '../client';
 import RedisCommandsQueue from '../client/commands-queue';
-import { createBinhdrResponse } from './test-utils';
-import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
+import {
+  createBinhdrFrame,
+  parseRequestFrames,
+  type ParsedRequestFrame,
+} from './test-utils';
+import { RequestHeaderEncoder } from './generated/request-header-codec';
+import { calculateSlot } from './new-slot-calulator';
 
 const createClient = RedisClient.create;
 
-interface ParsedRequest {
-  hasBinaryHeader: boolean;
-  header?: { commandCount: number; length: number };
-  payload: Buffer;
+function responseForCommand(command: string[]): string {
+  return command[0].toUpperCase() === 'PING' ? '+PONG\r\n' : '+OK\r\n';
 }
 
-function parseClientRequest(data: Buffer): ParsedRequest {
-  if (data.length >= RequestHeaderDecoder.ENCODED_LENGTH && data[0] === RequestHeaderDecoder.designatorConstantValue()) {
-    const decoder = new RequestHeaderDecoder();
-    decoder.wrap(data, 0);
-    if (decoder.isValid()) {
-      const payloadLength = decoder.length();
-      return {
-        hasBinaryHeader: true,
-        header: { commandCount: decoder.commandCount(), length: decoder.length() },
-        payload: data.subarray(
-          RequestHeaderDecoder.ENCODED_LENGTH,
-          RequestHeaderDecoder.ENCODED_LENGTH + payloadLength
-        ),
-      };
+function maybeKey(command: string[]): string | undefined {
+  switch (command[0].toUpperCase()) {
+    case 'SET':
+    case 'GET':
+    case 'INCR':
+      return command[1];
+    default:
+      return undefined;
+  }
+}
+
+function assertRequestFrameValid(request: ParsedRequestFrame): void {
+  if (request.type === 'raw') {
+    assert.equal(request.commands.length >= 1, true, 'raw request should contain at least one command');
+    return;
+  }
+
+  assert.equal(request.payload.length, request.header.length, 'Payload length should match header');
+  assert.equal(request.commands.length, request.header.commandCount, 'commandCount should match parsed RESP commands');
+
+  let expectedSlot: number | undefined;
+  for (const command of request.commands) {
+    const key = maybeKey(command);
+    if (key === undefined) {
+      continue;
+    }
+
+    const slot = calculateSlot(key);
+    if (expectedSlot === undefined) {
+      expectedSlot = slot;
+    } else {
+      assert.equal(slot, expectedSlot, 'all keyed commands in one binary frame should share the same slot');
     }
   }
-  return { hasBinaryHeader: false, payload: data };
+
+  assert.equal(
+    request.header.slot,
+    expectedSlot ?? RequestHeaderEncoder.slotNullValue(),
+    'binary header slot should match parsed command keys'
+  );
 }
 
 describe('Binary Headers Abort and Timeout', function () {
@@ -39,7 +65,7 @@ describe('Binary Headers Abort and Timeout', function () {
 
   let server: net.Server | undefined;
   let port: number;
-  let receivedRequests: ParsedRequest[];
+  let receivedRequests: ParsedRequestFrame[];
   let client: RedisClientType | undefined;
 
   async function getFreePort(): Promise<number> {
@@ -61,27 +87,20 @@ describe('Binary Headers Abort and Timeout', function () {
   function createMockServer(mode: ResponseMode = 'smart'): net.Server {
     return net.createServer((socket) => {
       socket.on('data', (data) => {
-        let offset = 0;
-        while (offset < data.length) {
-          const remaining = data.subarray(offset);
-          const parsed = parseClientRequest(remaining);
-          receivedRequests.push(parsed);
+        for (const request of parseRequestFrames(data)) {
+          receivedRequests.push(request);
+          assertRequestFrameValid(request);
 
-          const cmdCount = parsed.header?.commandCount ?? 1;
-          const payloadStr = parsed.payload.toString();
-
-          for (let i = 0; i < cmdCount; i++) {
+          for (const command of request.commands) {
             const resp = mode === 'pong-only' ? '+PONG\r\n'
               : mode === 'ok-only' ? '+OK\r\n'
-              : payloadStr.includes('PING') ? '+PONG\r\n' : '+OK\r\n';
-            socket.write(createBinhdrResponse(resp));
+              : responseForCommand(command);
+            socket.write(
+              request.type === 'binary'
+                ? createBinhdrFrame(Buffer.from(resp), 1, request.header.clientIdx)
+                : resp
+            );
           }
-
-          if (!parsed.hasBinaryHeader) {
-            break;
-          }
-
-          offset += RequestHeaderDecoder.ENCODED_LENGTH + parsed.header!.length;
         }
       });
     });
@@ -101,14 +120,14 @@ describe('Binary Headers Abort and Timeout', function () {
   }
 
   function getAllPayloads(): string {
-    return receivedRequests.map(r => r.payload.toString()).join('');
+    return receivedRequests
+      .flatMap(request => request.commands.map(command => command.join(' ')))
+      .join('\n');
   }
 
   function assertAllRequestsValid(): void {
     for (const req of receivedRequests) {
-      if (req.hasBinaryHeader) {
-        assert.equal(req.payload.length, req.header!.length, 'Payload length should match header');
-      }
+      assertRequestFrameValid(req);
     }
   }
 
@@ -215,24 +234,19 @@ describe('Binary Headers Abort and Timeout', function () {
 
     it('cleans up abort listeners for batch commands', async function () {
       server = net.createServer((socket) => {
-        socket.on('data', (data) => {
-          let offset = 0;
-          while (offset < data.length) {
-            const remaining = data.subarray(offset);
-            const parsed = parseClientRequest(remaining);
-            receivedRequests.push(parsed);
-
-            if (parsed.hasBinaryHeader) {
-              offset += RequestHeaderDecoder.ENCODED_LENGTH + parsed.header!.length;
-              for (let i = 0; i < parsed.header!.commandCount; i++) {
-                socket.write(createBinhdrResponse('+OK\r\n'));
-              }
-            } else {
-              socket.write('+OK\r\n');
-              break;
-            }
+      socket.on('data', (data) => {
+        for (const request of parseRequestFrames(data)) {
+          receivedRequests.push(request);
+          assertRequestFrameValid(request);
+          for (const _command of request.commands) {
+            socket.write(
+              request.type === 'binary'
+                ? createBinhdrFrame(Buffer.from('+OK\r\n'), 1, request.header.clientIdx)
+                : '+OK\r\n'
+            );
           }
-        });
+        }
+      });
       });
       await once(server.listen(port), 'listening');
       await createConnectedClient();

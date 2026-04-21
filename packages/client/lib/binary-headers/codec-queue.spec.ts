@@ -4,6 +4,7 @@ import encodeCommand from '../RESP/encoder';
 import RedisCommandsQueue, { type CommandToWrite } from '../client/commands-queue';
 import { RESP_TYPES } from '../RESP/decoder';
 import { BinaryHeadersCodec, BinaryHeadersInboundCodec } from './codec';
+import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { DefaultBinaryHeaderStatsCounter, FlushReason } from './stats';
 import type { WireCodec } from './wire-codec';
 import {
@@ -11,9 +12,9 @@ import {
   delay,
   // Frame utilities
   createBinhdrFrame,
-  createMultipleFrames,
   // RESP utilities
   parseRespCommands,
+  parseRespCommandStrings,
   respSimpleString,
   respInteger,
   respBulkString,
@@ -72,6 +73,41 @@ function fakeCommand(args: string[]): CommandToWrite {
 
 function pushThroughOutboundCodec(codec: BinaryHeadersCodec, args: string[]) {
   return codec.outbound.push(fakeCommand(args), encodeCommand(args), args);
+}
+
+function chunkToBuffer(chunk: ReadonlyArray<unknown>): Buffer {
+  return Buffer.concat(chunk.map(part => typeof part === 'string' ? Buffer.from(part) : part as Buffer));
+}
+
+function decodeOutgoingHeader(chunk: ReadonlyArray<unknown>): { commandCount: number; clientIdx: number } {
+  const decoder = new RequestHeaderDecoder().wrap(chunk[0] as Buffer, 0);
+  assert.equal(decoder.isValid(), true);
+  return {
+    commandCount: decoder.commandCount(),
+    clientIdx: decoder.clientIdx(),
+  };
+}
+
+function responseFramesForWrites(
+  writes: ReadonlyArray<ReadonlyArray<unknown>>,
+  payloads: ReadonlyArray<Buffer>
+): Buffer[] {
+  const frames: Buffer[] = [];
+  let payloadIndex = 0;
+
+  for (const write of writes) {
+    const header = decodeOutgoingHeader(write);
+    for (let i = 0; i < header.commandCount; i++) {
+      const payload = payloads[payloadIndex++];
+      if (payload === undefined) {
+        throw new Error('Not enough response payloads provided for queued writes');
+      }
+      frames.push(createBinhdrFrame(payload, 1, header.clientIdx));
+    }
+  }
+
+  assert.equal(payloadIndex, payloads.length, 'Unused response payloads remain');
+  return frames;
 }
 
 describe('Codec Queue [codec-queue]', function () {
@@ -1057,11 +1093,12 @@ describe('Codec Queue [codec-queue]', function () {
     it('handles empty payload frame', async function () {
       const queue = createBinhdrQueue();
       const promise = queue.addCommand<null>(['PING']);
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
+      const { clientIdx } = decodeOutgoingHeader(writes[0]);
 
       // Create frame with empty payload followed by actual response
-      const emptyFrame = ResponseHeaderEncoder.allocateAndEncode(0, 1, false, 0);
-      const responseFrame = createBinhdrFrame(Buffer.from('$-1\r\n')); // null bulk string
+      const emptyFrame = ResponseHeaderEncoder.allocateAndEncode(0, 0, false, clientIdx);
+      const responseFrame = createBinhdrFrame(Buffer.from('$-1\r\n'), 1, clientIdx); // null bulk string
 
       queue.processIncomingData(Buffer.concat([emptyFrame, responseFrame]));
 
@@ -1125,17 +1162,20 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Prime interceptor as "binary observed".
       const prime = queue.addCommand<string>(['PING']);
-      for (const _ of queue.commandsToWrite()) {}
-      queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n')));
+      const primeWrites = collectYielded(queue);
+      queue.processIncomingData(
+        createBinhdrFrame(Buffer.from('+OK\r\n'), 1, decodeOutgoingHeader(primeWrites[0]).clientIdx)
+      );
       assert.equal(await prime, 'OK');
 
       const promise1 = queue.addCommand<number>(['INCR', 'x']);
       const promise2 = queue.addCommand<number>(['INCR', 'y']);
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
+      const secondHeader = decodeOutgoingHeader(writes[1]);
 
       const mixedChunk = Buffer.concat([
         Buffer.from(':1\r\n'),
-        createBinhdrFrame(Buffer.from(':2\r\n')),
+        createBinhdrFrame(Buffer.from(':2\r\n'), 1, secondHeader.clientIdx),
       ]);
 
       queue.processIncomingData(mixedChunk);
@@ -1150,8 +1190,10 @@ describe('Codec Queue [codec-queue]', function () {
 
       // Prime interceptor as "binary observed".
       const prime = queue.addCommand<string>(['PING']);
-      for (const _ of queue.commandsToWrite()) {}
-      queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n')));
+      const primeWrites = collectYielded(queue);
+      queue.processIncomingData(
+        createBinhdrFrame(Buffer.from('+OK\r\n'), 1, decodeOutgoingHeader(primeWrites[0]).clientIdx)
+      );
       assert.equal(await prime, 'OK');
 
       const blob = queue.addCommand<Buffer>(['GET', 'k1'], {
@@ -1160,7 +1202,8 @@ describe('Codec Queue [codec-queue]', function () {
         },
       });
       const integer = queue.addCommand<number>(['INCR', 'k2']);
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
+      const integerHeader = decodeOutgoingHeader(writes[1]);
 
       // Plain RESP bulk payload: "$5\r\nA\r\n\x80B\r\n"
       // Then a valid binary-header frame in the same chunk.
@@ -1171,7 +1214,7 @@ describe('Codec Queue [codec-queue]', function () {
       ]);
       const mixedChunk = Buffer.concat([
         plainBulk,
-        createBinhdrFrame(Buffer.from(':2\r\n')),
+        createBinhdrFrame(Buffer.from(':2\r\n'), 1, integerHeader.clientIdx),
       ]);
 
       queue.processIncomingData(mixedChunk);
@@ -1274,14 +1317,15 @@ describe('Codec Queue [codec-queue]', function () {
       const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
       const promise = queue.addCommand<string>(['PING']);
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
+      const { clientIdx } = decodeOutgoingHeader(writes[0]);
 
       // Frame with protocolError flag set
-      queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n'), 1, 99, true));
+      queue.processIncomingData(createBinhdrFrame(Buffer.from('+OK\r\n'), 1, clientIdx, true));
 
       await promise;
       assert.equal(errors.length, 1);
-      assert.equal(errors[0], 99);
+      assert.equal(errors[0], clientIdx);
     });
 
     it('does not call onProtocolError when flag is not set', async function () {
@@ -1299,6 +1343,106 @@ describe('Codec Queue [codec-queue]', function () {
 
       await promise;
       assert.equal(called, false);
+    });
+  });
+
+  describe('reply stream conformance', function () {
+    it('accepts split binary reply frames for a single packed request', async function () {
+      const queue = createBinhdrQueue();
+      const replies = [
+        queue.addCommand<string>(['SET', '{split}a', '1']),
+        queue.addCommand<string>(['SET', '{split}b', '2']),
+        queue.addCommand<string>(['SET', '{split}c', '3']),
+      ];
+
+      const writes = collectYielded(queue);
+      assert.equal(writes.length, 1);
+
+      const requestHeader = new RequestHeaderDecoder().wrap(writes[0][0] as Buffer, 0);
+      assert.equal(requestHeader.isValid(), true);
+
+      queue.processIncomingData(createBinhdrFrame(
+        Buffer.concat([respSimpleString('OK'), respSimpleString('OK')]),
+        2,
+        requestHeader.clientIdx()
+      ));
+      queue.processIncomingData(createBinhdrFrame(
+        respSimpleString('OK'),
+        1,
+        requestHeader.clientIdx()
+      ));
+
+      assert.deepEqual(await Promise.all(replies), ['OK', 'OK', 'OK']);
+    });
+
+    it('rejects a split reply stream that jumps to the next packed request early', async function () {
+      const queue = createBinhdrQueue();
+      const pending = [
+        queue.addCommand<string>(['SET', '{a}k1', '1']),
+        queue.addCommand<string>(['SET', '{a}k2', '2']),
+        queue.addCommand<string>(['SET', '{b}k1', '1']),
+        queue.addCommand<string>(['SET', '{b}k2', '2']),
+      ];
+      pending.forEach(promise => promise.catch(() => {}));
+
+      const writes = collectYielded(queue);
+      assert.equal(writes.length, 2);
+
+      const firstHeader = new RequestHeaderDecoder().wrap(writes[0][0] as Buffer, 0);
+      const secondHeader = new RequestHeaderDecoder().wrap(writes[1][0] as Buffer, 0);
+      assert.equal(firstHeader.isValid(), true);
+      assert.equal(secondHeader.isValid(), true);
+
+      queue.processIncomingData(createBinhdrFrame(
+        respSimpleString('OK'),
+        1,
+        firstHeader.clientIdx()
+      ));
+
+      assert.throws(
+        () => queue.processIncomingData(createBinhdrFrame(
+          Buffer.concat([respSimpleString('OK'), respSimpleString('OK')]),
+          2,
+          secondHeader.clientIdx()
+        )),
+        /awaiting clientIdx=/
+      );
+    });
+
+    it('allows reply stream validation to be disabled', async function () {
+      const queue = createBinhdrQueue({ validateReplyStream: false });
+      const pending = [
+        queue.addCommand<string>(['SET', '{a}k1', '1']),
+        queue.addCommand<string>(['SET', '{a}k2', '2']),
+        queue.addCommand<string>(['SET', '{b}k1', '1']),
+        queue.addCommand<string>(['SET', '{b}k2', '2']),
+      ];
+
+      const writes = collectYielded(queue);
+      assert.equal(writes.length, 2);
+
+      const firstHeader = new RequestHeaderDecoder().wrap(writes[0][0] as Buffer, 0);
+      const secondHeader = new RequestHeaderDecoder().wrap(writes[1][0] as Buffer, 0);
+      assert.equal(firstHeader.isValid(), true);
+      assert.equal(secondHeader.isValid(), true);
+
+      queue.processIncomingData(createBinhdrFrame(
+        respSimpleString('A'),
+        1,
+        firstHeader.clientIdx()
+      ));
+      assert.doesNotThrow(() => queue.processIncomingData(createBinhdrFrame(
+        Buffer.concat([respSimpleString('C'), respSimpleString('D')]),
+        2,
+        secondHeader.clientIdx()
+      )));
+      queue.processIncomingData(createBinhdrFrame(
+        respSimpleString('B'),
+        1,
+        firstHeader.clientIdx()
+      ));
+
+      assert.deepEqual(await Promise.all(pending), ['A', 'C', 'D', 'B']);
     });
   });
 
@@ -1334,16 +1478,31 @@ describe('Codec Queue [codec-queue]', function () {
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
 
-      const promise = queue.addCommand<string>(['PING']);
-      for (const _ of queue.commandsToWrite()) {}
-
-      const frame = createBinhdrFrame(Buffer.from('+PONG\r\n'));
+      const stale = queue.addCommand<string>(['PING']);
+      const staleWrites = collectYielded(queue);
+      const staleFrame = createBinhdrFrame(
+        Buffer.from('+PONG\r\n'),
+        1,
+        decodeOutgoingHeader(staleWrites[0]).clientIdx
+      );
 
       // Buffer a partial header, then reset queue parser state.
-      queue.processIncomingData(frame.subarray(0, 4));
+      queue.processIncomingData(staleFrame.subarray(0, 4));
       queue.resetDecoder();
 
-      // Full frame should parse cleanly after reset.
+      // The old in-flight command can no longer be correlated after reset.
+      queue.flushWaitingForReply(new Error('reset'));
+      await assert.rejects(stale, /reset/);
+
+      const promise = queue.addCommand<string>(['PING']);
+      const writes = collectYielded(queue);
+      const frame = createBinhdrFrame(
+        Buffer.from('+PONG\r\n'),
+        1,
+        decodeOutgoingHeader(writes[0]).clientIdx
+      );
+
+      // A new frame should parse cleanly after reset.
       queue.processIncomingData(frame);
 
       const result = await promise;
@@ -2043,6 +2202,56 @@ describe('Auto-pipelining behavior', function () {
       assertPackedHeader(results[0], { commandCount: 1 });
     });
 
+    it('falls back to raw RESP when a single command exceeds maxPayloadLength', function () {
+      const queue = createBinhdrQueue({ maxPayloadLength: 32 });
+      const longValue = 'x'.repeat(128);
+      queue.addCommand(['SET', 'key', longValue]);
+
+      const results = collectYielded(queue);
+      assert.equal(results.length, 1);
+      assert.deepEqual(parseRespCommandStrings(chunkToBuffer(results[0])), [
+        ['SET', 'key', longValue]
+      ]);
+    });
+
+    it('flushes a pending packed batch before writing an oversized command as raw RESP', function () {
+      const queue = createBinhdrQueue({ maxPayloadLength: 96 });
+      const longValue = 'x'.repeat(128);
+
+      queue.addCommand(['SET', '{slot}a', '1']);
+      queue.addCommand(['SET', '{slot}b', '2']);
+      queue.addCommand(['SET', '{slot}c', longValue]);
+
+      const results = collectYielded(queue);
+      assert.equal(results.length, 2);
+      assertPackedData(results[0], {
+        commandCount: 2,
+        commands: [['SET', '{slot}a', '1'], ['SET', '{slot}b', '2']]
+      });
+      assert.deepEqual(parseRespCommandStrings(chunkToBuffer(results[1])), [
+        ['SET', '{slot}c', longValue]
+      ]);
+    });
+
+    it('accepts raw RESP replies for a packed request when the server falls back from binary replies', async function () {
+      const queue = createBinhdrQueue();
+      const replies = [
+        queue.addCommand<string>(['SET', '{raw}a', '1']),
+        queue.addCommand<string>(['SET', '{raw}b', '2']),
+      ];
+
+      const writes = collectYielded(queue);
+      assert.equal(writes.length, 1);
+      assertPackedHeader(writes[0], { commandCount: 2 });
+
+      queue.processIncomingData(Buffer.concat([
+        respSimpleString('OK'),
+        respSimpleString('OK'),
+      ]));
+
+      assert.deepEqual(await Promise.all(replies), ['OK', 'OK']);
+    });
+
     it('buffer commands are handled correctly', function () {
       const queue = createBinhdrQueue();
       queue.addCommand([Buffer.from('SET'), Buffer.from('key'), Buffer.from('value')]);
@@ -2148,9 +2357,9 @@ describe('Chunking scenarios (table-driven)', function () {
     it(tc.name, async function () {
       const queue = createBinhdrQueue();
       const promise = queue.addCommand(['PING']);
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
 
-      const frame = createBinhdrFrame(tc.payload);
+      const frame = createBinhdrFrame(tc.payload, 1, decodeOutgoingHeader(writes[0]).clientIdx);
       const chunks = tc.chunk(frame);
 
       for (const chunk of chunks) {
@@ -2202,11 +2411,11 @@ describe('Stress scenarios (table-driven)', function () {
       for (let i = 0; i < tc.commandCount; i++) {
         promises.push(queue.addCommand(['PING']));
       }
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
 
       // Send all responses
-      const payload = tc.payload();
-      const allFrames = createMultipleFrames(tc.commandCount, payload);
+      const payloads = Array.from({ length: tc.commandCount }, () => tc.payload());
+      const allFrames = Buffer.concat(responseFramesForWrites(writes, payloads));
       queue.processIncomingData(allFrames);
 
       const results = await Promise.all(promises);
@@ -2253,11 +2462,11 @@ describe('Error scenarios (table-driven)', function () {
     it(tc.name, async function () {
       const queue = createBinhdrQueue();
       const promises = tc.commands.map(cmd => queue.addCommand(cmd));
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
 
       // Send responses
-      for (const resp of tc.responses) {
-        queue.processIncomingData(createBinhdrFrame(resp));
+      for (const frame of responseFramesForWrites(writes, tc.responses)) {
+        queue.processIncomingData(frame);
       }
 
       let errorCount = 0;
@@ -2302,9 +2511,9 @@ describe('Multi-frame chunking scenarios (table-driven)', function () {
     it(tc.name, async function () {
       const queue = createBinhdrQueue();
       const promises = tc.payloads.map(() => queue.addCommand(['PING']));
-      for (const _ of queue.commandsToWrite()) {}
+      const writes = collectYielded(queue);
 
-      const frames = tc.payloads.map(p => createBinhdrFrame(p));
+      const frames = responseFramesForWrites(writes, tc.payloads);
       const combined = Buffer.concat(frames);
 
       let chunks: Buffer[];

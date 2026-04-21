@@ -3,9 +3,16 @@ import { describe, it, beforeEach, afterEach } from 'mocha';
 import { once } from 'node:events';
 import net from 'node:net';
 import { createClient, RedisClientType } from '../../index';
-import { createBinhdrResponse, assertStats, type ExpectedStats } from './test-utils';
-import { RequestHeaderDecoder } from './generated/request-header-codec';
+import {
+  createBinhdrFrame,
+  assertStats,
+  parseRequestFrames,
+  type ExpectedStats,
+  type ParsedRequestFrame,
+} from './test-utils';
+import { RequestHeaderEncoder } from './generated/request-header-codec';
 import type { BinaryHeaderStats } from './stats';
+import { calculateSlot } from './new-slot-calulator';
 
 /**
  * End-to-end tests for binary headers statistics collection.
@@ -21,28 +28,49 @@ interface ServerStats {
   totalRequests: number;
   totalCommands: number;
   batchSizes: number[];
+  frames: ParsedRequestFrame[];
 }
 
-function parseMultipleRequests(data: Buffer): Array<{ commandCount: number; length: number }> {
-  const results: Array<{ commandCount: number; length: number }> = [];
-  let offset = 0;
-
-  while (offset < data.length) {
-    const remaining = data.subarray(offset);
-    if (remaining.length >= RequestHeaderDecoder.ENCODED_LENGTH &&
-        remaining[0] === RequestHeaderDecoder.designatorConstantValue()) {
-      const decoder = new RequestHeaderDecoder();
-      decoder.wrap(remaining, 0);
-      if (decoder.isValid()) {
-        const payloadLen = decoder.length();
-        results.push({ commandCount: decoder.commandCount(), length: payloadLen });
-        offset += RequestHeaderDecoder.ENCODED_LENGTH + payloadLen;
-        continue;
-      }
-    }
-    break;
+function maybeKey(command: string[]): string | undefined {
+  switch (command[0].toUpperCase()) {
+    case 'SET':
+    case 'GET':
+    case 'INCR':
+      return command[1];
+    default:
+      return undefined;
   }
-  return results;
+}
+
+function assertFrameMatchesProtocol(frame: ParsedRequestFrame): void {
+  if (frame.type === 'raw') {
+    assert.equal(frame.commands.length >= 1, true, 'raw request should contain at least one command');
+    return;
+  }
+
+  assert.equal(frame.commands.length, frame.header.commandCount, 'commandCount should match parsed RESP commands');
+  assert.equal(frame.payload.length, frame.header.length, 'payload length should match binary header');
+
+  let expectedSlot: number | undefined;
+  for (const command of frame.commands) {
+    const key = maybeKey(command);
+    if (key === undefined) {
+      continue;
+    }
+
+    const slot = calculateSlot(key);
+    if (expectedSlot === undefined) {
+      expectedSlot = slot;
+    } else {
+      assert.equal(slot, expectedSlot, 'all keyed commands in one frame should share the same slot');
+    }
+  }
+
+  assert.equal(
+    frame.header.slot,
+    expectedSlot ?? RequestHeaderEncoder.slotNullValue(),
+    'binary header slot should match parsed command keys'
+  );
 }
 
 describe('Binary Headers Stats E2E', function () {
@@ -70,13 +98,19 @@ describe('Binary Headers Stats E2E', function () {
   function createMockServer(): net.Server {
     return net.createServer((socket) => {
       socket.on('data', (data) => {
-        const requests = parseMultipleRequests(data);
+        const requests = parseRequestFrames(data);
         for (const req of requests) {
+          serverStats.frames.push(req);
+          assertFrameMatchesProtocol(req);
           serverStats.totalRequests++;
-          serverStats.totalCommands += req.commandCount;
-          serverStats.batchSizes.push(req.commandCount);
-          for (let i = 0; i < req.commandCount; i++) {
-            socket.write(createBinhdrResponse('+OK\r\n'));
+          serverStats.totalCommands += req.commands.length;
+          serverStats.batchSizes.push(req.commands.length);
+          for (const _command of req.commands) {
+            socket.write(
+              req.type === 'binary'
+                ? createBinhdrFrame(Buffer.from('+OK\r\n'), 1, req.header.clientIdx)
+                : '+OK\r\n'
+            );
           }
         }
       });
@@ -102,7 +136,7 @@ describe('Binary Headers Stats E2E', function () {
 
   beforeEach(async function () {
     port = await getFreePort();
-    serverStats = { totalRequests: 0, totalCommands: 0, batchSizes: [] };
+    serverStats = { totalRequests: 0, totalCommands: 0, batchSizes: [], frames: [] };
     server = createMockServer();
     await once(server.listen(port), 'listening');
   });

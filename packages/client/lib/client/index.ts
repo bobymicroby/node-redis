@@ -43,6 +43,11 @@ export interface BinaryHeadersOptions {
   timer?: BinaryHeadersTimerConfig | false;
   maxCommandCount?: number;
   maxPayloadLength?: number;
+  /**
+   * Validate that inbound reply framing matches the packed requests sent on
+   * this connection. Default: true.
+   */
+  validateReplyStream?: boolean;
   'stats-collector'?: 'noop' | 'enabled';
   getStats?: () => BinaryHeaderStats;
 }
@@ -752,6 +757,7 @@ export default class RedisClient<
           },
         },
         statsCounter,
+        validateReplyStream: binaryHeadersOpts.validateReplyStream,
       });
 
       return new RedisCommandsQueue(

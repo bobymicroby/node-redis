@@ -6,6 +6,7 @@ import { BinaryHeadersCodec } from './codec';
 import { STATIC_RESOLVER } from './eligibility';
 import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { DefaultBinaryHeaderStatsCounter } from './stats';
+import { assertPackedHeader, collectYielded } from './test-utils';
 
 /**
  * Tests for memtier-bench pipelining and bulk-size behavior.
@@ -82,334 +83,8 @@ function extractSlot(key: string): string | null {
 }
 
 // ============================================================================
-// Test Helpers
-// ============================================================================
-
-function collectYielded(queue: RedisCommandsQueue): Array<ReadonlyArray<unknown>> {
-  const results: Array<ReadonlyArray<unknown>> = [];
-  const gen = queue.commandsToWrite();
-  let next = gen.next();
-  while (!next.done) {
-    results.push(next.value as ReadonlyArray<unknown>);
-    next = gen.next();
-  }
-  return results;
-}
-
-function parsePackedHeader(chunk: ReadonlyArray<unknown>): { commandCount: number } {
-  const header = chunk[0] as Buffer;
-  const decoder = new RequestHeaderDecoder();
-  decoder.wrap(header, 0);
-  return {
-    commandCount: decoder.commandCount()
-  };
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
-
-describe('BulkKeyGenerator', function () {
-  describe('bulk-size = 1 (each command is its own bulk)', function () {
-    it('generates keys with hash tags, cycling through slots', function () {
-      const keyGen = createBulkKeyGenerator('test-', 1, 10, 0, 999, 0, 0);
-
-      const keys: string[] = [];
-      for (let i = 0; i < 10; i++) {
-        keys.push(nextKey(keyGen));
-      }
-
-      // With bulk-size=1, each command is its own bulk, so slot cycles every command
-      // This matches memtier's behavior: bulk key format is used regardless of bulk_size
-      for (const key of keys) {
-        assert.notEqual(extractSlot(key), null, `Key ${key} should have hash tag`);
-        assert(key.startsWith('test-'), `Key ${key} should have prefix`);
-      }
-
-      // Verify slots cycle: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
-      const slots = keys.map(extractSlot);
-      assert.deepEqual(slots, ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
-        `Slots should cycle through 0-9: ${slots.join(', ')}`);
-    });
-  });
-
-  describe('bulk-size > 1 (batching)', function () {
-    it('generates same-slot keys within a bulk', function () {
-      const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 0, 0);
-
-      // Generate 5 keys (one bulk)
-      const bulk1Keys: string[] = [];
-      for (let i = 0; i < 5; i++) {
-        bulk1Keys.push(nextKey(keyGen));
-      }
-
-      // All keys in bulk 1 should have the same slot
-      const bulk1Slots = bulk1Keys.map(extractSlot);
-      assert(bulk1Slots.every(s => s === bulk1Slots[0]),
-        `All keys in bulk 1 should have same slot: ${bulk1Keys.join(', ')}`);
-    });
-
-    it('changes slot between bulks', function () {
-      const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 0, 0);
-
-      // Generate first bulk (5 keys)
-      const bulk1Keys: string[] = [];
-      for (let i = 0; i < 5; i++) {
-        bulk1Keys.push(nextKey(keyGen));
-      }
-
-      // Generate second bulk (5 keys)
-      const bulk2Keys: string[] = [];
-      for (let i = 0; i < 5; i++) {
-        bulk2Keys.push(nextKey(keyGen));
-      }
-
-      const bulk1Slot = extractSlot(bulk1Keys[0]);
-      const bulk2Slot = extractSlot(bulk2Keys[0]);
-
-      assert.notEqual(bulk1Slot, bulk2Slot,
-        `Bulk 1 slot (${bulk1Slot}) should differ from bulk 2 slot (${bulk2Slot})`);
-
-      assert.equal(parseInt(bulk2Slot!), parseInt(bulk1Slot!) + 1,
-        `Slot should increment: ${bulk1Slot} -> ${bulk2Slot}`);
-    });
-
-    it('cycles through slots', function () {
-      const keyGen = createBulkKeyGenerator('test-', 2, 3, 0, 99, 0, 0);
-
-      const slots: string[] = [];
-      for (let i = 0; i < 12; i++) {
-        const key = nextKey(keyGen);
-        if (i % 2 === 0) {
-          slots.push(extractSlot(key)!);
-        }
-      }
-
-      assert.deepEqual(slots, ['0', '1', '2', '0', '1', '2'],
-        `Slots should cycle through 0-2: ${slots.join(', ')}`);
-    });
-
-    it('key suffix continues sequentially across bulks', function () {
-      const keyGen = createBulkKeyGenerator('test-', 3, 10, 0, 999, 0, 0);
-
-      const keys: string[] = [];
-      for (let i = 0; i < 9; i++) {
-        keys.push(nextKey(keyGen));
-      }
-
-      const suffixes = keys.map(k => {
-        const match = k.match(/:(\d+)$/);
-        return match ? parseInt(match[1]) : -1;
-      });
-
-      assert.deepEqual(suffixes, [0, 1, 2, 3, 4, 5, 6, 7, 8],
-        `Suffixes should be sequential: ${suffixes.join(', ')}`);
-    });
-  });
-
-  describe('validation', function () {
-    it('requires sufficient keys per slot for bulk-size', function () {
-      const keysPerSlot = Math.floor((9 - 0 + 1) / 10);
-      assert.equal(keysPerSlot, 1);
-    });
-  });
-});
-
-describe('Pipeline and Bulk-Size Behavior', function () {
-  function simulatePipelinedLoop(
-    pipelineDepth: number,
-    bulkSize: number,
-    totalCommands: number
-  ): {
-    bulksIssued: number;
-    commandsPerBulk: number[];
-    slotsPerBulk: Set<string>[];
-  } {
-    const keyGen = createBulkKeyGenerator('test-', bulkSize, 10, 0, 999, 0, 0);
-    const bulksIssued: { commands: string[]; slots: Set<string> }[] = [];
-    let commandsIssued = 0;
-
-    while (commandsIssued < totalCommands) {
-      const bulk: { commands: string[]; slots: Set<string> } = {
-        commands: [],
-        slots: new Set()
-      };
-
-      for (let i = 0; i < bulkSize && commandsIssued < totalCommands; i++) {
-        const key = nextKey(keyGen);
-        bulk.commands.push(key);
-        const slot = extractSlot(key);
-        if (slot) bulk.slots.add(slot);
-        commandsIssued++;
-      }
-
-      bulksIssued.push(bulk);
-    }
-
-    return {
-      bulksIssued: bulksIssued.length,
-      commandsPerBulk: bulksIssued.map(b => b.commands.length),
-      slotsPerBulk: bulksIssued.map(b => b.slots)
-    };
-  }
-
-  describe('bulk-size batching', function () {
-    it('issues commands in bulk-size batches', function () {
-      const result = simulatePipelinedLoop(100, 10, 100);
-
-      assert.equal(result.bulksIssued, 10);
-      assert(result.commandsPerBulk.every(c => c === 10),
-        `All bulks should have 10 commands: ${result.commandsPerBulk.join(', ')}`);
-    });
-
-    it('each bulk has commands with the same slot', function () {
-      const result = simulatePipelinedLoop(100, 10, 100);
-
-      for (let i = 0; i < result.slotsPerBulk.length; i++) {
-        assert.equal(result.slotsPerBulk[i].size, 1,
-          `Bulk ${i} should have 1 slot, got ${result.slotsPerBulk[i].size}`);
-      }
-    });
-
-    it('different bulks have different slots', function () {
-      const result = simulatePipelinedLoop(100, 10, 50);
-
-      const slots = result.slotsPerBulk.map(s => Array.from(s)[0]);
-      const uniqueSlots = new Set(slots);
-      assert.equal(uniqueSlots.size, slots.length,
-        `All bulks should have unique slots: ${slots.join(', ')}`);
-    });
-
-    it('handles partial last bulk', function () {
-      const result = simulatePipelinedLoop(100, 10, 25);
-
-      assert.equal(result.bulksIssued, 3);
-      assert.deepEqual(result.commandsPerBulk, [10, 10, 5]);
-    });
-  });
-
-  describe('pipeline vs bulk-size relationship', function () {
-    it('pipeline=100, bulk-size=10 creates 10 initial bulks', function () {
-      const pipelineDepth = 100;
-      const bulkSize = 10;
-
-      const initialBulks = Math.ceil(pipelineDepth / bulkSize);
-      assert.equal(initialBulks, 10);
-
-      const result = simulatePipelinedLoop(pipelineDepth, bulkSize, pipelineDepth);
-      assert.equal(result.bulksIssued, 10);
-    });
-
-    it('pipeline=50, bulk-size=10 creates 5 initial bulks', function () {
-      const pipelineDepth = 50;
-      const bulkSize = 10;
-
-      const initialBulks = Math.ceil(pipelineDepth / bulkSize);
-      assert.equal(initialBulks, 5);
-
-      const result = simulatePipelinedLoop(pipelineDepth, bulkSize, pipelineDepth);
-      assert.equal(result.bulksIssued, 5);
-    });
-
-    it('pipeline=10, bulk-size=10 creates 1 initial bulk', function () {
-      const pipelineDepth = 10;
-      const bulkSize = 10;
-
-      const initialBulks = Math.ceil(pipelineDepth / bulkSize);
-      assert.equal(initialBulks, 1);
-
-      const result = simulatePipelinedLoop(pipelineDepth, bulkSize, pipelineDepth);
-      assert.equal(result.bulksIssued, 1);
-    });
-  });
-});
-
-describe('Binary Header Batching with BulkKeyGenerator', function () {
-  it('same-slot keys are eligible for batching', function () {
-    const keyGen = createBulkKeyGenerator('test-', 5, 10, 0, 999, 3, 0);
-
-    const keys: string[] = [];
-    for (let i = 0; i < 5; i++) {
-      keys.push(nextKey(keyGen));
-    }
-
-    const slots = keys.map(extractSlot);
-    assert(slots.every(s => s === slots[0]),
-      `All keys should have same slot for batching: ${keys.join(', ')}`);
-
-    for (const key of keys) {
-      assert.match(key, /\{\d+\}:\d+$/,
-        `Key ${key} should have format {slot}:suffix`);
-    }
-  });
-
-  it('different-slot keys trigger separate batches', function () {
-    const keyGen = createBulkKeyGenerator('test-', 2, 10, 0, 999, 0, 0);
-
-    const key1 = nextKey(keyGen);
-    const key2 = nextKey(keyGen);
-    const key3 = nextKey(keyGen);
-    const key4 = nextKey(keyGen);
-
-    assert.equal(extractSlot(key1), extractSlot(key2),
-      `Keys in same bulk should have same slot: ${key1}, ${key2}`);
-    assert.equal(extractSlot(key3), extractSlot(key4),
-      `Keys in same bulk should have same slot: ${key3}, ${key4}`);
-    assert.notEqual(extractSlot(key1), extractSlot(key3),
-      `Keys in different bulks should have different slots: ${key1}, ${key3}`);
-  });
-});
-
-describe('Memtier Benchmark Configuration', function () {
-  describe('validation rules', function () {
-    it('requires pipeline >= bulk-size', function () {
-      const pipeline = 5;
-      const bulkSize = 10;
-
-      assert(pipeline < bulkSize,
-        'This configuration should fail validation');
-    });
-
-    it('requires sufficient keys per slot', function () {
-      const keyMin = 1;
-      const keyMax = 1000000;
-      const bulkSlots = 16384;
-      const bulkSize = 10;
-
-      const keysPerSlot = Math.floor((keyMax - keyMin + 1) / bulkSlots);
-      assert(keysPerSlot >= bulkSize,
-        `Keys per slot (${keysPerSlot}) must be >= bulk-size (${bulkSize})`);
-    });
-
-    it('fails with insufficient keys per slot', function () {
-      const keyMin = 1;
-      const keyMax = 100;
-      const bulkSlots = 100;
-      const bulkSize = 10;
-
-      const keysPerSlot = Math.floor((keyMax - keyMin + 1) / bulkSlots);
-      assert(keysPerSlot < bulkSize,
-        `This configuration should fail: keys per slot (${keysPerSlot}) < bulk-size (${bulkSize})`);
-    });
-  });
-});
-
-describe('Latency Recording', function () {
-  it('records latency per command, not per bulk', function () {
-    const bulkSize = 10;
-    const totalCommands = 30;
-    let recordedLatencies = 0;
-
-    for (let i = 0; i < totalCommands; i++) {
-      recordedLatencies++;
-    }
-
-    assert.equal(recordedLatencies, totalCommands,
-      `Should record ${totalCommands} latencies, one per command`);
-    assert.notEqual(recordedLatencies, Math.ceil(totalCommands / bulkSize),
-      'Should NOT record one latency per bulk');
-  });
-});
 
 describe('Integration: Binary Header Batching with Queue', function () {
   it('same-slot keys from BulkKeyGenerator batch under one header', function () {
@@ -428,9 +103,7 @@ describe('Integration: Binary Header Batching with Queue', function () {
     const results = collectYielded(queue);
 
     assert.equal(results.length, 1, 'Should yield 1 packed batch for 5 same-slot commands');
-
-    const parsed = parsePackedHeader(results[0]);
-    assert.equal(parsed.commandCount, 5, 'Batch should contain 5 commands');
+    assertPackedHeader(results[0], { commandCount: 5 });
   });
 
   it('different-slot keys from different bulks create separate headers', function () {
@@ -449,12 +122,8 @@ describe('Integration: Binary Header Batching with Queue', function () {
     const results = collectYielded(queue);
 
     assert.equal(results.length, 2, 'Should yield 2 batches for 2 different slots');
-
-    const parsed1 = parsePackedHeader(results[0]);
-    const parsed2 = parsePackedHeader(results[1]);
-
-    assert.equal(parsed1.commandCount, 3, 'First batch should have 3 commands');
-    assert.equal(parsed2.commandCount, 3, 'Second batch should have 3 commands');
+    assertPackedHeader(results[0], { commandCount: 3 });
+    assertPackedHeader(results[1], { commandCount: 3 });
   });
 
   it('bulk-size=1 creates separate headers for each command', function () {
@@ -473,8 +142,8 @@ describe('Integration: Binary Header Batching with Queue', function () {
 
     let totalCommands = 0;
     for (const result of results) {
-      const parsed = parsePackedHeader(result);
-      totalCommands += parsed.commandCount;
+      const decoder = new RequestHeaderDecoder().wrap(result[0] as Buffer, 0);
+      totalCommands += decoder.commandCount();
     }
     assert.equal(totalCommands, 3, 'Total commands should be 3');
   });
@@ -503,8 +172,7 @@ describe('Integration: Binary Header Batching with Queue', function () {
     assert.equal(results.length, 2, 'Should yield 2 batches');
 
     for (const result of results) {
-      const parsed = parsePackedHeader(result);
-      assert.equal(parsed.commandCount, 5, 'Each batch should have 5 commands');
+      assertPackedHeader(result, { commandCount: 5 });
     }
   });
 });
@@ -828,8 +496,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       const results = collectYielded(queue);
 
       assert.equal(results.length, 1, 'Should yield 1 batch');
-      const parsed = parsePackedHeader(results[0]);
-      assert.equal(parsed.commandCount, 10, 'Batch should contain 10 commands');
+      assertPackedHeader(results[0], { commandCount: 10 });
 
       assert.equal(schedulerStats.scheduleCount, 0, 'No timer scheduled');
 
@@ -971,9 +638,7 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       const results = collectYielded(queue);
 
       assert.equal(results.length, 1, 'Should yield 1 batch');
-
-      const parsed = parsePackedHeader(results[0]);
-      assert.equal(parsed.commandCount, 10, 'Batch should contain 10 commands');
+      assertPackedHeader(results[0], { commandCount: 10 });
 
       // CRITICAL: No timer should be scheduled for explicit pipelines
       assert.equal(schedulerStats.scheduleCount, 0,

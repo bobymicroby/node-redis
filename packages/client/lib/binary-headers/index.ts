@@ -58,6 +58,7 @@ export type {
   CommandArguments,
   SocketChunk,
   SocketChunks,
+  DecodedValueKind,
   WriteHandler,
   WriteSink,
   WriteBatch,

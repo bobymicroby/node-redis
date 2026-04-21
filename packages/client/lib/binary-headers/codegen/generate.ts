@@ -8,7 +8,7 @@ function printUsage(): void {
   console.log('Usage: npx tsx generate.ts <schema-file>');
   console.log('');
   console.log('Examples:');
-  console.log('  npx tsx generate.ts ../schemas/v1.ts');
+  console.log('  npx tsx generate.ts ../schemas/v0.ts');
   console.log('  npx tsx generate.ts ./my-custom-schema.ts');
   console.log('');
   console.log('The schema file must export a ProtocolSchema object.');

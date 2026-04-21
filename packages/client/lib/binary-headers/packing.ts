@@ -159,6 +159,10 @@ export class CommandPacker {
     return this.#respCount;
   }
 
+  get maxPayloadLength(): number {
+    return this.#maxPayloadLength;
+  }
+
   #getFlushReason(count: number, slot: number, payloadLength: number): FlushReason | null {
     if (count >= this.#maxCommandCount) {
       return FlushReason.MAX_COMMANDS;

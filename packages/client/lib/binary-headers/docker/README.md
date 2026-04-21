@@ -10,7 +10,7 @@ A containerized version of the memtier-like benchmark tool for node-redis.
 ./packages/client/lib/binary-headers/docker/build.sh
 
 # Or with a custom tag
-./packages/client/lib/binary-headers/docker/build.sh memtier-bench:v1.0
+./packages/client/lib/binary-headers/docker/build.sh memtier-bench:local
 ```
 
 ### Using docker build directly

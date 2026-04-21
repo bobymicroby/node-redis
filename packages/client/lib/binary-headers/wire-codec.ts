@@ -120,11 +120,19 @@ export interface InboundCodec {
   decode(chunk: Buffer, next: (data: Buffer) => void): void;
 
   /**
+   * Optional hook invoked by the queue when the downstream RESP decoder
+   * classifies a decoded top-level value.
+   */
+  onDecodedValue?(kind: DecodedValueKind): void;
+
+  /**
    * Clear codec-internal state (e.g. partial frame buffers)
    * when the queue decoder is reset due to reconnect/error recovery.
    */
   reset(): void;
 }
+
+export type DecodedValueKind = 'reply' | 'push';
 
 /**
  * Paired inbound/outbound transport codecs used by the command queue.

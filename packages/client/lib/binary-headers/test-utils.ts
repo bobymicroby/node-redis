@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { ResponseHeaderEncoder } from './generated/response-header-codec';
-import { RequestHeaderDecoder } from './generated/request-header-codec';
+import { RequestHeaderDecoder, RequestHeaderEncoder } from './generated/request-header-codec';
 import { Decoder } from '../RESP/decoder';
 import type { RespVersions } from '../RESP/types';
 import RedisCommandsQueue, { type CommandOptions } from '../client/commands-queue';
@@ -68,6 +68,85 @@ export function createMultipleFrames(count: number, respPayload: Buffer): Buffer
   return Buffer.concat(frames);
 }
 
+export interface ParsedRespRequestFrame {
+  readonly type: 'raw';
+  readonly payload: Buffer;
+  readonly commands: string[][];
+}
+
+export interface ParsedBinhdrRequestFrame {
+  readonly type: 'binary';
+  readonly payload: Buffer;
+  readonly commands: string[][];
+  readonly header: {
+    commandCount: number;
+    length: number;
+    slot: number;
+    clientIdx: number;
+  };
+}
+
+export type ParsedRequestFrame = ParsedRespRequestFrame | ParsedBinhdrRequestFrame;
+
+export function parseRespCommandStrings(data: string | Buffer): string[][] {
+  return parseRespCommands(data).map(command =>
+    (command as unknown[]).map(value => value instanceof Buffer ? value.toString() : String(value))
+  );
+}
+
+export function parseSingleRequestFrame(data: Buffer): ParsedRequestFrame {
+  if (
+    data.length >= RequestHeaderDecoder.ENCODED_LENGTH &&
+    data[0] === RequestHeaderEncoder.designatorConstantValue()
+  ) {
+    const decoder = new RequestHeaderDecoder().wrap(data, 0);
+    if (decoder.isValid()) {
+      const length = decoder.length();
+      const payload = data.subarray(
+        RequestHeaderDecoder.ENCODED_LENGTH,
+        RequestHeaderDecoder.ENCODED_LENGTH + length
+      );
+      return {
+        type: 'binary',
+        payload,
+        commands: parseRespCommandStrings(payload),
+        header: {
+          commandCount: decoder.commandCount(),
+          length,
+          slot: decoder.slot(),
+          clientIdx: decoder.clientIdx(),
+        },
+      };
+    }
+  }
+
+  return {
+    type: 'raw',
+    payload: data,
+    commands: parseRespCommandStrings(data),
+  };
+}
+
+export function parseRequestFrames(data: Buffer): ParsedRequestFrame[] {
+  const frames: ParsedRequestFrame[] = [];
+  let offset = 0;
+
+  while (offset < data.length) {
+    const remaining = data.subarray(offset);
+    const frame = parseSingleRequestFrame(remaining);
+    frames.push(frame);
+
+    if (frame.type === 'binary') {
+      offset += RequestHeaderDecoder.ENCODED_LENGTH + frame.header.length;
+      continue;
+    }
+
+    break;
+  }
+
+  return frames;
+}
+
 // ============================================================================
 // RESP Parsing Utilities
 // ============================================================================
@@ -124,7 +203,7 @@ export function collectYieldedParsed(queue: { commandsToWrite(): Generator<Reado
  */
 export function assertPackedHeader(
   packed: ReadonlyArray<unknown> | null,
-  expected: { commandCount?: number; slot?: number }
+  expected: { commandCount?: number; slot?: number; clientIdx?: number }
 ): void {
   assert.ok(packed !== null, 'Expected packed data to be non-null');
   assert.ok(packed[0] instanceof Buffer, 'Expected first element to be a Buffer');
@@ -137,6 +216,9 @@ export function assertPackedHeader(
   }
   if (expected.slot !== undefined) {
     assert.equal(decoder.slot(), expected.slot);
+  }
+  if (expected.clientIdx !== undefined) {
+    assert.equal(decoder.clientIdx(), expected.clientIdx);
   }
 }
 
@@ -447,7 +529,10 @@ export interface QueueFactoryOptions {
   maxLength?: number | null;
   onShardedChannelMoved?: () => void;
   resolver?: EligibilityResolver;
-  onProtocolError?: (requestId: number) => void;
+  onProtocolError?: (clientIdx: number) => void;
+  maxCommandCount?: number;
+  maxPayloadLength?: number;
+  validateReplyStream?: boolean;
   timer?: {
     maxWaitMs: number;
     scheduler?: Scheduler;
@@ -466,15 +551,20 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
     onShardedChannelMoved = () => {},
     resolver,
     onProtocolError,
+    maxCommandCount,
+    maxPayloadLength,
+    validateReplyStream,
     timer,
     statsCounter,
   } = options;
 
-  const codec = (resolver || onProtocolError || statsCounter || timer)
+  const codec = (resolver || onProtocolError || statsCounter || timer || validateReplyStream !== undefined)
     ? new BinaryHeadersCodec({
         outbound: resolver || timer
           ? {
               resolver,
+              maxCommandCount,
+              maxPayloadLength,
               timer: timer
                 ? { maxWaitMs: timer.maxWaitMs, scheduler: timer.scheduler ?? createTimeoutScheduler() }
                 : undefined
@@ -482,6 +572,7 @@ function createCodecQueue(options: QueueFactoryOptions = {}): TestableQueue {
           : undefined,
         inbound: onProtocolError ? { onProtocolError: (header) => onProtocolError(header.clientIdx) } : undefined,
         statsCounter,
+        validateReplyStream,
       })
     : undefined;
 

@@ -8,7 +8,6 @@ Schema-driven code generation for the binary headers wire protocol, following SB
 binary-headers/
 ├── schemas/              # Protocol definitions
 │   ├── v0.ts             # v0 protocol schema (0x80 format)
-│   └── v1.ts             # v1 protocol schema (0xAE format, current)
 ├── codegen/              # Generator code
 │   ├── generate.ts       # CLI entry point
 │   ├── flyweight-generator.ts  # SBE-style codec generation
@@ -23,11 +22,11 @@ binary-headers/
 ## Quick Start
 
 ```bash
-# Generate code using the default schema (v1)
+# Generate code using the default schema (v0)
 npm run generate:binhdr --workspace=@redis/client
 
 # Generate from a specific schema file
-npx tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v1.ts
+npx tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v0.ts
 ```
 
 ## Generated Files
@@ -38,9 +37,9 @@ npx tsx lib/binary-headers/codegen/generate.ts lib/binary-headers/schemas/v1.ts
 | `request-header-codec.ts` | `RequestHeaderEncoder` and `RequestHeaderDecoder` classes |
 | `response-header-codec.ts` | `ResponseHeaderEncoder` and `ResponseHeaderDecoder` classes |
 
-## Protocol Versions
+## Protocol Version
 
-### v0 - Original Format (0x80)
+### v0 - Binary Headers Format (0x80)
 
 10-byte request header, 8-byte response header.
 
@@ -58,52 +57,31 @@ Response (8 bytes):
 └──────────┴────────┴───────┴───────────┘
 ```
 
-### v1 - DMC Proxy Format (0xAE)
-
-16-byte request and response headers with version field and request ID.
-
-```
-Request (16 bytes):
-┌──────────┬─────────┬──────┬────────┬──────┬───────────┬──────────┐
-│ MAGIC    │ VERSION │ SLOT │ LENGTH │ NCMD │ REQUEST_ID│ RESERVED │
-│ 0xAE     │ 0x01    │ 2B BE│ 4B BE  │ 1B   │ 4B BE     │ 3B       │
-└──────────┴─────────┴──────┴────────┴──────┴───────────┴──────────┘
-
-Response (16 bytes):
-┌──────────┬─────────┬──────────┬────────┬───────┬───────────┬──────────┐
-│ MAGIC    │ VERSION │ RESERVED │ LENGTH │ FLAGS │ REQUEST_ID│ RESERVED │
-│ 0xAE     │ 0x01    │ 2B       │ 4B BE  │ 1B    │ 4B BE     │ 3B       │
-└──────────┴─────────┴──────────┴────────┴───────┴───────────┴──────────┘
-```
-
 ## Defining a Schema
 
 ```typescript
 import { protocol, message, fixed, field, bitfield } from '../codegen/schema';
 
-export const BinaryHeadersProtocolV1 = protocol(
+export const BinaryHeadersProtocolV0 = protocol(
   'BinaryHeaders',
-  1,
-  [], // constants array (typically empty - derived from fields)
+  0,
   [
-    message('RequestHeader', 16, [
-      fixed('designator', 'uint8', 0, 0xAE),
-      fixed('version', 'uint8', 1, 0x01),
-      field('slot', 'uint16', 2, { endian: 'big', min: 0, max: 0x3FFF, nullValue: 0xFFFF }),
-      field('length', 'uint32', 4, { endian: 'big' }),
-      field('commandCount', 'uint8', 8, { min: 1, max: 0x7F }),
-      field('requestId', 'uint32', 9, { endian: 'big' }),
+    message('RequestHeader', 10, [
+      fixed('designator', 'uint8', 0, 0x80),
+      field('length', 'uint32', 1, { endian: 'big', min: 0, max: 0x7FFFFFFF }),
+      field('commandCount', 'uint8', 5, { min: 1, max: 0x7F }),
+      field('slot', 'uint16', 6, { endian: 'big', min: 0, max: 0x3FFF, nullValue: 0xFFFF }),
+      field('clientIdx', 'uint16', 8, { endian: 'big', min: 0, max: 0xFFFF }),
     ], 'Request header description'),
 
-    message('ResponseHeader', 16, [
-      fixed('designator', 'uint8', 0, 0xAE),
-      fixed('version', 'uint8', 1, 0x01),
-      field('length', 'uint32', 4, { endian: 'big' }),
-      bitfield('flags', 8, [
+    message('ResponseHeader', 8, [
+      fixed('designator', 'uint8', 0, 0x80),
+      field('length', 'uint32', 1, { endian: 'big', min: 0, max: 0x7FFFFFFF }),
+      bitfield('flags', 5, [
         { name: 'commandCount', bits: 7, mask: 0x7F },
         { name: 'protocolError', bits: 1, mask: 0x80 },
       ]),
-      field('requestId', 'uint32', 9, { endian: 'big' }),
+      field('clientIdx', 'uint16', 6, { endian: 'big', min: 0, max: 0xFFFF }),
     ], 'Response header description'),
   ],
   'Protocol description'
@@ -130,8 +108,7 @@ export const BinaryHeadersProtocolV1 = protocol(
 A field with a constant value (e.g., magic byte, version).
 
 ```typescript
-fixed('designator', 'uint8', 0, 0xAE)
-fixed('version', 'uint8', 1, 0x01, { sinceVersion: 0 })
+fixed('designator', 'uint8', 0, 0x80)
 ```
 
 #### `field(name, type, offset, options?)`
@@ -139,7 +116,7 @@ fixed('version', 'uint8', 1, 0x01, { sinceVersion: 0 })
 A variable field with optional constraints.
 
 ```typescript
-field('slot', 'uint16', 2, { endian: 'big', min: 0, max: 0x3FFF, nullValue: 0xFFFF })
+field('slot', 'uint16', 6, { endian: 'big', min: 0, max: 0x3FFF, nullValue: 0xFFFF })
 ```
 
 Options:
@@ -153,7 +130,7 @@ Options:
 Multiple values packed into a single byte.
 
 ```typescript
-bitfield('flags', 8, [
+bitfield('flags', 5, [
   { name: 'commandCount', bits: 7, mask: 0x7F },
   { name: 'protocolError', bits: 1, mask: 0x80 },
 ])
@@ -165,22 +142,22 @@ bitfield('flags', 8, [
 
 ```typescript
 // Static one-shot encoding
-const buffer = RequestHeaderEncoder.allocateAndEncode(slot, length, commandCount, requestId);
+const buffer = RequestHeaderEncoder.allocateAndEncode(length, commandCount, slot, clientIdx);
 
 // Encode into existing buffer
-RequestHeaderEncoder.encodeInto(buffer, offset, slot, length, commandCount, requestId);
+RequestHeaderEncoder.encodeInto(buffer, offset, length, commandCount, slot, clientIdx);
 
 // Flyweight instance (reusable, zero-allocation per encode)
 const encoder = new RequestHeaderEncoder();
 encoder.wrapAndWrite(buffer, 0)
-  .slot(1234)
   .length(100)
   .commandCount(5)
-  .requestId(42);
+  .slot(1234)
+  .clientIdx(42);
 
 // Static metadata
-RequestHeaderEncoder.ENCODED_LENGTH;        // 16
-RequestHeaderEncoder.slotEncodingOffset();  // 2
+RequestHeaderEncoder.ENCODED_LENGTH;        // 10
+RequestHeaderEncoder.slotEncodingOffset();  // 6
 RequestHeaderEncoder.slotMaxValue();        // 0x3FFF
 RequestHeaderEncoder.slotNullValue();       // 0xFFFF
 ```
@@ -200,10 +177,10 @@ const decoder = new RequestHeaderDecoder();
 decoder.wrap(buffer, 0);
 
 if (decoder.isValid()) {
-  const slot = decoder.slot();
   const length = decoder.length();
   const commandCount = decoder.commandCount();
-  const requestId = decoder.requestId();
+  const slot = decoder.slot();
+  const clientIdx = decoder.clientIdx();
 }
 
 // Static helpers

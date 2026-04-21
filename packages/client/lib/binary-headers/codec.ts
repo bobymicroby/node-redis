@@ -5,15 +5,17 @@ import type {
   SocketChunk,
   CommandArguments,
   WriteBatch,
+  DecodedValueKind,
   WriteCommandMeta,
   WriteSink,
   Scheduler,
-  Cancellable
+  Cancellable,
 } from './wire-codec';
 import type { CommandToWrite } from '../client/commands-queue';
 import type { EligibilityResolver } from './eligibility';
 import { SLOT_INELIGIBLE, NOOP_RESOLVER } from './eligibility';
 import { CommandPacker, calculatePayloadLength as calcPayloadLength, type CommandPackerOptions } from './packing';
+import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { ResponseHeaderDecoder, type ResponseHeader as BinaryResponseHeader } from './generated/response-header-codec';
 import { FlushReason, disabledBinaryHeaderStatsCounter, type BinaryHeaderStatsCounter, type BinaryHeaderStats } from './stats';
 import {
@@ -60,6 +62,95 @@ export interface BinaryHeadersCodecOptions {
   readonly outbound?: BinaryHeadersOutboundOptions;
   readonly inbound?: BinaryHeadersInboundOptions;
   readonly statsCounter?: BinaryHeaderStatsCounter;
+  /**
+   * Validate that inbound reply framing matches the packed requests emitted on
+   * this connection. Default: true.
+   */
+  readonly validateReplyStream?: boolean;
+}
+
+interface PendingReplyGroup {
+  remaining: number;
+  clientIdx?: number;
+}
+
+class ReplyTracker {
+  readonly #groups: PendingReplyGroup[] = [];
+
+  expectRaw(commandCount: number = 1): void {
+    if (commandCount <= 0) return;
+    this.#groups.push({ remaining: commandCount });
+  }
+
+  expectBinary(commandCount: number, clientIdx: number): void {
+    if (commandCount <= 0) return;
+    this.#groups.push({ remaining: commandCount, clientIdx });
+  }
+
+  consumeBinaryHeader(header: BinaryResponseHeader): number {
+    const commandCount = header.commandCount;
+    if (commandCount === 0) {
+      const current = this.#groups[0];
+      if (current?.clientIdx !== undefined && current.clientIdx !== header.clientIdx) {
+        throw new Error(
+          `Received binary header with clientIdx=${header.clientIdx} while awaiting clientIdx=${current.clientIdx}`,
+        );
+      }
+      return 0;
+    }
+
+    const current = this.#groups[0];
+    if (current === undefined) {
+      throw new Error(
+        `Received binary header with clientIdx=${header.clientIdx} but no pending reply group exists`,
+      );
+    }
+
+    if (current.clientIdx === undefined) {
+      throw new Error(
+        `Received binary header with clientIdx=${header.clientIdx} before pending raw RESP replies completed`,
+      );
+    }
+
+    if (current.clientIdx !== header.clientIdx) {
+      throw new Error(
+        `Received binary header with clientIdx=${header.clientIdx} while awaiting clientIdx=${current.clientIdx}`,
+      );
+    }
+
+    if (commandCount > current.remaining) {
+      throw new Error(
+        `Received binary header with ${commandCount} replies for clientIdx=${header.clientIdx}, expected at most ${current.remaining}`,
+      );
+    }
+
+    current.remaining -= commandCount;
+    if (current.remaining === 0) {
+      this.#groups.shift();
+    }
+
+    return commandCount;
+  }
+
+  consumeStandaloneReply(): void {
+    const current = this.#groups[0];
+    if (current === undefined) {
+      throw new Error('Received reply but no pending reply group exists');
+    }
+
+    current.remaining--;
+    if (current.remaining < 0) {
+      throw new Error('Received more replies than expected for the current reply group');
+    }
+
+    if (current.remaining === 0) {
+      this.#groups.shift();
+    }
+  }
+
+  reset(): void {
+    this.#groups.length = 0;
+  }
 }
 
 /**
@@ -83,6 +174,7 @@ export interface BinaryHeadersCodecOptions {
 export class BinaryHeadersOutboundCodec implements OutboundCodec {
   readonly #resolver: EligibilityResolver;
   readonly #packer: CommandPacker;
+  readonly #replyTracker: ReplyTracker | null;
   readonly #statsCounter: BinaryHeaderStatsCounter;
   readonly #scheduler: Scheduler | null;
   readonly #maxWaitMs: number;
@@ -93,12 +185,15 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
   #pendingRequiresDrainAtEnd = false;
   #pendingFlush: Cancellable | null = null;
   #sink: WriteSink | null = null;
+  readonly #requestHeaderDecoder = new RequestHeaderDecoder();
 
   constructor(
     options: BinaryHeadersOutboundOptions = {},
-    statsCounter?: BinaryHeaderStatsCounter
+    statsCounter?: BinaryHeaderStatsCounter,
+    replyTracker?: ReplyTracker,
   ) {
     this.#statsCounter = statsCounter ?? disabledBinaryHeaderStatsCounter();
+    this.#replyTracker = replyTracker ?? null;
     this.#resolver = options.resolver ?? NOOP_RESOLVER;
     this.#scheduler = options.timer?.scheduler ?? null;
     this.#maxWaitMs = options.timer?.maxWaitMs ?? 0;
@@ -167,9 +262,10 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#cancelPendingFlush();
     const emittedCommands = this.#takeBufferedCommands();
     this.#resetPendingSegment();
+    this.#replyTracker?.expectBinary(emittedCommands.length, this.#binaryClientIdxFromPacked(packed));
     return {
       writes: [packed],
-      emittedCommands
+      emittedCommands,
     };
   }
 
@@ -183,8 +279,16 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     if (right === null) return left;
     return {
       writes: [...left.writes, ...right.writes],
-      emittedCommands: [...left.emittedCommands, ...right.emittedCommands]
+      emittedCommands: [...left.emittedCommands, ...right.emittedCommands],
     };
+  }
+
+  #binaryClientIdxFromPacked(packed: SocketChunk): number {
+    this.#requestHeaderDecoder.wrap(packed[0] as Buffer, 0);
+    if (!this.#requestHeaderDecoder.isValid()) {
+      throw new Error('Generated invalid binary header batch');
+    }
+    return this.#requestHeaderDecoder.clientIdx();
   }
 
   #pushEncoded(
@@ -215,21 +319,31 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     if (slot === SLOT_INELIGIBLE) {
       this.#statsCounter.recordIneligible();
       const pending = this.#flushBuffered(FlushReason.DRAIN);
+      this.#replyTracker?.expectRaw();
       if (pending === null) {
         return {
           writes: [encoded],
-          emittedCommands: [command]
+          emittedCommands: [command],
         };
       }
       return {
         writes: [...pending.writes, encoded],
-        emittedCommands: [...pending.emittedCommands, command]
+        emittedCommands: [...pending.emittedCommands, command],
       };
     }
 
-    this.#statsCounter.recordBatchedCommand();
-
     const payloadLength = byteLength ?? calcPayloadLength(encoded);
+    if (payloadLength > this.#packer.maxPayloadLength) {
+      const pending = this.#flushBuffered(FlushReason.DRAIN);
+      this.#replyTracker?.expectRaw();
+      const rawBatch: WriteBatch = {
+        writes: [encoded],
+        emittedCommands: [command],
+      };
+      return BinaryHeadersOutboundCodec.#mergeBatches(pending, rawBatch);
+    }
+
+    this.#statsCounter.recordBatchedCommand();
     const packed = this.#packer.add(encoded, slot, payloadLength);
     if (!packed) {
       this.#bufferedCommands.push(command);
@@ -240,11 +354,12 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#cancelPendingFlush();
     const emittedCommands = this.#takeBufferedCommands();
     this.#resetPendingSegment();
+    this.#replyTracker?.expectBinary(emittedCommands.length, this.#binaryClientIdxFromPacked(packed));
     this.#bufferedCommands.push(command);
     this.#markPendingSegment(meta);
     return {
       writes: [packed],
-      emittedCommands
+      emittedCommands,
     };
   }
 
@@ -353,13 +468,16 @@ const enum HeaderParseResult {
  */
 export class BinaryHeadersInboundCodec implements InboundCodec {
   readonly #headerDecoder = new ResponseHeaderDecoder();
+  readonly #replyTracker: ReplyTracker | null;
   readonly #onHeader: OnHeader | undefined;
   readonly #onProtocolError: OnProtocolError | undefined;
   readonly #plainFrameScanner = new PlainRespFrameScanner();
   #partial: Buffer | null = null;
   #payloadRemaining = 0;
+  #binaryPayloadReplyCount = 0;
 
-  constructor(options: BinaryHeadersInboundOptions = {}) {
+  constructor(options: BinaryHeadersInboundOptions = {}, replyTracker?: ReplyTracker) {
+    this.#replyTracker = replyTracker ?? null;
     this.#onHeader = options.onHeader;
     this.#onProtocolError = options.onProtocolError;
   }
@@ -368,10 +486,29 @@ export class BinaryHeadersInboundCodec implements InboundCodec {
     this.#decode(chunk, next);
   }
 
+  onDecodedValue(kind: DecodedValueKind): void {
+    if (this.#replyTracker === null) {
+      return;
+    }
+
+    if (kind === 'push') {
+      return;
+    }
+
+    if (this.#binaryPayloadReplyCount > 0) {
+      this.#binaryPayloadReplyCount--;
+      return;
+    }
+
+    this.#replyTracker.consumeStandaloneReply();
+  }
+
   reset(): void {
     this.#partial = null;
     this.#payloadRemaining = 0;
+    this.#binaryPayloadReplyCount = 0;
     this.#plainFrameScanner.reset();
+    this.#replyTracker?.reset();
   }
 
   #decode(chunk: Buffer, emit: (data: Buffer) => void): void {
@@ -442,6 +579,22 @@ export class BinaryHeadersInboundCodec implements InboundCodec {
     this.#payloadRemaining = this.#headerDecoder.length();
     this.#plainFrameScanner.reset();
 
+    if (this.#replyTracker !== null && (this.#onHeader !== undefined || this.#onProtocolError !== undefined)) {
+      const header = this.#headerDecoder.toObject();
+      this.#binaryPayloadReplyCount += this.#replyTracker.consumeBinaryHeader(header);
+      if (this.#onHeader !== undefined) {
+        this.#onHeader(header);
+      }
+      if (this.#onProtocolError !== undefined && header.protocolError) {
+        this.#onProtocolError(header);
+      }
+      return HeaderParseResult.CONTINUE;
+    }
+
+    if (this.#replyTracker !== null) {
+      this.#binaryPayloadReplyCount += this.#replyTracker.consumeBinaryHeader(this.#headerDecoder.toObject());
+    }
+
     if (this.#onHeader !== undefined || (this.#onProtocolError !== undefined && this.#headerDecoder.protocolError())) {
       const header = this.#headerDecoder.toObject();
       if (this.#onHeader !== undefined) {
@@ -467,8 +620,9 @@ export class BinaryHeadersCodec implements WireCodec {
 
   constructor(options: BinaryHeadersCodecOptions = {}) {
     this.#statsCounter = options.statsCounter ?? disabledBinaryHeaderStatsCounter();
-    this.inbound = new BinaryHeadersInboundCodec(options.inbound);
-    this.outbound = new BinaryHeadersOutboundCodec(options.outbound, this.#statsCounter);
+    const replyTracker = options.validateReplyStream === false ? undefined : new ReplyTracker();
+    this.inbound = new BinaryHeadersInboundCodec(options.inbound, replyTracker);
+    this.outbound = new BinaryHeadersOutboundCodec(options.outbound, this.#statsCounter, replyTracker);
   }
 
   stats(): BinaryHeaderStats {
@@ -485,6 +639,7 @@ export function createBinaryHeadersCodec(
     onHeader?: OnHeader;
     onProtocolError?: OnProtocolError;
     statsCounter?: BinaryHeaderStatsCounter;
+    validateReplyStream?: boolean;
   }
 ): BinaryHeadersCodec {
   return new BinaryHeadersCodec({
@@ -496,5 +651,6 @@ export function createBinaryHeadersCodec(
       onProtocolError: options?.onProtocolError,
     },
     statsCounter: options?.statsCounter,
+    validateReplyStream: options?.validateReplyStream,
   });
 }
