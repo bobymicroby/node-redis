@@ -1,3 +1,5 @@
+import { RESP_TYPES } from '../RESP/decoder';
+
 const CR = 0x0D;
 const LF = 0x0A;
 const MINUS = 0x2D;
@@ -5,20 +7,6 @@ const ASCII_ZERO = 0x30;
 const ASCII_NINE = 0x39;
 const BOOL_TRUE = 0x74;
 const BOOL_FALSE = 0x66;
-const RESP_SIMPLE_STRING = 0x2B; // +
-const RESP_SIMPLE_ERROR = 0x2D; // -
-const RESP_INTEGER = 0x3A; // :
-const RESP_DOUBLE = 0x2C; // ,
-const RESP_BIG_NUMBER = 0x28; // (
-const RESP_BOOLEAN = 0x23; // #
-const RESP_NULL = 0x5F; // _
-const RESP_BLOB_STRING = 0x24; // $
-const RESP_BLOB_ERROR = 0x21; // !
-const RESP_VERBATIM_STRING = 0x3D; // =
-const RESP_ARRAY = 0x2A; // *
-const RESP_SET = 0x7E; // ~
-const RESP_PUSH = 0x3E; // >
-const RESP_MAP = 0x25; // %
 
 const enum ParseState {
   EXPECT_TYPE,
@@ -168,34 +156,34 @@ export class PlainRespFrameScanner {
 
   #consumeType(byte: number): ByteConsumeResult {
     switch (byte) {
-      case RESP_SIMPLE_STRING:
-      case RESP_SIMPLE_ERROR:
-      case RESP_INTEGER:
-      case RESP_DOUBLE:
-      case RESP_BIG_NUMBER:
+      case RESP_TYPES.SIMPLE_STRING:
+      case RESP_TYPES.SIMPLE_ERROR:
+      case RESP_TYPES.NUMBER:
+      case RESP_TYPES.DOUBLE:
+      case RESP_TYPES.BIG_NUMBER:
         this.#parseState = ParseState.READ_SIMPLE_LINE;
         this.#sawCR = false;
         return ByteConsumeResult.CONTINUE;
 
-      case RESP_BOOLEAN:
+      case RESP_TYPES.BOOLEAN:
         this.#parseState = ParseState.READ_BOOLEAN_VALUE;
         return ByteConsumeResult.CONTINUE;
 
-      case RESP_NULL:
+      case RESP_TYPES.NULL:
         this.#parseState = ParseState.EXPECT_NULL_CR;
         return ByteConsumeResult.CONTINUE;
 
-      case RESP_BLOB_STRING:
-      case RESP_BLOB_ERROR:
-      case RESP_VERBATIM_STRING:
+      case RESP_TYPES.BLOB_STRING:
+      case RESP_TYPES.BLOB_ERROR:
+      case RESP_TYPES.VERBATIM_STRING:
         return this.#startLengthLine(LengthKind.BULK, 1);
 
-      case RESP_ARRAY:
-      case RESP_SET:
-      case RESP_PUSH:
+      case RESP_TYPES.ARRAY:
+      case RESP_TYPES.SET:
+      case RESP_TYPES.PUSH:
         return this.#startLengthLine(LengthKind.AGGREGATE, 1);
 
-      case RESP_MAP:
+      case RESP_TYPES.MAP:
         return this.#startLengthLine(LengthKind.AGGREGATE, 2);
 
       default:
