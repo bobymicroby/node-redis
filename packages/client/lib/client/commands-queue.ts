@@ -180,25 +180,25 @@ export default class RedisCommandsQueue {
   }
 
   #onReply(reply: ReplyUnion) {
-    this.#inbound?.onDecodedValue?.('reply');
+    this.#inbound?.noteReplyOrPush?.('reply');
     this.#waitingForReply.shift()!.resolve(reply);
   }
 
   #onErrorReply(err: ErrorReply) {
-    this.#inbound?.onDecodedValue?.('reply');
+    this.#inbound?.noteReplyOrPush?.('reply');
     this.#waitingForReply.shift()!.reject(err);
   }
 
   #onPush(push: Array<any>) {
     // TODO: type
     if (this.#pubSub.handleMessageReply(push)) {
-      this.#inbound?.onDecodedValue?.('push');
+      this.#inbound?.noteReplyOrPush?.('push');
       return true;
     }
 
     const isShardedUnsubscribe = PubSub.isShardedUnsubscribe(push);
     if (isShardedUnsubscribe && !this.#waitingForReply.length) {
-      this.#inbound?.onDecodedValue?.('push');
+      this.#inbound?.noteReplyOrPush?.('push');
       const channel = push[1].toString();
       this.#onShardedChannelMoved(
         channel,
@@ -207,7 +207,7 @@ export default class RedisCommandsQueue {
       return true;
     } else if (isShardedUnsubscribe || PubSub.isStatusReply(push)) {
       const head = this.#waitingForReply.head!.value;
-      this.#inbound?.onDecodedValue?.('reply');
+      this.#inbound?.noteReplyOrPush?.('reply');
       if (
         (Number.isNaN(head.channelsCounter!) && push[2] === 0) ||
         --head.channelsCounter! === 0

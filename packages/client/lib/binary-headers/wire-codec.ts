@@ -120,10 +120,17 @@ export interface InboundCodec {
   decode(chunk: Buffer, next: (data: Buffer) => void): void;
 
   /**
-   * Optional hook invoked by the queue when the downstream RESP decoder
-   * classifies a decoded top-level value.
+   * Queue-to-codec notification telling the inbound codec whether a decoded
+   * top-level RESP value was treated as a pending-command reply or as a push
+   * notification.
+   *
+   * Generic codecs may ignore this hook. Binary Headers uses it when
+   * reply-stream validation is enabled, because in RESP2 only the queue can
+   * decide, based on connection state and message contents, whether a decoded
+   * array consumed reply-credit or was handled as push. In RESP3, push frames
+   * are explicit on the wire (`>`).
    */
-  onDecodedValue?(kind: DecodedValueKind): void;
+  noteReplyOrPush?(kind: ReplyOrPush): void;
 
   /**
    * Clear codec-internal state (e.g. partial frame buffers)
@@ -132,7 +139,7 @@ export interface InboundCodec {
   reset(): void;
 }
 
-export type DecodedValueKind = 'reply' | 'push';
+export type ReplyOrPush = 'reply' | 'push';
 
 /**
  * Paired inbound/outbound transport codecs used by the command queue.

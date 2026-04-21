@@ -5,7 +5,7 @@ import type {
   SocketChunk,
   CommandArguments,
   WriteBatch,
-  DecodedValueKind,
+  ReplyOrPush,
   WriteCommandMeta,
   WriteSink,
   Scheduler,
@@ -486,7 +486,7 @@ export class BinaryHeadersInboundCodec implements InboundCodec {
     this.#decode(chunk, next);
   }
 
-  onDecodedValue(kind: DecodedValueKind): void {
+  noteReplyOrPush(kind: ReplyOrPush): void {
     if (this.#replyTracker === null) {
       return;
     }
