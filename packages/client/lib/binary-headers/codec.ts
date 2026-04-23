@@ -1,4 +1,5 @@
 import type {
+  BufferedCommands,
   OutboundCodec,
   InboundCodec,
   WireCodec,
@@ -204,7 +205,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#packer = new CommandPacker(this.#statsCounter, packerOptions);
   }
 
-  #takeBufferedCommands(): CommandToWrite[] {
+  #takeBufferedCommands(): BufferedCommands {
     const buffered = this.#bufferedCommands;
     this.#bufferedCommands = [];
     return buffered;
@@ -424,7 +425,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     return this.#packer.bufferSize > 0;
   }
 
-  reset(): CommandToWrite[] {
+  reset(): BufferedCommands {
     this.#cancelPendingFlush();
     this.#packer.reset();
     this.#chainSlotCache.clear();

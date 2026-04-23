@@ -37,6 +37,8 @@ export interface WriteBatch {
   emittedCommands: ReadonlyArray<CommandToWrite>;
 }
 
+export type BufferedCommands = ReadonlyArray<CommandToWrite>;
+
 /**
  * Queue-owned metadata that influences outbound batching policy.
  */
@@ -99,7 +101,7 @@ export interface OutboundCodec {
    *
    * The queue uses the returned commands to reject the corresponding promises.
    */
-  reset(): CommandToWrite[];
+  reset(): BufferedCommands;
 
   /**
    * Cleanup hook for codecs that keep async resources such as timers.

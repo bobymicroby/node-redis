@@ -14,6 +14,7 @@ import {
 import type {
   InboundCodec,
   OutboundCodec,
+  SocketChunks,
   WireCodec,
   WriteBatch,
   WriteHandler,
@@ -768,7 +769,7 @@ export default class RedisCommandsQueue {
     }
   }
 
-  #consumeWriteBatch(batch: WriteBatch | null): WriteBatch['writes'] {
+  #consumeWriteBatch(batch: WriteBatch | null): SocketChunks {
     if (batch === null) return [];
 
     this.#moveBatchToWaitingForReply(batch);

@@ -1,6 +1,10 @@
 import encodeCommand, { encodeCommandWithLength } from '../RESP/encoder';
 import type { RedisArgument } from '../RESP/types';
-import type { OutboundCodec, WriteBatch } from '../binary-headers/wire-codec';
+import type {
+  BufferedCommands,
+  OutboundCodec,
+  WriteBatch,
+} from '../binary-headers/wire-codec';
 import type { CommandToWrite } from './commands-queue';
 
 export interface EncodedCommandToWrite {
@@ -52,7 +56,7 @@ export function rejectBufferedOutbound(
   outbound: OutboundCodec | null,
   err: Error,
   rejectCommand: (command: CommandToWrite, err: Error) => void,
-): ReadonlyArray<CommandToWrite> {
+): BufferedCommands {
   const buffered = outbound?.reset() ?? [];
   for (const command of buffered) {
     rejectCommand(command, err);
