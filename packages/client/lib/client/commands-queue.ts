@@ -592,12 +592,9 @@ export default class RedisCommandsQueue {
       // TODO reuse `toSend` or create new object?
       if (outbound !== null) {
         try {
-          const batch = pushCommandToOutbound(outbound, toSend, encoded, byteLength);
-
-          if (batch !== null) {
-            this.#moveBatchToWaitingForReply(batch);
-            yield* batch.writes;
-          }
+          yield* this.#consumeWriteBatch(
+            pushCommandToOutbound(outbound, toSend, encoded, byteLength),
+          );
         } catch (err) {
           this.#handleOutboundError(err, toSend);
         }
@@ -611,11 +608,7 @@ export default class RedisCommandsQueue {
 
     if (outbound !== null) {
       try {
-        const drained = outbound.completePushes();
-        if (drained !== null) {
-          this.#moveBatchToWaitingForReply(drained);
-          yield* drained.writes;
-        }
+        yield* this.#consumeWriteBatch(outbound.completePushes());
       } catch (err) {
         this.#handleOutboundError(err);
       }
@@ -775,9 +768,15 @@ export default class RedisCommandsQueue {
     }
   }
 
-  #emitWriteBatch(batch: WriteBatch): void {
+  #consumeWriteBatch(batch: WriteBatch | null): WriteBatch['writes'] {
+    if (batch === null) return [];
+
     this.#moveBatchToWaitingForReply(batch);
-    this.#writeHandler(batch.writes);
+    return batch.writes;
+  }
+
+  #emitWriteBatch(batch: WriteBatch): void {
+    this.#writeHandler(this.#consumeWriteBatch(batch));
   }
 
   #handleOutboundError(err: unknown, current?: CommandToWrite): void {
