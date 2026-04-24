@@ -601,7 +601,8 @@ export function createMasterQueue(options: Omit<QueueFactoryOptions, 'resolver' 
   const queue = new MasterQueue(
     options.respVersion ?? 2,
     options.maxLength ?? null,
-    options.onShardedChannelMoved ?? (() => {})
+    options.onShardedChannelMoved ?? (() => {}),
+    ''
   );
   return new MasterQueueAdapter(queue);
 }

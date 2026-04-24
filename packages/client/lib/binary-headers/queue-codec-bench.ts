@@ -32,7 +32,8 @@ function createMasterQueue(): MasterQueue {
   return new MasterQueue(
     2,
     null,
-    () => {}
+    () => {},
+    ''
   );
 }
 
