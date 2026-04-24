@@ -573,7 +573,7 @@ export default class RedisCommandsQueue {
   }
 
   isWaitingToWrite() {
-    return this.#toWrite.length > 0;
+    return this.#toWrite.length > 0 || this.hasPendingOutbound();
   }
 
   *commandsToWrite() {
@@ -773,7 +773,7 @@ export default class RedisCommandsQueue {
     if (batch === null) return [];
 
     this.#moveBatchToWaitingForReply(batch);
-    return batch.writes;
+    return [batch.write];
   }
 
   #emitWriteBatch(batch: WriteBatch): void {

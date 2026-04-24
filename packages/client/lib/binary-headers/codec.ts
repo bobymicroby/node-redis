@@ -168,9 +168,9 @@ class ReplyTracker {
  *
  * What `push()` / `drain()` return in different scenarios:
  * - Eligible, still buffering        -> null
- * - Eligible, triggers batch emit    -> { writes: [packed], emittedCommands: [...] }
- * - Ineligible, nothing buffered     -> { writes: [encoded], emittedCommands: [command] }
- * - Ineligible with buffered batch   -> { writes: [pending, encoded], emittedCommands: [...] }
+ * - Eligible, triggers batch emit    -> { write: packed, emittedCommands: [...] }
+ * - Ineligible, nothing buffered     -> { write: encoded, emittedCommands: [command] }
+ * - Ineligible with buffered batch   -> { write: [...pending, ...encoded], emittedCommands: [...] }
  */
 export class BinaryHeadersOutboundCodec implements OutboundCodec {
   readonly #resolver: EligibilityResolver;
@@ -265,7 +265,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#resetPendingSegment();
     this.#replyTracker?.expectBinary(emittedCommands.length, this.#binaryClientIdxFromPacked(packed));
     return {
-      writes: [packed],
+      write: packed,
       emittedCommands,
     };
   }
@@ -279,7 +279,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     if (left === null) return right;
     if (right === null) return left;
     return {
-      writes: [...left.writes, ...right.writes],
+      write: [...left.write, ...right.write],
       emittedCommands: [...left.emittedCommands, ...right.emittedCommands],
     };
   }
@@ -323,14 +323,14 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
       this.#replyTracker?.expectRaw();
       if (pending === null) {
         return {
-          writes: [encoded],
+          write: encoded,
           emittedCommands: [command],
         };
       }
-      return {
-        writes: [...pending.writes, encoded],
-        emittedCommands: [...pending.emittedCommands, command],
-      };
+      return BinaryHeadersOutboundCodec.#mergeBatches(pending, {
+        write: encoded,
+        emittedCommands: [command],
+      });
     }
 
     const payloadLength = byteLength ?? calcPayloadLength(encoded);
@@ -338,7 +338,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
       const pending = this.#flushBuffered(FlushReason.DRAIN);
       this.#replyTracker?.expectRaw();
       const rawBatch: WriteBatch = {
-        writes: [encoded],
+        write: encoded,
         emittedCommands: [command],
       };
       return BinaryHeadersOutboundCodec.#mergeBatches(pending, rawBatch);
@@ -359,7 +359,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#bufferedCommands.push(command);
     this.#markPendingSegment(meta);
     return {
-      writes: [packed],
+      write: packed,
       emittedCommands,
     };
   }

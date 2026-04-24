@@ -26,14 +26,14 @@ export type SocketChunk = ReadonlyArray<RedisArgument>;
 export type SocketChunks = ReadonlyArray<SocketChunk>;
 
 /**
- * A batch of encoded socket writes produced by an outbound codec.
+ * An atomic encoded socket write produced by an outbound codec.
  *
- * `writes` contains the wire payload ready for `socket.write(...)`.
- * `emittedCommands` contains the queue command records that those writes
- * put on the wire and should therefore move into `waitingForReply`.
+ * `write` contains the wire payload ready for one queue yield to the socket.
+ * `emittedCommands` contains the queue command records that this write puts
+ * on the wire and should therefore move into `waitingForReply`.
  */
 export interface WriteBatch {
-  writes: SocketChunks;
+  write: SocketChunk;
   emittedCommands: ReadonlyArray<CommandToWrite>;
 }
 

@@ -15,6 +15,7 @@ import {
   // RESP utilities
   parseRespCommands,
   parseRespCommandStrings,
+  parseRequestFrames,
   respSimpleString,
   respInteger,
   respBulkString,
@@ -86,6 +87,24 @@ function decodeOutgoingHeader(chunk: ReadonlyArray<unknown>): { commandCount: nu
     commandCount: decoder.commandCount(),
     clientIdx: decoder.clientIdx(),
   };
+}
+
+function assertRequestFramesData(
+  chunk: ReadonlyArray<unknown>,
+  expected: Array<{ type: 'binary' | 'raw'; commands: string[][] }>
+): void {
+  const frames = parseRequestFrames(chunkToBuffer(chunk));
+  assert.equal(frames.length, expected.length, 'request frame count mismatch');
+
+  for (let i = 0; i < expected.length; i++) {
+    const frame = frames[i];
+    const expectedFrame = expected[i];
+    assert.equal(frame.type, expectedFrame.type, `frame ${i} type`);
+    assert.deepEqual(frame.commands, expectedFrame.commands, `frame ${i} commands`);
+    if (frame.type === 'binary') {
+      assert.equal(frame.header.commandCount, expectedFrame.commands.length, `frame ${i} commandCount`);
+    }
+  }
 }
 
 function responseFramesForWrites(
@@ -438,7 +457,7 @@ describe('Codec Queue [codec-queue]', function () {
 
       const drained = codec.outbound.drain(FlushReason.DRAIN);
       assert.ok(drained !== null, 'Should have drained data');
-      assertPackedData(drained.writes[0], {
+      assertPackedData(drained.write, {
         commandCount: 1,
         commands: [['SET', 'key', 'value']]
       });
@@ -530,7 +549,7 @@ describe('Codec Queue [codec-queue]', function () {
 
       const drained = codec.outbound.drain(FlushReason.DRAIN);
       assert.ok(drained !== null, 'Manual drain should return data');
-      assertPackedData(drained.writes[0], {
+      assertPackedData(drained.write, {
         commandCount: 1,
         commands: [['SET', 'key', 'value']]
       });
@@ -1588,7 +1607,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
           completePushes: () => {
             completePushesCalls++;
             return {
-              writes: [flushResult],
+              write: flushResult,
               emittedCommands: []
             };
           },
@@ -1622,7 +1641,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
         outbound: {
           bind: () => {},
           push: (command, encoded) => ({
-            writes: [encoded],
+            write: encoded,
             emittedCommands: [command]
           }),
           completePushes: () => null,
@@ -1663,7 +1682,7 @@ describe('Codec Queue Interface (CodecQueue specific)', function () {
               throw pushError;
             }
             return {
-              writes: [encoded],
+              write: encoded,
               emittedCommands: [command]
             };
           },
@@ -1951,24 +1970,16 @@ describe('Auto-pipelining behavior', function () {
 
       const results = collectYielded(queue);
 
-      // Ineligible command triggers flush of buffered eligible commands to preserve order
-      // 1. PING is buffered
-      // 2. UNKNOWNCMD is ineligible - flushes PING first, then passes through
-      // 3. Second PING is buffered, then drained at end
-      assert.equal(results.length, 3, 'Should have 3 yields');
+      // Ineligible command triggers a packed flush, then passes through in the
+      // same atomic socket yield to keep backpressure accounting correct.
+      assert.equal(results.length, 2, 'Should have 2 atomic yields');
+      assertRequestFramesData(results[0], [
+        { type: 'binary', commands: [['PING']] },
+        { type: 'raw', commands: [['UNKNOWNCMD', 'arg']] },
+      ]);
 
-      // First yield: packed PING batch (flushed when ineligible arrived)
-      assertPackedData(results[0], {
-        commandCount: 1,
-        commands: [['PING']]
-      });
-
-      // Second yield: ineligible command passed through as-is (unpacked RESP)
-      const parsedIneligible = parseRespCommands((results[1] as string[]).join(''));
-      assert.deepEqual(parsedIneligible, [['UNKNOWNCMD', 'arg']], 'Ineligible passes through unpacked');
-
-      // Third yield: second PING drained at end
-      assertPackedData(results[2], {
+      // Second PING drained at end
+      assertPackedData(results[1], {
         commandCount: 1,
         commands: [['PING']]
       });
@@ -2014,24 +2025,16 @@ describe('Auto-pipelining behavior', function () {
 
       const results = collectYielded(queue);
 
-      // Ineligible command triggers flush of buffered commands to preserve order
-      // 1. SET+GET for k1 are buffered
-      // 2. UNKNOWNCMD triggers flush of k1 batch, then passes through
-      // 3. SET+GET for k2 are buffered, then drained at end
-      assert.equal(results.length, 3, 'Should have 3 yields');
-
-      // First batch: SET+GET for k1 (flushed when ineligible arrived)
-      assertPackedData(results[0], {
-        commandCount: 2,
-        commands: [['SET', 'k1', 'v1'], ['GET', 'k1']]
-      });
-
-      // Ineligible passes through
-      const parsedIneligible = parseRespCommands((results[1] as string[]).join(''));
-      assert.deepEqual(parsedIneligible, [['UNKNOWNCMD']]);
+      // Ineligible command triggers flush of buffered commands and passes
+      // through in the same atomic yield.
+      assert.equal(results.length, 2, 'Should have 2 atomic yields');
+      assertRequestFramesData(results[0], [
+        { type: 'binary', commands: [['SET', 'k1', 'v1'], ['GET', 'k1']] },
+        { type: 'raw', commands: [['UNKNOWNCMD']] },
+      ]);
 
       // Second batch: SET+GET for k2 (drained at end)
-      assertPackedData(results[2], {
+      assertPackedData(results[1], {
         commandCount: 2,
         commands: [['SET', 'k2', 'v2'], ['GET', 'k2']]
       });
@@ -2047,24 +2050,20 @@ describe('Auto-pipelining behavior', function () {
 
       const results = collectYielded(queue);
 
-      assert.equal(results.length, 4, 'Should have 4 yields');
+      assert.equal(results.length, 3, 'Should have 3 atomic yields');
 
-      // First: packed SET (flushed when UNKNOWN1 arrived)
-      assertPackedData(results[0], {
-        commandCount: 1,
-        commands: [['SET', 'k', 'v']]
-      });
+      // First: packed SET plus UNKNOWN1 passthrough
+      assertRequestFramesData(results[0], [
+        { type: 'binary', commands: [['SET', 'k', 'v']] },
+        { type: 'raw', commands: [['UNKNOWN1']] },
+      ]);
 
-      // Second: UNKNOWN1 passthrough
-      const parsed1 = parseRespCommands((results[1] as string[]).join(''));
-      assert.deepEqual(parsed1, [['UNKNOWN1']]);
-
-      // Third: UNKNOWN2 passthrough (no flush needed, buffer was empty)
-      const parsed2 = parseRespCommands((results[2] as string[]).join(''));
+      // Second: UNKNOWN2 passthrough (no flush needed, buffer was empty)
+      const parsed2 = parseRespCommands((results[1] as string[]).join(''));
       assert.deepEqual(parsed2, [['UNKNOWN2']]);
 
-      // Fourth: packed GET (drained at end)
-      assertPackedData(results[3], {
+      // Third: packed GET (drained at end)
+      assertPackedData(results[2], {
         commandCount: 1,
         commands: [['GET', 'k']]
       });
@@ -2095,31 +2094,23 @@ describe('Auto-pipelining behavior', function () {
 
       const results = collectYielded(queue);
 
-      assert.equal(results.length, 5, 'Should have 5 yields');
+      assert.equal(results.length, 3, 'Should have 3 atomic yields');
 
       // 1. UNKNOWN1 passthrough
       const parsed1 = parseRespCommands((results[0] as string[]).join(''));
       assert.deepEqual(parsed1, [['UNKNOWN1']]);
 
-      // 2. packed PING (flushed when UNKNOWN2 arrived)
-      assertPackedData(results[1], {
-        commandCount: 1,
-        commands: [['PING']]
-      });
+      // 2. packed PING plus UNKNOWN2 passthrough
+      assertRequestFramesData(results[1], [
+        { type: 'binary', commands: [['PING']] },
+        { type: 'raw', commands: [['UNKNOWN2']] },
+      ]);
 
-      // 3. UNKNOWN2 passthrough
-      const parsed2 = parseRespCommands((results[2] as string[]).join(''));
-      assert.deepEqual(parsed2, [['UNKNOWN2']]);
-
-      // 4. packed PING (flushed when UNKNOWN3 arrived)
-      assertPackedData(results[3], {
-        commandCount: 1,
-        commands: [['PING']]
-      });
-
-      // 5. UNKNOWN3 passthrough
-      const parsed3 = parseRespCommands((results[4] as string[]).join(''));
-      assert.deepEqual(parsed3, [['UNKNOWN3']]);
+      // 3. packed PING plus UNKNOWN3 passthrough
+      assertRequestFramesData(results[2], [
+        { type: 'binary', commands: [['PING']] },
+        { type: 'raw', commands: [['UNKNOWN3']] },
+      ]);
     });
 
     it('different slots interleaved with ineligible commands', function () {
@@ -2131,20 +2122,16 @@ describe('Auto-pipelining behavior', function () {
 
       const results = collectYielded(queue);
 
-      assert.equal(results.length, 3, 'Should have 3 yields');
+      assert.equal(results.length, 2, 'Should have 2 atomic yields');
 
-      // First: packed slot A (flushed when ineligible arrived)
-      assertPackedData(results[0], {
-        commandCount: 1,
-        commands: [['SET', '{a}k', 'v']]
-      });
+      // First: packed slot A plus ineligible passthrough
+      assertRequestFramesData(results[0], [
+        { type: 'binary', commands: [['SET', '{a}k', 'v']] },
+        { type: 'raw', commands: [['UNKNOWNCMD']] },
+      ]);
 
-      // Second: ineligible passthrough
-      const parsed = parseRespCommands((results[1] as string[]).join(''));
-      assert.deepEqual(parsed, [['UNKNOWNCMD']]);
-
-      // Third: packed slot B (drained at end)
-      assertPackedData(results[2], {
+      // Second: packed slot B (drained at end)
+      assertPackedData(results[1], {
         commandCount: 1,
         commands: [['SET', '{b}k', 'v']]
       });
@@ -2163,17 +2150,11 @@ describe('Auto-pipelining behavior', function () {
 
       // With scheduler, drain doesn't happen at generator end
       // But ineligible still triggers flush of buffered commands
-      assert.equal(results.length, 2, 'Should have 2 yields (flush + passthrough)');
-
-      // First: packed PING (flushed when ineligible arrived)
-      assertPackedData(results[0], {
-        commandCount: 1,
-        commands: [['PING']]
-      });
-
-      // Second: ineligible passthrough
-      const parsed = parseRespCommands((results[1] as string[]).join(''));
-      assert.deepEqual(parsed, [['UNKNOWNCMD']]);
+      assert.equal(results.length, 1, 'Should have 1 atomic yield');
+      assertRequestFramesData(results[0], [
+        { type: 'binary', commands: [['PING']] },
+        { type: 'raw', commands: [['UNKNOWNCMD']] },
+      ]);
 
       // Third PING is still buffered for timer
       assert.equal(queue.hasPendingOutbound(), true, 'Should have pending for timer');
@@ -2223,13 +2204,10 @@ describe('Auto-pipelining behavior', function () {
       queue.addCommand(['SET', '{slot}c', longValue]);
 
       const results = collectYielded(queue);
-      assert.equal(results.length, 2);
-      assertPackedData(results[0], {
-        commandCount: 2,
-        commands: [['SET', '{slot}a', '1'], ['SET', '{slot}b', '2']]
-      });
-      assert.deepEqual(parseRespCommandStrings(chunkToBuffer(results[1])), [
-        ['SET', '{slot}c', longValue]
+      assert.equal(results.length, 1);
+      assertRequestFramesData(results[0], [
+        { type: 'binary', commands: [['SET', '{slot}a', '1'], ['SET', '{slot}b', '2']] },
+        { type: 'raw', commands: [['SET', '{slot}c', longValue]] },
       ]);
     });
 
@@ -3022,6 +3000,59 @@ describe('Partial Generator Consumption', function () {
     const stats = queue.getStats();
     assert.equal(stats.totalCommandCount, 3);
     assert.equal(stats.slotMismatchFlushCount, 2);
+  });
+
+  it('backpressure before completePushes leaves codec-buffered work schedulable', function () {
+    const queue = createBinhdrQueue();
+
+    queue.addCommand(['SET', '{a}k', 'v']);
+    queue.addCommand(['SET', '{b}k', 'v']);
+
+    const gen = queue.commandsToWrite();
+    const first = gen.next();
+
+    assert.equal(first.done, false);
+    assertPackedData(first.value!, {
+      commandCount: 1,
+      commands: [['SET', '{a}k', 'v']]
+    });
+
+    // Mirrors RedisSocket.write() breaking out of the generator when
+    // writableNeedDrain becomes true after the first socket write.
+    gen.return(undefined);
+
+    assert.equal(queue.hasPendingOutbound(), true, 'second command is buffered in the codec');
+    assert.equal(
+      queue.isWaitingToWrite(),
+      true,
+      'socket drain should schedule another write when only codec-buffered work remains'
+    );
+  });
+
+  it('backpressure cannot split a merged codec batch across socket yields', function () {
+    const queue = createBinhdrQueue({ maxPayloadLength: 96 });
+    const longValue = 'x'.repeat(128);
+
+    queue.addCommand(['SET', '{slot}a', '1']);
+    queue.addCommand(['SET', '{slot}b', longValue]);
+
+    const gen = queue.commandsToWrite();
+    const first = gen.next();
+
+    assert.equal(first.done, false);
+    const frames = parseRequestFrames(chunkToBuffer(first.value!));
+    assert.equal(frames.length, 2, 'merged codec batch should be one atomic socket yield');
+    assert.equal(frames[0].type, 'binary');
+    assert.deepEqual(frames[0].commands, [['SET', '{slot}a', '1']]);
+    assert.equal(frames[1].type, 'raw');
+    assert.deepEqual(frames[1].commands, [['SET', '{slot}b', longValue]]);
+
+    // Backpressure after this yield is safe because both logical request
+    // frames have already been handed to RedisSocket.write() as one unit.
+    gen.return(undefined);
+
+    const resumed = collectYielded(queue);
+    assert.equal(resumed.length, 0, 'merged batch should not leave a second write behind');
   });
 });
 
