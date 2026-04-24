@@ -4,10 +4,8 @@ import type {
   InboundCodec,
   WireCodec,
   SocketChunk,
-  CommandArguments,
   WriteBatch,
   ReplyOrPush,
-  WriteCommandMeta,
   WriteSink,
   Scheduler,
   Cancellable,
@@ -216,9 +214,9 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#pendingRequiresDrainAtEnd = false;
   }
 
-  #markPendingSegment(meta?: WriteCommandMeta): void {
-    this.#pendingChainId = meta?.chainId;
-    if (meta?.chainId !== undefined) {
+  #markPendingSegment(command: CommandToWrite): void {
+    this.#pendingChainId = command.chainId;
+    if (command.chainId !== undefined) {
       this.#pendingRequiresDrainAtEnd = true;
     }
   }
@@ -294,12 +292,9 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
 
   #pushEncoded(
     command: CommandToWrite,
-    encoded: SocketChunk,
-    args: CommandArguments,
-    byteLength?: number,
-    chainId?: symbol,
-    meta?: WriteCommandMeta
+    encoded: SocketChunk
   ): WriteBatch | null {
+    const chainId = command.chainId;
     let slot: number;
 
     // Fast path: reuse cached slot for same chain (multi/pipeline)
@@ -309,7 +304,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
       slot = this.#chainSlotCache.get(chainId)!;
     } else {
       // Calculate slot (only once per chain)
-      slot = this.#resolver.getSlot(args);
+      slot = this.#resolver.getSlot(command.args);
 
       // Cache for subsequent commands in this chain
       if (chainId !== undefined && slot !== SLOT_INELIGIBLE) {
@@ -333,7 +328,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
       });
     }
 
-    const payloadLength = byteLength ?? calcPayloadLength(encoded);
+    const payloadLength = calcPayloadLength(encoded);
     if (payloadLength > this.#packer.maxPayloadLength) {
       const pending = this.#flushBuffered(FlushReason.DRAIN);
       this.#replyTracker?.expectRaw();
@@ -348,7 +343,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     const packed = this.#packer.add(encoded, slot, payloadLength);
     if (!packed) {
       this.#bufferedCommands.push(command);
-      this.#markPendingSegment(meta);
+      this.#markPendingSegment(command);
       return null;
     }
 
@@ -357,7 +352,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
     this.#resetPendingSegment();
     this.#replyTracker?.expectBinary(emittedCommands.length, this.#binaryClientIdxFromPacked(packed));
     this.#bufferedCommands.push(command);
-    this.#markPendingSegment(meta);
+    this.#markPendingSegment(command);
     return {
       write: packed,
       emittedCommands,
@@ -366,13 +361,10 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
 
   push(
     command: CommandToWrite,
-    encoded: SocketChunk,
-    args: CommandArguments,
-    byteLength?: number,
-    meta?: WriteCommandMeta
+    encoded: SocketChunk
   ): WriteBatch | null {
     this.#statsCounter.recordCommand();
-    const chainId = meta?.chainId;
+    const chainId = command.chainId;
 
     // Clear cache when chain changes (to avoid memory leak)
     if (chainId !== this.#lastChainId) {
@@ -393,10 +385,10 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
 
     batch = BinaryHeadersOutboundCodec.#mergeBatches(
       batch,
-      this.#pushEncoded(command, encoded, args, byteLength, chainId, meta)
+      this.#pushEncoded(command, encoded)
     );
 
-    if (meta?.forceImmediate && this.hasBuffered()) {
+    if ((command.abort !== undefined || command.timeout !== undefined) && this.hasBuffered()) {
       batch = BinaryHeadersOutboundCodec.#mergeBatches(
         batch,
         this.drain(FlushReason.DRAIN)

@@ -581,9 +581,8 @@ export default class RedisCommandsQueue {
     let toSend = this.#toWrite.shift();
     while (toSend) {
       let encoded: ReadonlyArray<RedisArgument>;
-      let byteLength: number | undefined;
       try {
-        ({ encoded, byteLength } = encodeCommandToWrite(toSend.args, outbound));
+        ({ encoded } = encodeCommandToWrite(toSend.args));
       } catch (err) {
         toSend.reject(err);
         toSend = this.#toWrite.shift();
@@ -594,7 +593,7 @@ export default class RedisCommandsQueue {
       if (outbound !== null) {
         try {
           yield* this.#consumeWriteBatch(
-            pushCommandToOutbound(outbound, toSend, encoded, byteLength),
+            pushCommandToOutbound(outbound, toSend, encoded),
           );
         } catch (err) {
           this.#handleOutboundError(err, toSend);

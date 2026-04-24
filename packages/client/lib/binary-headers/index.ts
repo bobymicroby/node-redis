@@ -62,7 +62,6 @@ export type {
   WriteHandler,
   WriteSink,
   WriteBatch,
-  WriteCommandMeta,
 } from './wire-codec';
 
 // Binary Headers Codec (integrates with commands-queue)

@@ -73,7 +73,7 @@ function fakeCommand(args: string[]): CommandToWrite {
 }
 
 function pushThroughOutboundCodec(codec: BinaryHeadersCodec, args: string[]) {
-  return codec.outbound.push(fakeCommand(args), encodeCommand(args), args);
+  return codec.outbound.push(fakeCommand(args), encodeCommand(args));
 }
 
 function chunkToBuffer(chunk: ReadonlyArray<unknown>): Buffer {

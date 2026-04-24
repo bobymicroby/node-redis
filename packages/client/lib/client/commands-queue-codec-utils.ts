@@ -1,4 +1,4 @@
-import encodeCommand, { encodeCommandWithLength } from '../RESP/encoder';
+import encodeCommand from '../RESP/encoder';
 import type { RedisArgument } from '../RESP/types';
 import type {
   BufferedCommands,
@@ -9,24 +9,13 @@ import type { CommandToWrite } from './commands-queue';
 
 export interface EncodedCommandToWrite {
   encoded: ReadonlyArray<RedisArgument>;
-  byteLength: number | undefined;
 }
 
 export function encodeCommandToWrite(
-  args: ReadonlyArray<RedisArgument>,
-  outbound: OutboundCodec | null,
+  args: ReadonlyArray<RedisArgument>
 ): EncodedCommandToWrite {
-  if (outbound !== null) {
-    const result = encodeCommandWithLength(args);
-    return {
-      encoded: result.encoded,
-      byteLength: result.byteLength,
-    };
-  }
-
   return {
     encoded: encodeCommand(args),
-    byteLength: undefined,
   };
 }
 
@@ -67,11 +56,7 @@ export function rejectBufferedOutbound(
 export function pushCommandToOutbound(
   outbound: OutboundCodec,
   command: CommandToWrite,
-  encoded: ReadonlyArray<RedisArgument>,
-  byteLength: number | undefined,
+  encoded: ReadonlyArray<RedisArgument>
 ): WriteBatch | null {
-  return outbound.push(command, encoded, command.args, byteLength, {
-    chainId: command.chainId,
-    forceImmediate: command.abort !== undefined || command.timeout !== undefined,
-  });
+  return outbound.push(command, encoded);
 }

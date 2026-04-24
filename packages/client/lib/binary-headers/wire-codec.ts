@@ -40,14 +40,6 @@ export interface WriteBatch {
 export type BufferedCommands = ReadonlyArray<CommandToWrite>;
 
 /**
- * Queue-owned metadata that influences outbound batching policy.
- */
-export interface WriteCommandMeta {
-  chainId?: symbol;
-  forceImmediate?: boolean;
-}
-
-/**
  * Async sink used by codecs that can emit writes outside the generator flow,
  * such as timer-driven batching.
  */
@@ -77,10 +69,7 @@ export interface OutboundCodec {
    */
   push(
     command: CommandToWrite,
-    encoded: SocketChunk,
-    args: CommandArguments,
-    byteLength?: number,
-    meta?: WriteCommandMeta
+    encoded: SocketChunk
   ): WriteBatch | null;
 
   /**

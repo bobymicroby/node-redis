@@ -22,7 +22,7 @@
 │   │   2. if (codec) ────┬──────────────────────────────────────────────────────┐  │   │
 │   │                     │                                                        │  │   │
 │   │                     ▼                                                       │  │   │
-│   │       codec.outbound.push(command, encoded, args)                            │  │   │
+│   │       codec.outbound.push(command, encoded)                                  │  │   │
 │   │                     │                                                        │  │   │
 │   │           ┌─────────┴─────────┐                                              │  │   │
 │   │           │                   │                                              │  │   │
@@ -33,13 +33,13 @@
 │   │       └───┬────┘        └────┬─────┘                                         │  │   │
 │   │           │                  │                                               │  │   │
 │   │           │ (buffered,       │                                               │  │   │
-│   │           │  continue)       └────► mark emittedCommands ─► yield writes ───┼──┼───►
+│   │           │  continue)       └────► mark emittedCommands ─► yield write ────┼──┼───►
 │   │           ▼                                                                 │  │   │
 │   │      next iteration                                                          │  │   │
 │   │                                                                              │  │   │
 │   │   3. end of loop: codec.outbound.completePushes()                            │  │   │
 │   │                     │                                                        │  │   │
-│   │                     └────────────────► mark emittedCommands ─► yield writes ─┼──┼───►
+│   │                     └────────────────► mark emittedCommands ─► yield write ──┼──┼───►
 │   │                                                                              │  │   │
 │   │      else (no codec)  ─────────────────────────────────► yield + mark sent ─┼──┼───►
 │   │                                                                              │  │   │
