@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "lib": ["ES2023"],
+    "types": ["node", "mocha"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "target": "ES2022",
