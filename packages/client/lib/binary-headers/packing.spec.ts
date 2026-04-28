@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import { describe, it } from 'mocha';
 import {
   CommandPacker,
@@ -345,6 +346,9 @@ describe('Packing', () => {
 
     describe('memory retention', () => {
       it('releases flushed payload references so GC can reclaim them', () => {
+        const repoRoot = process.cwd().replace(/\\/g, '/').endsWith('/packages/client')
+          ? resolve(process.cwd(), '../..')
+          : process.cwd();
         const script = `
           const { CommandPacker } = require('./packages/client/lib/binary-headers/packing');
           const { FlushReason } = require('./packages/client/lib/binary-headers/stats');
@@ -380,10 +384,10 @@ describe('Packing', () => {
           process.execPath,
           ['--expose-gc', '-r', 'ts-node/register/transpile-only', '-e', script],
           {
-            cwd: process.cwd(),
+            cwd: repoRoot,
             env: {
               ...process.env,
-              TS_NODE_PROJECT: './packages/test-utils/tsconfig.json',
+              TS_NODE_PROJECT: resolve(repoRoot, 'packages/test-utils/tsconfig.json'),
             },
             encoding: 'utf8',
           }

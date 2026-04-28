@@ -33,7 +33,7 @@ export default class RespQueue extends EventEmitter {
     }
   }
 
-  request(data: Buffer, expectedReplies = 1): Promise<Buffer> {
+  request(data: Buffer, replyCount = 1): Promise<Buffer> {
     let resolve: (data: Buffer) => void;
     let reject: (reason: any) => void;
 
@@ -43,7 +43,7 @@ export default class RespQueue extends EventEmitter {
     });
 
     //@ts-ignore
-    this.queue.push({ resolve, reject, remaining: expectedReplies, chunks: [] });
+    this.queue.push({ resolve, reject, remaining: replyCount, chunks: [] });
     this.serverSocket.write(data);
     return promise;
   }

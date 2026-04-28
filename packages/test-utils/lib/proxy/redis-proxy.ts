@@ -198,17 +198,9 @@ interface Stage<I, O, R = Buffer> {
 }
 
 /**
- * RESP bytes to write to Redis plus the number of RESP replies to read.
+ * Parser from client socket chunks to RESP bytes.
  */
-interface ProxyRequest {
-  readonly data: Buffer;
-  readonly expectedReplies: number;
-}
-
-/**
- * Parser from client socket chunks to `ProxyRequest` values.
- */
-type RequestParserStage = Stage<Buffer, ProxyRequest>;
+type RequestParserStage = Stage<Buffer, Buffer>;
 
 interface DmcBinaryHeadersConnectionState extends ConnectionInfoCommon {
   bindhrEnabled: boolean;
@@ -218,7 +210,7 @@ interface DmcBinaryHeadersConnectionState extends ConnectionInfoCommon {
 /**
  * Optional parser for client input before public RESP interceptors.
  *
- * Output must be `ProxyRequest`; `ProxyRequest.data` must be RESP.
+ * Output must be RESP bytes accepted by the Redis writer.
  */
 interface RequestPipelinePlugin {
   initialize(): Promise<void>;
@@ -235,7 +227,7 @@ type ResolvedProxyConfig = Omit<Required<ProxyConfig>, 'dmcBinaryHeadersProxy'> 
 /**
  * Keep adjacent pipeline types explicit.
  *
- * DMC parsing is `Buffer -> DmcBinaryHeadersRequestFrame -> ProxyRequest`.
+ * DMC parsing is `Buffer -> DmcBinaryHeadersRequestFrame -> Buffer`.
  * Pairwise composition gives the proxy core one parser without a list whose
  * elements have different input and output types.
  */
@@ -365,6 +357,15 @@ function parseRespCommandArrays(data: Buffer): ReadonlyArray<ReadonlyArray<Redis
   });
 }
 
+function countRespMessages(data: Buffer): number {
+  let count = 0;
+  const framer = new RespFramer();
+  framer.on('message', () => count++);
+  framer.write(data);
+
+  return count || 1;
+}
+
 function stringifyCommands(
   commands: ReadonlyArray<ReadonlyArray<RedisArgument>>,
 ): string[][] {
@@ -469,11 +470,11 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   }
 
   /**
-   * Second DMC parser step: framer output to Redis RESP requests.
+   * Second DMC parser step: framer output to RESP bytes.
    */
   private createDmcRequestStage(
     state: DmcBinaryHeadersConnectionState
-  ): Stage<DmcBinaryHeadersRequestFrame, ProxyRequest> {
+  ): Stage<DmcBinaryHeadersRequestFrame, Buffer> {
     return {
       write: async (frame, next) => frame.type === 'binary'
         ? this.handleRequestFrame(state, frame, next)
@@ -507,7 +508,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   private async handleRawFrame(
     state: DmcBinaryHeadersConnectionState,
     data: Buffer,
-    next: StageNext<ProxyRequest, Buffer>
+    next: StageNext<Buffer, Buffer>
   ): Promise<readonly Buffer[]> {
     const commands = parseRespCommandArrays(data);
     const names = commandNames(commands);
@@ -521,7 +522,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
     };
     state.requests.push(record);
 
-    return [await next({ data, expectedReplies: commands.length || 1 })];
+    return [await next(data)];
   }
 
   /**
@@ -530,7 +531,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   private async handleRequestFrame(
     state: DmcBinaryHeadersConnectionState,
     frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
-    next: StageNext<ProxyRequest, Buffer>
+    next: StageNext<Buffer, Buffer>
   ): Promise<readonly Buffer[]> {
     let commands: ReadonlyArray<ReadonlyArray<RedisArgument>> = [];
     let validationError = this.validateRequestHeader(frame);
@@ -566,10 +567,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
       )];
     }
 
-    const redisResponse = await next({
-      data: frame.payload,
-      expectedReplies: frame.header.commandCount,
-    });
+    const redisResponse = await next(frame.payload);
     return [this.createReplyFrame(redisResponse, frame.header.commandCount, frame.header.clientIdx)];
   }
 
@@ -697,7 +695,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
 /**
  * TCP proxy between node-redis and a Redis test server.
  *
- * Client bytes are parsed to `ProxyRequest`, passed through public RESP
+ * Client bytes are parsed to RESP bytes, passed through public RESP
  * interceptors, then written to Redis. DMC request frames are stripped before
  * the public interceptors run.
  */
@@ -1016,7 +1014,7 @@ export class RedisProxy extends EventEmitter {
   /**
    * Plain RESP parser: one complete client message becomes one Redis request.
    */
-  private createRespFrameStage(): Stage<Buffer, ProxyRequest> {
+  private createRespFrameStage(): Stage<Buffer, Buffer> {
     const framer = new RespFramer();
     return {
       write: async (chunk, next) => {
@@ -1032,7 +1030,7 @@ export class RedisProxy extends EventEmitter {
 
         const responses: Buffer[] = [];
         for (const frame of frames) {
-          responses.push(await next({ data: frame, expectedReplies: 1 }));
+          responses.push(await next(frame));
         }
         return responses;
       },
@@ -1040,37 +1038,36 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Hide `expectedReplies` from public interceptors; keep it around their
-   * `Buffer -> Buffer` calls.
+   * Run public interceptors between parsing and the Redis writer.
    */
-  private createInterceptorChainStage(connection: ActiveConnection): Stage<ProxyRequest, ProxyRequest> {
+  private createInterceptorChainStage(connection: ActiveConnection): Stage<Buffer, Buffer> {
     return {
-      write: async (request, next) => {
-        const interceptorChain = connection.interceptors.concat(this.globalInterceptors).reduceRight<StageNext<ProxyRequest, Buffer>>(
-          (nextInterceptor, interceptor) => (request) =>
+      write: async (data, next) => {
+        const interceptorChain = connection.interceptors.concat(this.globalInterceptors).reduceRight<StageNext<Buffer, Buffer>>(
+          (nextInterceptor, interceptor) => (data) =>
             interceptor.fn(
-              request.data,
-              (data) => nextInterceptor({ ...request, data }),
+              data,
+              nextInterceptor,
               interceptor.state,
             ),
           next,
         );
 
-        return [await interceptorChain(request)];
+        return [await interceptorChain(data)];
       },
     };
   }
 
   /**
-   * Redis writer. `request.data` must be RESP.
+   * Redis writer. Reply count is derived after interceptors have run.
    */
   private createRedisTerminal(
     connection: ActiveConnection,
     respQueue: RespQueue
-  ): StageNext<ProxyRequest, Buffer> {
-    return async (request) => {
-      this.emit('data', connection.id, 'client->server', request.data);
-      return respQueue.request(request.data, request.expectedReplies);
+  ): StageNext<Buffer, Buffer> {
+    return async (data) => {
+      this.emit('data', connection.id, 'client->server', data);
+      return respQueue.request(data, countRespMessages(data));
     };
   }
 
@@ -1080,8 +1077,8 @@ export class RedisProxy extends EventEmitter {
   private attachRequestPipeline(
     connection: ActiveConnection,
     requestParser: RequestParserStage,
-    interceptorStage: Stage<ProxyRequest, ProxyRequest>,
-    terminal: StageNext<ProxyRequest, Buffer>
+    interceptorStage: Stage<Buffer, Buffer>,
+    terminal: StageNext<Buffer, Buffer>
   ): void {
     const requestStage = composeStages(requestParser, interceptorStage);
     let responseChain = Promise.resolve();
