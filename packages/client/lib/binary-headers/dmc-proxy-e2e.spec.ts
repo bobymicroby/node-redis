@@ -104,7 +104,6 @@ describe('Binary Headers DMC Proxy E2E', function () {
     );
     assert.ok(commandRequest, 'COMMAND COUNT should be observed');
     assert.equal(commandRequest.type, 'raw');
-    assert.equal(commandRequest.handledLocally, false);
   }, createDmcBinaryHeadersProxyOptions());
 
   testUtils.testWithClient('mixed raw and binary-header requests preserve reply order', async (client, context) => {
@@ -129,25 +128,42 @@ describe('Binary Headers DMC Proxy E2E', function () {
     );
   }, createDmcBinaryHeadersProxyOptions());
 
-  testUtils.testWithClient('BINDHR is handled locally and always observed as raw RESP', async (client, context) => {
+  testUtils.testWithClient('proxy rejects BINDHR inside binary-header traffic', async (_client, context) => {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
+    assert.ok(context.proxyPort, 'test requires proxy port');
     const proxy = context.dmcBinaryHeadersProxy;
     proxy.clearDmcBinaryHeadersProxyStats();
 
-    assert.equal(await client.sendCommand(['BINDHR', 'STATUS'] as const), 1);
-    assert.equal(await client.sendCommand(['BINDHR', 'DISABLE'] as const), 0);
+    const payload = chunkToBuffer(encodeCommand(['BINDHR', 'STATUS']));
+    const frame = Buffer.concat([
+      RequestHeaderEncoder.allocateAndEncode(
+        payload.length,
+        1,
+        RequestHeaderEncoder.slotNullValue(),
+        7,
+      ),
+      payload,
+    ]);
 
-    let stats = proxy.getDmcBinaryHeadersProxyStats();
-    assert.equal(stats.connections[0].bindhrEnabled, false);
+    const { response, socket } = await sendFrame(context.proxyPort, frame);
+    try {
+      const decoder = new ResponseHeaderDecoder().wrap(response, 0);
+      assert.equal(decoder.protocolError(), true);
+      assert.equal(decoder.clientIdx(), 7);
+      assert.match(
+        response.subarray(ResponseHeaderDecoder.ENCODED_LENGTH).toString(),
+        /BINDHR must be sent as raw RESP/,
+      );
 
-    assert.equal(await client.sendCommand(['BINDHR', 'ENABLE'] as const), 1);
-    stats = proxy.getDmcBinaryHeadersProxyStats();
-    assert.equal(stats.connections[0].bindhrEnabled, true);
-
-    const bindhrRequests = stats.requests.filter((request) => request.commandNames[0] === 'BINDHR');
-    assert.equal(bindhrRequests.length, 3);
-    assert.equal(bindhrRequests.every((request) => request.type === 'raw'), true);
-    assert.equal(bindhrRequests.every((request) => request.handledLocally), true);
+      const bindhrRequest = proxy.getDmcBinaryHeadersProxyStats().requests.find(
+        (request) => request.commandNames[0] === 'BINDHR',
+      );
+      assert.ok(bindhrRequest, 'BINDHR should be observed');
+      assert.equal(bindhrRequest.type, 'binary');
+      assert.equal(bindhrRequest.rejected, true);
+    } finally {
+      socket.destroy();
+    }
   }, createDmcBinaryHeadersProxyOptions());
 
   testUtils.testWithClient('MONITOR RESET can return to normal binary-header commands', async (client) => {

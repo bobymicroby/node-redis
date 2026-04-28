@@ -16,6 +16,14 @@ import {
 import RespFramer from './resp-framer';
 import RespQueue from './resp-queue';
 
+/**
+ * DMC binary-header mode for this test proxy.
+ *
+ * Client input may be RESP or DMC binary-header request frames. The proxy
+ * writes RESP only to Redis: the test Redis server does not decode binary
+ * headers. Replies to binary-header requests are wrapped before they are
+ * written back to the client.
+ */
 export interface DmcBinaryHeadersProxyConfig {
   readonly bindhrEnabled?: boolean;
   readonly supportedCommands?: ReadonlyArray<CommandRecord>;
@@ -23,6 +31,9 @@ export interface DmcBinaryHeadersProxyConfig {
   readonly validateEligibility?: boolean;
 }
 
+/**
+ * Listen socket and Redis target.
+ */
 interface ProxyConfig {
   readonly listenPort: number;
   readonly listenHost?: string;
@@ -40,6 +51,12 @@ interface ConnectionInfoCommon {
   readonly connectedAt: Date;
 }
 
+/**
+ * One client request group parsed by the DMC plugin.
+ *
+ * `raw` is one complete RESP message. `binary` is one DMC request frame whose
+ * payload contains `commandCount` RESP command arrays.
+ */
 export interface DmcBinaryHeadersProxyRequestRecord {
   readonly connectionId: string;
   readonly type: 'raw' | 'binary';
@@ -49,18 +66,26 @@ export interface DmcBinaryHeadersProxyRequestRecord {
   readonly commandCount: number;
   readonly slot?: number;
   readonly clientIdx?: number;
-  readonly handledLocally?: boolean;
   readonly rejected?: boolean;
   readonly error?: string;
 }
 
+/**
+ * DMC state kept for one live client connection.
+ */
 export interface DmcBinaryHeadersProxyConnectionInfo {
   readonly bindhrEnabled: boolean;
   readonly requests: readonly DmcBinaryHeadersProxyRequestRecord[];
 }
 
+/**
+ * Per-connection DMC state returned to tests.
+ */
 export interface DmcBinaryHeadersProxyConnectionStats extends ConnectionInfoCommon, DmcBinaryHeadersProxyConnectionInfo {}
 
+/**
+ * Copies of all DMC records kept by the plugin.
+ */
 export interface DmcBinaryHeadersProxyStats {
   readonly connections: readonly DmcBinaryHeadersProxyConnectionStats[];
   readonly requests: readonly DmcBinaryHeadersProxyRequestRecord[];
@@ -89,6 +114,12 @@ interface ProxyStats {
   readonly globalInterceptors: InterceptorState[];
 }
 
+/**
+ * Frame parsed from client bytes in DMC mode.
+ *
+ * `raw.data` is a complete RESP message. `binary.payload` is the RESP bytes
+ * inside one DMC request frame.
+ */
 type DmcBinaryHeadersRequestFrame =
   | { readonly type: 'raw'; readonly data: Buffer }
   | {
@@ -104,22 +135,35 @@ type DmcBinaryHeadersRequestFrame =
     };
 
 interface ProxyEvents {
-  /** Emitted when a new client connects */
+  /** Emitted after the Redis-side socket connects for a client. */
   'connection': (connectionInfo: ConnectionInfo) => void;
-  /** Emitted when a connection is closed */
+  /** Emitted after connection cleanup removes the socket pair. */
   'disconnect': (connectionInfo: ConnectionInfo) => void;
-  /** Emitted when data is transferred */
+  /** Emitted for bytes written toward Redis or toward the client. */
   'data': (connectionId: string, direction: DataDirection, data: Buffer) => void;
-  /** Emitted when an error occurs */
+  /** Emitted for client, Redis-side, or proxy server socket errors. */
   'error': (error: Error, connectionId?: string) => void;
-  /** Emitted when the proxy server starts */
+  /** Emitted after the proxy listen socket is bound. */
   'listening': (host: string, port: number) => void;
-  /** Emitted when the proxy server stops */
+  /** Emitted after the proxy listen socket closes. */
   'close': () => void;
 }
 
-export type Next = (data: Buffer, expectedReplies?: number) => Promise<Buffer>;
+/**
+ * Continuation passed to public RESP interceptors.
+ *
+ * `data` is RESP bytes for one or more command arrays. `next()` passes those
+ * bytes to later interceptors and then to Redis, and resolves with the RESP
+ * replies. DMC headers and reply counts are outside this API.
+ */
+export type Next = (data: Buffer) => Promise<Buffer>;
 
+/**
+ * Public RESP interceptor.
+ *
+ * It runs after client input has been converted to RESP bytes and before those
+ * bytes are written to Redis. In DMC mode the binary header is already stripped.
+ */
 export type InterceptorFunction = (data: Buffer, next: Next, state: InterceptorState) => Promise<Buffer>;
 
 export interface InterceptorDescription {
@@ -141,16 +185,87 @@ interface Interceptor {
   fn: InterceptorFunction;
 }
 
+type StageNext<O, R> = (output: O) => Promise<R>;
+
+/**
+ * Request pipeline stage.
+ *
+ * A stage may emit zero or more values and may change the value type. The
+ * return value is the response bytes for the input it consumed.
+ */
+interface Stage<I, O, R = Buffer> {
+  write(input: I, next: StageNext<O, R>): Promise<readonly R[]>;
+}
+
+/**
+ * RESP bytes to write to Redis plus the number of RESP replies to read.
+ */
+interface ProxyRequest {
+  readonly data: Buffer;
+  readonly expectedReplies: number;
+}
+
+/**
+ * Parser from client socket chunks to `ProxyRequest` values.
+ */
+type RequestParserStage = Stage<Buffer, ProxyRequest>;
+
+interface DmcBinaryHeadersConnectionState extends ConnectionInfoCommon {
+  bindhrEnabled: boolean;
+  requests: DmcBinaryHeadersProxyRequestRecord[];
+}
+
+/**
+ * Optional parser for client input before public RESP interceptors.
+ *
+ * Output must be `ProxyRequest`; `ProxyRequest.data` must be RESP.
+ */
+interface RequestPipelinePlugin {
+  initialize(): Promise<void>;
+
+  createRequestStage(connection: ActiveConnection): RequestParserStage;
+
+  cleanupConnection(connectionId: string): void;
+}
+
 type ResolvedProxyConfig = Omit<Required<ProxyConfig>, 'dmcBinaryHeadersProxy'> & {
   readonly dmcBinaryHeadersProxy?: DmcBinaryHeadersProxyConfig;
 };
 
+/**
+ * Keep adjacent pipeline types explicit.
+ *
+ * DMC parsing is `Buffer -> DmcBinaryHeadersRequestFrame -> ProxyRequest`.
+ * Pairwise composition gives the proxy core one parser without a list whose
+ * elements have different input and output types.
+ */
+function composeStages<A, B, C>(
+  first: Stage<A, B>,
+  second: Stage<B, C>
+): Stage<A, C> {
+  return {
+    write: (input, next) => first.write(input, async (middle) => {
+      const responses = await second.write(middle, next);
+      return Buffer.concat(responses);
+    }),
+  };
+}
+
+/**
+ * Incremental framer for DMC mode.
+ *
+ * The client stream may contain RESP messages and DMC request frames in the
+ * same connection.
+ */
 class DmcBinaryHeadersRequestFramer extends EventEmitter {
   readonly #respFramer = new RespFramer();
   readonly #headerDecoder = new RequestHeaderDecoder();
   #buffer = Buffer.alloc(0);
   #offset = 0;
 
+  /**
+   * Emit complete frames; keep a trailing partial frame buffered.
+   */
   public write(data: Buffer): void {
     this.#buffer = Buffer.concat([this.#buffer, data]);
 
@@ -170,6 +285,9 @@ class DmcBinaryHeadersRequestFramer extends EventEmitter {
     }
   }
 
+  /**
+   * Return null if the buffer does not yet hold a full frame.
+   */
   #readFrame(start: number): { frame: DmcBinaryHeadersRequestFrame; end: number } | null {
     if (this.#buffer[start] !== RequestHeaderEncoder.designatorConstantValue()) {
       const messageEnd = this.#respFramer.findMessageEnd(this.#buffer, start);
@@ -257,13 +375,339 @@ function commandNames(commands: ReadonlyArray<ReadonlyArray<RedisArgument>>): st
   return commands.map((command) => redisArgumentToString(command[0]).toUpperCase());
 }
 
+/**
+ * Parser plugin for the DMC binary-header subset used by client tests.
+ *
+ * Raw RESP is passed through. Binary-header requests are checked, stripped to
+ * RESP before Redis sees them, and wrapped again on the reply path.
+ */
+class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
+  private readonly config: DmcBinaryHeadersProxyConfig;
+  private eligibilityResolver?: EligibilityResolver;
+  private readonly connections = new Map<string, DmcBinaryHeadersConnectionState>();
+
+  constructor(config: DmcBinaryHeadersProxyConfig) {
+    this.config = config;
+  }
+
+  /**
+   * Build the static command eligibility table used by this test proxy.
+   */
+  public async initialize(): Promise<void> {
+    if (this.eligibilityResolver !== undefined) {
+      return;
+    }
+
+    const supportedCommands = this.config.supportedCommands ?? STATIC_COMMAND_RECORDS;
+    this.eligibilityResolver = await createEligibilityResolver(async () => supportedCommands);
+  }
+
+  /**
+   * Each connection has its own framer; partial TCP chunks are per socket.
+   */
+  public createRequestStage(connection: ActiveConnection): RequestParserStage {
+    return composeStages(
+      this.createFrameStage(),
+      this.createDmcRequestStage(this.createConnectionState(connection)),
+    );
+  }
+
+  public cleanupConnection(connectionId: string): void {
+    this.connections.delete(connectionId);
+  }
+
+  /**
+   * Return copies; tests must not mutate live connection state.
+   */
+  public getStats(): DmcBinaryHeadersProxyStats {
+    const connections = Array.from(this.connections.values())
+      .map((connection) => ({
+        id: connection.id,
+        clientAddress: connection.clientAddress,
+        clientPort: connection.clientPort,
+        connectedAt: connection.connectedAt,
+        bindhrEnabled: connection.bindhrEnabled,
+        requests: [...connection.requests],
+      }));
+
+    return {
+      connections,
+      requests: connections.flatMap((connection) => connection.requests),
+    };
+  }
+
+  public clearStats(): void {
+    for (const connection of this.connections.values()) {
+      connection.requests.splice(0);
+    }
+  }
+
+  /**
+   * First DMC parser step: client bytes to RESP/DMC frames.
+   */
+  private createFrameStage(): Stage<Buffer, DmcBinaryHeadersRequestFrame> {
+    const framer = new DmcBinaryHeadersRequestFramer();
+    return {
+      write: async (chunk, next) => {
+        const frames: DmcBinaryHeadersRequestFrame[] = [];
+        const onMessage = (frame: DmcBinaryHeadersRequestFrame) => frames.push(frame);
+        framer.on('message', onMessage);
+
+        try {
+          framer.write(chunk);
+        } finally {
+          framer.off('message', onMessage);
+        }
+
+        const responses: Buffer[] = [];
+        for (const frame of frames) {
+          responses.push(await next(frame));
+        }
+        return responses;
+      },
+    };
+  }
+
+  /**
+   * Second DMC parser step: framer output to Redis RESP requests.
+   */
+  private createDmcRequestStage(
+    state: DmcBinaryHeadersConnectionState
+  ): Stage<DmcBinaryHeadersRequestFrame, ProxyRequest> {
+    return {
+      write: async (frame, next) => frame.type === 'binary'
+        ? this.handleRequestFrame(state, frame, next)
+        : this.handleRawFrame(state, frame.data, next),
+    };
+  }
+
+  private createConnectionState(
+    connection: ActiveConnection
+  ): DmcBinaryHeadersConnectionState {
+    const existing = this.connections.get(connection.id);
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    const state: DmcBinaryHeadersConnectionState = {
+      id: connection.id,
+      clientAddress: connection.clientAddress,
+      clientPort: connection.clientPort,
+      connectedAt: connection.connectedAt,
+      bindhrEnabled: this.config.bindhrEnabled ?? true,
+      requests: [],
+    };
+    this.connections.set(connection.id, state);
+    return state;
+  }
+
+  /**
+   * Record raw RESP and forward it unchanged.
+   */
+  private async handleRawFrame(
+    state: DmcBinaryHeadersConnectionState,
+    data: Buffer,
+    next: StageNext<ProxyRequest, Buffer>
+  ): Promise<readonly Buffer[]> {
+    const commands = parseRespCommandArrays(data);
+    const names = commandNames(commands);
+    const record: DmcBinaryHeadersProxyRequestRecord = {
+      connectionId: state.id,
+      type: 'raw',
+      bindhrEnabled: state.bindhrEnabled,
+      commands: stringifyCommands(commands),
+      commandNames: names,
+      commandCount: commands.length,
+    };
+    state.requests.push(record);
+
+    return [await next({ data, expectedReplies: commands.length || 1 })];
+  }
+
+  /**
+   * Strip a valid DMC request to RESP; wrap the RESP replies on return.
+   */
+  private async handleRequestFrame(
+    state: DmcBinaryHeadersConnectionState,
+    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
+    next: StageNext<ProxyRequest, Buffer>
+  ): Promise<readonly Buffer[]> {
+    let commands: ReadonlyArray<ReadonlyArray<RedisArgument>> = [];
+    let validationError = this.validateRequestHeader(frame);
+
+    if (validationError === null) {
+      try {
+        commands = parseRespCommandArrays(frame.payload);
+        validationError = this.validateCommands(frame, commands, state);
+      } catch (err) {
+        validationError = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    const record: DmcBinaryHeadersProxyRequestRecord = {
+      connectionId: state.id,
+      type: 'binary',
+      bindhrEnabled: state.bindhrEnabled,
+      commands: stringifyCommands(commands),
+      commandNames: commandNames(commands),
+      commandCount: frame.header.commandCount,
+      slot: frame.header.slot,
+      clientIdx: frame.header.clientIdx,
+      rejected: validationError !== null,
+      error: validationError ?? undefined,
+    };
+    state.requests.push(record);
+
+    if (validationError !== null) {
+      return [this.createProtocolErrorResponse(
+        validationError,
+        frame.header.commandCount,
+        frame.header.clientIdx,
+      )];
+    }
+
+    const redisResponse = await next({
+      data: frame.payload,
+      expectedReplies: frame.header.commandCount,
+    });
+    return [this.createReplyFrame(redisResponse, frame.header.commandCount, frame.header.clientIdx)];
+  }
+
+  /**
+   * Header checks do not require RESP payload decoding.
+   */
+  private validateRequestHeader(
+    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
+  ): string | null {
+    if (frame.header.commandCount < RequestHeaderEncoder.commandCountMinValue()) {
+      return `Invalid binary-header command count ${frame.header.commandCount}`;
+    }
+
+    if (frame.header.commandCount > RequestHeaderEncoder.commandCountMaxValue()) {
+      return `Invalid binary-header command count ${frame.header.commandCount}`;
+    }
+
+    if (
+      frame.header.slot !== RequestHeaderEncoder.slotNullValue() &&
+      frame.header.slot > RequestHeaderEncoder.slotMaxValue()
+    ) {
+      return `Invalid binary-header slot ${frame.header.slot}`;
+    }
+
+    return null;
+  }
+
+  /**
+   * Enforce the static eligibility config used by this test proxy.
+   */
+  private validateCommands(
+    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
+    commands: ReadonlyArray<ReadonlyArray<RedisArgument>>,
+    state: DmcBinaryHeadersConnectionState,
+  ): string | null {
+    if (!state.bindhrEnabled) {
+      return 'Binary headers are disabled for this connection';
+    }
+
+    if (commands.length !== frame.header.commandCount) {
+      return `Binary-header command count ${frame.header.commandCount} does not match RESP payload command count ${commands.length}`;
+    }
+
+    const validateEligibility = this.config.validateEligibility !== false;
+    const resolver = this.eligibilityResolver;
+    if (validateEligibility && resolver === undefined) {
+      return 'DMC proxy eligibility resolver was not initialized';
+    }
+
+    if (!validateEligibility) {
+      for (const command of commands) {
+        const name = redisArgumentToString(command[0]).toUpperCase();
+        if (name === 'BINDHR') {
+          return 'BINDHR must be sent as raw RESP';
+        }
+      }
+      return null;
+    }
+
+    let resolvedSlot = RequestHeaderEncoder.slotNullValue();
+    for (const command of commands) {
+      const name = redisArgumentToString(command[0]).toUpperCase();
+      if (name === 'BINDHR') {
+        return 'BINDHR must be sent as raw RESP';
+      }
+
+      const result = resolver!.getEligibility(command);
+      if (!result.eligible) {
+        return `${name || '<empty>'} is not binary-header eligible in this proxy`;
+      }
+
+      if (result.slot === RequestHeaderEncoder.slotNullValue()) {
+        continue;
+      }
+
+      if (resolvedSlot === RequestHeaderEncoder.slotNullValue()) {
+        resolvedSlot = result.slot;
+      } else if (resolvedSlot !== result.slot) {
+        return `Binary-header payload contains multiple slots (${resolvedSlot}, ${result.slot})`;
+      }
+    }
+
+    if (frame.header.slot !== resolvedSlot) {
+      return `Binary-header slot ${frame.header.slot} does not match decoded command slot ${resolvedSlot}`;
+    }
+
+    return null;
+  }
+
+  private createReplyFrame(
+    payload: Buffer,
+    commandCount: number,
+    clientIdx: number,
+    protocolError = false,
+  ): Buffer {
+    return Buffer.concat([
+      ResponseHeaderEncoder.allocateAndEncode(payload.length, commandCount, protocolError, clientIdx),
+      payload,
+    ]);
+  }
+
+  /**
+   * Return enough RESP errors to satisfy the client's reply tracker.
+   */
+  private createProtocolErrorResponse(
+    message: string,
+    commandCount: number,
+    clientIdx: number,
+  ): Buffer {
+    const safeCommandCount = commandCount >= ResponseHeaderEncoder.commandCountMinValue() &&
+      commandCount <= ResponseHeaderEncoder.commandCountMaxValue()
+      ? commandCount
+      : 1;
+    const payload = Buffer.concat(
+      Array.from(
+        { length: safeCommandCount },
+        () => Buffer.from(`-ERR DMC binary header proxy rejected request: ${message}\r\n`),
+      ),
+    );
+
+    return this.createReplyFrame(payload, safeCommandCount, clientIdx, true);
+  }
+}
+
+/**
+ * TCP proxy between node-redis and a Redis test server.
+ *
+ * Client bytes are parsed to `ProxyRequest`, passed through public RESP
+ * interceptors, then written to Redis. DMC request frames are stripped before
+ * the public interceptors run.
+ */
 export class RedisProxy extends EventEmitter {
   private readonly server: net.Server;
   public readonly config: ResolvedProxyConfig;
   private readonly connections: Map<string, ActiveConnection>;
   private isRunning: boolean;
   private globalInterceptors: Interceptor[] = [];
-  private dmcBinaryHeadersEligibilityResolver?: EligibilityResolver;
+  private readonly requestPipelinePlugin?: RequestPipelinePlugin;
 
   constructor(config: ProxyConfig) {
     super();
@@ -279,11 +723,15 @@ export class RedisProxy extends EventEmitter {
 
     this.connections = new Map();
     this.isRunning = false;
+    this.requestPipelinePlugin = this.createRequestPipelinePlugin();
     this.server = this.createServer();
   }
 
+  /**
+   * Initialize the parser before accepting client sockets.
+   */
   public async start(): Promise<void> {
-    await this.initializeDmcBinaryHeadersProxy();
+    await this.initializeRequestPipelinePlugin();
 
     return new Promise((resolve, reject) => {
       if (this.isRunning) {
@@ -306,13 +754,22 @@ export class RedisProxy extends EventEmitter {
     });
   }
 
-  private async initializeDmcBinaryHeadersProxy(): Promise<void> {
-    if (this.config.dmcBinaryHeadersProxy === undefined || this.dmcBinaryHeadersEligibilityResolver !== undefined) {
-      return;
+  /**
+   * DMC replaces the plain RESP parser when binary-header mode is enabled.
+   */
+  private createRequestPipelinePlugin(): RequestPipelinePlugin | undefined {
+    if (this.config.dmcBinaryHeadersProxy === undefined) {
+      return undefined;
     }
 
-    const supportedCommands = this.config.dmcBinaryHeadersProxy.supportedCommands ?? STATIC_COMMAND_RECORDS;
-    this.dmcBinaryHeadersEligibilityResolver = await createEligibilityResolver(async () => supportedCommands);
+    return new DmcBinaryHeadersProxyPlugin(this.config.dmcBinaryHeadersProxy);
+  }
+
+  /**
+   * Parser setup may load command eligibility data.
+   */
+  private async initializeRequestPipelinePlugin(): Promise<void> {
+    await this.requestPipelinePlugin?.initialize();
   }
 
   public async stop(): Promise<void> {
@@ -349,6 +806,9 @@ export class RedisProxy extends EventEmitter {
     };
   }
 
+  /**
+   * Existing connections use the new list on their next request.
+   */
   public setGlobalInterceptors(
     interceptorDescriptions: Array<InterceptorDescription>,
   ) {
@@ -375,37 +835,33 @@ export class RedisProxy extends EventEmitter {
         clientAddress: conn.clientAddress,
         clientPort: conn.clientPort,
         connectedAt: conn.connectedAt,
-        interceptors: conn.interceptors.map(i => i.state),
-        dmcBinaryHeadersProxy: conn.dmcBinaryHeadersProxy === undefined ? undefined : {
-          bindhrEnabled: conn.dmcBinaryHeadersProxy.bindhrEnabled,
-          requests: [...conn.dmcBinaryHeadersProxy.requests]
-        }
+        interceptors: conn.interceptors.map(i => i.state)
       })),
     };
   }
 
+  /**
+   * DMC records are separate from `getStats()` socket/interceptor counters.
+   */
   public getDmcBinaryHeadersProxyStats(): DmcBinaryHeadersProxyStats {
-    const connections = Array.from(this.connections.values())
-      .filter((connection) => connection.dmcBinaryHeadersProxy !== undefined)
-      .map((connection) => ({
-        id: connection.id,
-        clientAddress: connection.clientAddress,
-        clientPort: connection.clientPort,
-        connectedAt: connection.connectedAt,
-        bindhrEnabled: connection.dmcBinaryHeadersProxy!.bindhrEnabled,
-        requests: [...connection.dmcBinaryHeadersProxy!.requests],
-      }));
-
-    return {
-      connections,
-      requests: connections.flatMap((connection) => connection.requests),
+    return this.getDmcBinaryHeadersProxyPlugin()?.getStats() ?? {
+      connections: [],
+      requests: [],
     };
   }
 
   public clearDmcBinaryHeadersProxyStats(): void {
-    for (const connection of this.connections.values()) {
-      connection.dmcBinaryHeadersProxy?.requests.splice(0);
-    }
+    this.getDmcBinaryHeadersProxyPlugin()?.clearStats();
+  }
+
+  private getDmcBinaryHeadersProxyPlugin(): DmcBinaryHeadersProxyPlugin | undefined {
+    return this.requestPipelinePlugin instanceof DmcBinaryHeadersProxyPlugin
+      ? this.requestPipelinePlugin
+      : undefined;
+  }
+
+  private cleanupRequestPipelinePlugin(connectionId: string): void {
+    this.requestPipelinePlugin?.cleanupConnection(connectionId);
   }
 
   public closeConnection(connectionId: string): boolean {
@@ -417,6 +873,7 @@ export class RedisProxy extends EventEmitter {
     connection.clientSocket.destroy();
     connection.serverSocket.destroy();
     this.connections.delete(connectionId);
+    this.cleanupRequestPipelinePlugin(connectionId);
     this.emit('disconnect', connection);
     return true;
   }
@@ -497,6 +954,10 @@ export class RedisProxy extends EventEmitter {
     });
   }
 
+  /**
+   * Do not read client bytes until the Redis socket exists and the pipeline is
+   * installed.
+   */
   private handleClientConnection(clientSocket: net.Socket): void {
     clientSocket.pause();
     const serverSocket = this.createTargetSocket();
@@ -514,9 +975,11 @@ export class RedisProxy extends EventEmitter {
     });
 
     const respQueue = new RespQueue(serverSocket);
-    const forwardRawRequest = this.createRawRequestForwarder(connectionInfo, respQueue);
+    const requestParser = this.createRequestParserStage(connectionInfo);
+    const interceptorStage = this.createInterceptorChainStage(connectionInfo);
+    const sendToRedis = this.createRedisTerminal(connectionInfo, respQueue);
 
-    this.attachClientRequestHandler(connectionInfo, respQueue, forwardRawRequest);
+    this.attachRequestPipeline(connectionInfo, requestParser, interceptorStage, sendToRedis);
     this.attachPushHandler(connectionInfo, respQueue);
     this.attachSocketLifecycleHandlers(connectionInfo);
   }
@@ -540,93 +1003,99 @@ export class RedisProxy extends EventEmitter {
       clientSocket,
       serverSocket,
       interceptors: [],
-      dmcBinaryHeadersProxy: this.config.dmcBinaryHeadersProxy === undefined ? undefined : {
-        bindhrEnabled: this.config.dmcBinaryHeadersProxy.bindhrEnabled ?? true,
-        requests: [],
+    };
+  }
+
+  /**
+   * Choose the client-byte parser for this connection.
+   */
+  private createRequestParserStage(connection: ActiveConnection): RequestParserStage {
+    return this.requestPipelinePlugin?.createRequestStage(connection) ?? this.createRespFrameStage();
+  }
+
+  /**
+   * Plain RESP parser: one complete client message becomes one Redis request.
+   */
+  private createRespFrameStage(): Stage<Buffer, ProxyRequest> {
+    const framer = new RespFramer();
+    return {
+      write: async (chunk, next) => {
+        const frames: Buffer[] = [];
+        const onMessage = (frame: Buffer) => frames.push(frame);
+        framer.on('message', onMessage);
+
+        try {
+          framer.write(chunk);
+        } finally {
+          framer.off('message', onMessage);
+        }
+
+        const responses: Buffer[] = [];
+        for (const frame of frames) {
+          responses.push(await next({ data: frame, expectedReplies: 1 }));
+        }
+        return responses;
       },
     };
   }
 
-  private createRawRequestForwarder(
-    connection: ActiveConnection,
-    respQueue: RespQueue
-  ): Next {
-    return async (data: Buffer): Promise<Buffer> => {
-      const localDmcResponse = this.handleDmcBinaryHeadersRawRequest(connection, data);
-      if (localDmcResponse !== null) {
-        return localDmcResponse;
-      }
+  /**
+   * Hide `expectedReplies` from public interceptors; keep it around their
+   * `Buffer -> Buffer` calls.
+   */
+  private createInterceptorChainStage(connection: ActiveConnection): Stage<ProxyRequest, ProxyRequest> {
+    return {
+      write: async (request, next) => {
+        const interceptorChain = connection.interceptors.concat(this.globalInterceptors).reduceRight<StageNext<ProxyRequest, Buffer>>(
+          (nextInterceptor, interceptor) => (request) =>
+            interceptor.fn(
+              request.data,
+              (data) => nextInterceptor({ ...request, data }),
+              interceptor.state,
+            ),
+          next,
+        );
 
-      return this.createInterceptorChain(connection, respQueue)(data);
+        return [await interceptorChain(request)];
+      },
     };
   }
 
-  private createInterceptorChain(
+  /**
+   * Redis writer. `request.data` must be RESP.
+   */
+  private createRedisTerminal(
     connection: ActiveConnection,
     respQueue: RespQueue
-  ): Next {
-    const last = async (data: Buffer): Promise<Buffer> => {
-      this.emit('data', connection.id, 'client->server', data);
-      return respQueue.request(data);
+  ): StageNext<ProxyRequest, Buffer> {
+    return async (request) => {
+      this.emit('data', connection.id, 'client->server', request.data);
+      return respQueue.request(request.data, request.expectedReplies);
     };
-
-    return connection.interceptors.concat(this.globalInterceptors).reduceRight<Next>(
-      (next, interceptor) => (data) =>
-        interceptor.fn(data, next, interceptor.state),
-      last,
-    );
   }
 
-  private attachClientRequestHandler(
+  /**
+   * Keep response order equal to request read order.
+   */
+  private attachRequestPipeline(
     connection: ActiveConnection,
-    respQueue: RespQueue,
-    forwardRawRequest: Next
+    requestParser: RequestParserStage,
+    interceptorStage: Stage<ProxyRequest, ProxyRequest>,
+    terminal: StageNext<ProxyRequest, Buffer>
   ): void {
-    if (connection.dmcBinaryHeadersProxy !== undefined) {
-      this.attachDmcBinaryHeadersRequestHandler(connection, respQueue, forwardRawRequest);
-      return;
-    }
-
-    this.attachRespRequestHandler(connection, forwardRawRequest);
-  }
-
-  private attachDmcBinaryHeadersRequestHandler(
-    connection: ActiveConnection,
-    respQueue: RespQueue,
-    forwardRawRequest: Next
-  ): void {
-    const requestFramer = new DmcBinaryHeadersRequestFramer();
+    const requestStage = composeStages(requestParser, interceptorStage);
     let responseChain = Promise.resolve();
 
-    requestFramer.on('message', (frame: DmcBinaryHeadersRequestFrame) => {
+    connection.clientSocket.on('data', (chunk) => {
       responseChain = responseChain.then(async () => {
-        const response = frame.type === 'binary'
-          ? await this.handleDmcBinaryHeadersRequest(connection, frame, respQueue)
-          : await forwardRawRequest(frame.data);
-        this.writeResponseToClient(connection, response);
+        const responses = await requestStage.write(chunk, terminal);
+        for (const response of responses) {
+          this.writeResponseToClient(connection, response);
+        }
       }).catch((err) => {
         this.handleProxyError(connection, err);
       });
     });
-
-    connection.clientSocket.on('data', data => requestFramer.write(data));
-  }
-
-  private attachRespRequestHandler(
-    connection: ActiveConnection,
-    forwardRawRequest: Next
-  ): void {
-    const clientRespFramer = new RespFramer();
-    clientRespFramer.on('message', async (data) => {
-      try {
-        const response = await forwardRawRequest(data);
-        this.writeResponseToClient(connection, response);
-      } catch (err) {
-        this.handleProxyError(connection, err);
-      }
-    });
-
-    connection.clientSocket.on('data', data => clientRespFramer.write(data));
   }
 
   private attachPushHandler(
@@ -691,6 +1160,7 @@ export class RedisProxy extends EventEmitter {
     const connection = this.connections.get(connectionId);
     if (connection) {
       this.connections.delete(connectionId);
+      this.cleanupRequestPipelinePlugin(connectionId);
       this.emit('disconnect', connection);
     }
   }
@@ -703,215 +1173,6 @@ export class RedisProxy extends EventEmitter {
     if (this.config.enableLogging) {
       console.log(`[RedisProxy] ${new Date().toISOString()} - ${message}`);
     }
-  }
-
-  private handleDmcBinaryHeadersRawRequest(connection: ActiveConnection, data: Buffer): Buffer | null {
-    if (connection.dmcBinaryHeadersProxy === undefined) {
-      return null;
-    }
-
-    const commands = parseRespCommandArrays(data);
-    const names = commandNames(commands);
-    const bindhrCommand = commands.length === 1 && names[0] === 'BINDHR';
-    const record: DmcBinaryHeadersProxyRequestRecord = {
-      connectionId: connection.id,
-      type: 'raw',
-      bindhrEnabled: connection.dmcBinaryHeadersProxy.bindhrEnabled,
-      commands: stringifyCommands(commands),
-      commandNames: names,
-      commandCount: commands.length,
-      handledLocally: bindhrCommand,
-    };
-    connection.dmcBinaryHeadersProxy.requests.push(record);
-
-    if (!bindhrCommand) {
-      return null;
-    }
-
-    return this.handleBindhrCommand(connection, commands[0]);
-  }
-
-  private handleBindhrCommand(
-    connection: ActiveConnection,
-    command: ReadonlyArray<RedisArgument>,
-  ): Buffer {
-    const subcommand = redisArgumentToString(command[1]).toUpperCase();
-    if (command.length > 2) {
-      return Buffer.from('-ERR syntax error\r\n');
-    }
-
-    switch (subcommand || 'STATUS') {
-      case 'ENABLE':
-        connection.dmcBinaryHeadersProxy!.bindhrEnabled = true;
-        return Buffer.from(':1\r\n');
-      case 'DISABLE':
-        connection.dmcBinaryHeadersProxy!.bindhrEnabled = false;
-        return Buffer.from(':0\r\n');
-      case 'STATUS':
-        return Buffer.from(`:${connection.dmcBinaryHeadersProxy!.bindhrEnabled ? 1 : 0}\r\n`);
-      default:
-        return Buffer.from('-ERR syntax error\r\n');
-    }
-  }
-
-  private async handleDmcBinaryHeadersRequest(
-    connection: ActiveConnection,
-    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
-    respQueue: RespQueue,
-  ): Promise<Buffer> {
-    const dmcBinaryHeadersProxy = connection.dmcBinaryHeadersProxy;
-    if (dmcBinaryHeadersProxy === undefined) {
-      return respQueue.request(frame.data, frame.header.commandCount);
-    }
-
-    let commands: ReadonlyArray<ReadonlyArray<RedisArgument>> = [];
-    let validationError = this.validateDmcBinaryHeadersRequestHeader(frame);
-
-    if (validationError === null) {
-      try {
-        commands = parseRespCommandArrays(frame.payload);
-        validationError = this.validateDmcBinaryHeadersCommands(frame, commands, dmcBinaryHeadersProxy);
-      } catch (err) {
-        validationError = err instanceof Error ? err.message : String(err);
-      }
-    }
-
-    const record: DmcBinaryHeadersProxyRequestRecord = {
-      connectionId: connection.id,
-      type: 'binary',
-      bindhrEnabled: dmcBinaryHeadersProxy.bindhrEnabled,
-      commands: stringifyCommands(commands),
-      commandNames: commandNames(commands),
-      commandCount: frame.header.commandCount,
-      slot: frame.header.slot,
-      clientIdx: frame.header.clientIdx,
-      rejected: validationError !== null,
-      error: validationError ?? undefined,
-    };
-    dmcBinaryHeadersProxy.requests.push(record);
-
-    if (validationError !== null) {
-      return this.createDmcBinaryHeadersProtocolErrorResponse(
-        validationError,
-        frame.header.commandCount,
-        frame.header.clientIdx,
-      );
-    }
-
-    this.emit('data', connection.id, 'client->server', frame.payload);
-    const redisResponse = await respQueue.request(frame.payload, frame.header.commandCount);
-    return this.createDmcBinaryHeadersReplyFrame(redisResponse, frame.header.commandCount, frame.header.clientIdx);
-  }
-
-  private validateDmcBinaryHeadersRequestHeader(
-    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
-  ): string | null {
-    if (frame.header.commandCount < RequestHeaderEncoder.commandCountMinValue()) {
-      return `Invalid binary-header command count ${frame.header.commandCount}`;
-    }
-
-    if (frame.header.commandCount > RequestHeaderEncoder.commandCountMaxValue()) {
-      return `Invalid binary-header command count ${frame.header.commandCount}`;
-    }
-
-    if (
-      frame.header.slot !== RequestHeaderEncoder.slotNullValue() &&
-      frame.header.slot > RequestHeaderEncoder.slotMaxValue()
-    ) {
-      return `Invalid binary-header slot ${frame.header.slot}`;
-    }
-
-    return null;
-  }
-
-  private validateDmcBinaryHeadersCommands(
-    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
-    commands: ReadonlyArray<ReadonlyArray<RedisArgument>>,
-    dmcBinaryHeadersProxy: NonNullable<ActiveConnection['dmcBinaryHeadersProxy']>,
-  ): string | null {
-    if (!dmcBinaryHeadersProxy.bindhrEnabled) {
-      return 'Binary headers are disabled for this connection';
-    }
-
-    if (commands.length !== frame.header.commandCount) {
-      return `Binary-header command count ${frame.header.commandCount} does not match RESP payload command count ${commands.length}`;
-    }
-
-    const validateEligibility = this.config.dmcBinaryHeadersProxy?.validateEligibility !== false;
-    const resolver = this.dmcBinaryHeadersEligibilityResolver;
-    if (validateEligibility && resolver === undefined) {
-      return 'DMC proxy eligibility resolver was not initialized';
-    }
-
-    if (!validateEligibility) {
-      for (const command of commands) {
-        const name = redisArgumentToString(command[0]).toUpperCase();
-        if (name === 'BINDHR') {
-          return 'BINDHR must be sent as raw RESP';
-        }
-      }
-      return null;
-    }
-
-    let resolvedSlot = RequestHeaderEncoder.slotNullValue();
-    for (const command of commands) {
-      const name = redisArgumentToString(command[0]).toUpperCase();
-      if (name === 'BINDHR') {
-        return 'BINDHR must be sent as raw RESP';
-      }
-
-      const result = resolver!.getEligibility(command);
-      if (!result.eligible) {
-        return `${name || '<empty>'} is not binary-header eligible in this proxy`;
-      }
-
-      if (result.slot === RequestHeaderEncoder.slotNullValue()) {
-        continue;
-      }
-
-      if (resolvedSlot === RequestHeaderEncoder.slotNullValue()) {
-        resolvedSlot = result.slot;
-      } else if (resolvedSlot !== result.slot) {
-        return `Binary-header payload contains multiple slots (${resolvedSlot}, ${result.slot})`;
-      }
-    }
-
-    if (frame.header.slot !== resolvedSlot) {
-      return `Binary-header slot ${frame.header.slot} does not match decoded command slot ${resolvedSlot}`;
-    }
-
-    return null;
-  }
-
-  private createDmcBinaryHeadersReplyFrame(
-    payload: Buffer,
-    commandCount: number,
-    clientIdx: number,
-    protocolError = false,
-  ): Buffer {
-    return Buffer.concat([
-      ResponseHeaderEncoder.allocateAndEncode(payload.length, commandCount, protocolError, clientIdx),
-      payload,
-    ]);
-  }
-
-  private createDmcBinaryHeadersProtocolErrorResponse(
-    message: string,
-    commandCount: number,
-    clientIdx: number,
-  ): Buffer {
-    const safeCommandCount = commandCount >= ResponseHeaderEncoder.commandCountMinValue() &&
-      commandCount <= ResponseHeaderEncoder.commandCountMaxValue()
-      ? commandCount
-      : 1;
-    const payload = Buffer.concat(
-      Array.from(
-        { length: safeCommandCount },
-        () => Buffer.from(`-ERR DMC binary header proxy rejected request: ${message}\r\n`),
-      ),
-    );
-
-    return this.createDmcBinaryHeadersReplyFrame(payload, safeCommandCount, clientIdx, true);
   }
 }
 import { createServer } from 'net';
