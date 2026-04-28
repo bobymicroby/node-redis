@@ -548,6 +548,7 @@ export default class RedisCommandsQueue {
           (typeof reply === "string" && reply === "RESET") ||
           (reply instanceof Buffer && RESET.equals(reply))
         ) {
+          this.#inbound?.noteReplyOrPush?.('reply');
           this.#resetDecoderCallbacks();
           this.#resetFallbackOnReply = undefined;
           this.#pubSub.reset();

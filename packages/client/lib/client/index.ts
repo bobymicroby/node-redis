@@ -49,7 +49,6 @@ export interface BinaryHeadersOptions {
    */
   validateReplyStream?: boolean;
   'stats-collector'?: 'noop' | 'enabled';
-  getStats?: () => BinaryHeaderStats;
 }
 
 export interface RedisClientOptions<
@@ -495,6 +494,7 @@ export default class RedisClient<
   #paused = false;
   #clientIdentity: ClientIdentity;
   #registered = false;
+  #binaryHeaderStatsCounter: BinaryHeaderStatsCounter = disabledBinaryHeaderStatsCounter();
 
   get clientSideCache() {
     return this._self.#clientSideCache;
@@ -502,6 +502,10 @@ export default class RedisClient<
 
   get options(): RedisClientOptions<M, F, S, RESP> {
     return this._self.#options;
+  }
+
+  getBinaryHeaderStats(): BinaryHeaderStats {
+    return this._self.#binaryHeaderStatsCounter.snapshot();
   }
 
   /**
@@ -728,11 +732,9 @@ export default class RedisClient<
     const binaryHeadersOpts = this.#normalizedBinaryHeadersOptions();
 
     if (binaryHeadersOpts?.enabled) {
-      const statsCounter: BinaryHeaderStatsCounter = binaryHeadersOpts['stats-collector'] === 'enabled'
+      this.#binaryHeaderStatsCounter = binaryHeadersOpts['stats-collector'] === 'enabled'
         ? DefaultBinaryHeaderStatsCounter.create()
         : disabledBinaryHeaderStatsCounter();
-
-      binaryHeadersOpts.getStats = () => statsCounter.snapshot();
 
       const codec = new BinaryHeadersCodec({
         outbound: {
@@ -756,7 +758,7 @@ export default class RedisClient<
             this.emit('error', new Error(`Binary header protocol error: clientIdx=${header.clientIdx}`));
           },
         },
-        statsCounter,
+        statsCounter: this.#binaryHeaderStatsCounter,
         validateReplyStream: binaryHeadersOpts.validateReplyStream,
       });
 

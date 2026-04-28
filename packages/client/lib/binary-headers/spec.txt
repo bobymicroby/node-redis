@@ -1,24 +1,3 @@
-
-
-
-
-
-
-
-
-
-binary headers - phase 1
-
-
-
-By Sasha Grinshpun
-
-11 min
-
-25
-
-Add a reaction
-App IconNumbered Headings
 Binary Headers Proposal, stage 1
 The main purpose of this proposal is optimization of the current RESP protocol by introducing a fast path binary header that will be used by DMC proxy to route the command to the correct shard, keeping the required changes as minimal and simple as possible. So, the proposed protocol is very close to the protocol we've used in DMC POC.
 
@@ -32,7 +11,7 @@ The request bin header will contain the following information:
 
 2 bytes — slot number in network byte order. Legal range: 0..16383 (0x0000..0x3FFF). Special value 0xFFFF is reserved for "no slot".
 
-2 bytes — client_idx in network byte order. This field enables clients to set a correlation ID for tracking request-response pairs across the connection lifecycle. 
+2 bytes — client_idx in network byte order. This field enables clients to set a correlation ID for tracking request-response pairs across the connection lifecycle.
 
 <length> bytes of RESP payload. In the case of request exceeding the length limit, the request should be sent as raw RESP.
 
@@ -98,7 +77,7 @@ BINDHR command
 Syntax
 
 
-BINDHR [ENABLE|DISABLE|STATUS] 
+BINDHR [ENABLE|DISABLE|STATUS]
 Description
 The BINDHR command is used to enable/disable/query the binary headers mode. It is sent by the client to the server/proxy.
 
@@ -114,7 +93,7 @@ Example
 redis> BINDHR DISABLE
 (integer) 0
 Client behavior
-Conforming client should use BINDHR ENABLE to enable the binary headers mode. If the server/proxy does not support the binary headers mode, it should return an error. The client should use this information together with the per-command flag (described later) to decide whether to send binary headers or not. 
+Conforming client should use BINDHR ENABLE to enable the binary headers mode. If the server/proxy does not support the binary headers mode, it should return an error. The client should use this information together with the per-command flag (described later) to decide whether to send binary headers or not.
 
 Important: the client should not send binary headers for the BINDHR command itself, nor for any other command that flagged with binhdr flag. For those commands, the client should fall back to the regular RESP protocol. This simple approach should work for any RESP version (2 or 3) and requires a minimal processing on DMC side.
 
@@ -128,7 +107,7 @@ BINDHR disabled
 
 ["BINDHR", 0]
 Upon receiving this notification, the client should disable the binary headers mode.
-It's an advisory notification, the client is not required to disable the binary headers mode, but it's recommended to do so, as reciving it means, that the bdb has decided to disable the binary headers mode, probably due to some problems. 
+It's an advisory notification, the client is not required to disable the binary headers mode, but it's recommended to do so, as reciving it means, that the bdb has decided to disable the binary headers mode, probably due to some problems.
 
 Binary header commands changed
 
@@ -140,12 +119,12 @@ Listing the supporting commands
 The reply of COMMAND command will be extended to contain an additional flag named binhdr for the commands that can be encoded with binary headers, redis will implicitly compute this flag mostly by using other flags: commands that have key-spec, are (a least possibly) non-blocking, are generally allowed in scripts (but allowing scripts and mult-exec / watch, discard), and possibly an exception flag we’ll add. the reasoning is that we wanna block any proxy-terminated command (that’s also not allowed in scripts), or anything that requires dedicated sconn. we’ll also include commands without key-spec, as long as they don’t have a REQUEST_POLICY tip.
 
 Packing commands
-Multiple commands may be packed into a single message. The binary header should be sent only once, before the first command. The number of commands in the binary header should match the number of commands in the message. 
+Multiple commands may be packed into a single message. The binary header should be sent only once, before the first command. The number of commands in the binary header should match the number of commands in the message.
 
 Packing rules
 The client should not pack commands that are not in the list of supported commands.
 
-All commands in the message should have the same slot number. 
+All commands in the message should have the same slot number.
 
 If the slot number is unknown, 0xFFFF should be used.
 
@@ -167,7 +146,7 @@ set {x}b 2
 mset {x}c 3 {x}d 4
 time
 get {x}c
-Can be packed into a single message, since all keys belong to the same slot. The binary header should contain the slot number of {x}. 
+Can be packed into a single message, since all keys belong to the same slot. The binary header should contain the slot number of {x}.
 
 On-the-wire representation
 Assuming RESP2-style arrays of bulk strings, this packed message will look on the wire as follows.
@@ -194,11 +173,11 @@ Immediately after these 10 bytes, the RESP payload is sent verbatim:
 Where the total length of the RESP payload is 159 bytes, matching the LENGTH field in the binary header.
 
 Handling replies
-Requests and replies should be treated (by the client) as two (almost) independent streams (requests and replies). Almost means, that the client should not assume any dependency between the requests and replies, with 3 exceptions: 
+Requests and replies should be treated (by the client) as two (almost) independent streams (requests and replies). Almost means, that the client should not assume any dependency between the requests and replies, with 3 exceptions:
 
-(trivial) The total number of replies received at any given time should be less or equal to the number of total requests sent. 
+(trivial) The total number of replies received at any given time should be less or equal to the number of total requests sent.
 
-(trivial) The order of replies should match the order of requests. 
+(trivial) The order of replies should match the order of requests.
 
 Each packed reply should not contain the replies from different packed messages. While on dmc -> client leg this requirement isn't that important, it is important on the redis -> dmc leg. So, I prefer to keep it for consistency.
 
@@ -234,7 +213,7 @@ Let's see now why the 3 requirement is important on the redis -> dmc leg. The po
 
 DMC behavior
 Binary headers support configuration
-BINDHR support may be enabled/disabled on bdb level and can be changed dynamically at runtime. 
+BINDHR support may be enabled/disabled on bdb level and can be changed dynamically at runtime.
 
 Suppoted BINDHR commands
 The choice of the set of binary header commands is dictated by the main idea of binary headers - to send the command/pack of commands to the correct shard on the shared connection without any parsing and relying only on the information in the binary header (slot number, length, number of commands).
@@ -242,40 +221,40 @@ The choice of the set of binary header commands is dictated by the main idea of 
 DMC <-> Redis interaction
 DMC may choose to use binary headers on some connections to redis. In that case, it should send the BINDHR ENABLE command to the redis to enable the binary headers mode. This command will be sent only once per connection. If binary headers will be disabled on the bdb level, DMC should not use binary headers on any connection.
 
-a boolean (1) (integer) 1) - redis supports the binary headers mode. DMC can use binary headers on this connection. 
+a boolean (1) (integer) 1) - redis supports the binary headers mode. DMC can use binary headers on this connection.
 
 Any other response will be treated as if redis doesn't support binary headers mode. DMC should not use binary headers on this connection. In this case DMC sill might support binary headers from the client perspective by stripping the binary header and sending the message in raw RESP format. Actually, I don't expect any answer other then true/false or error, but better to be prepared for any case.
 
 Handling binary headers requests
 The major point in binary headers is to send the message to the correct shard without any parsing. As long as the whole incoming message is read in one iteration of epoll loop, it's simple: we decide on the destination shard based on the binary header and send the message as is. On the other hand, if we read only a part of message, it might be a problem.
 
-Actually, we're already handling the same problem today for a single long transaction: depending on configuration (link_sconn_on_full_request) we might decide to delay the handling of the transaction until we read the whole message. The same approach can be used for binary headers as well. The difference is, that we might have a packed message, that contains multiple commands. Delaying all of them till we read the whole message might not the best idea, since it may impact the latency. Open question: should we parse the message and send the commands one by one or should we behave exactly as with a single command? 
+Actually, we're already handling the same problem today for a single long transaction: depending on configuration (link_sconn_on_full_request) we might decide to delay the handling of the transaction until we read the whole message. The same approach can be used for binary headers as well. The difference is, that we might have a packed message, that contains multiple commands. Delaying all of them till we read the whole message might not the best idea, since it may impact the latency. Open question: should we parse the message and send the commands one by one or should we behave exactly as with a single command?
 
 Handling replies
 It's exactly the same as with dmc <-> client interaction. Upon receiving binhdr request, redis could choose whatever strategy of handling them as long as rules above are satisfied.
-For example, redis could choose simply strip the binary header and conitnue handling the message as if it was received in raw RESP format. This is the simplest approach and will work fine, except there will be no gain in using binhdr on dmc <-> redis leg.  It could choose to divide the replies to the message of N commands in few packed reply messages, as long as the total naumber of replies, contained in those messages, is N. 
+For example, redis could choose simply strip the binary header and conitnue handling the message as if it was received in raw RESP format. This is the simplest approach and will work fine, except there will be no gain in using binhdr on dmc <-> redis leg.  It could choose to divide the replies to the message of N commands in few packed reply messages, as long as the total naumber of replies, contained in those messages, is N.
 
 Handling protocol errors
-One of the duties of DMC is to handle protocol errors, e.g., it parses commands and takes appropriate actions if malformed RESP is received: 
+One of the duties of DMC is to handle protocol errors, e.g., it parses commands and takes appropriate actions if malformed RESP is received:
 
 Send -ERR Protocol error to the client and eventually closes the connection.
 
 If a some part of offending transaction is already sent to the server, the connection to the server is drained and eventually closed, e.g., older transactions are allowed to finish and then the connection is closed.
 
-With binary headers enabled, DMC should not parse the commands at all (apart from the binary header itself). So, now only redis is able to detect the protocol errors. What happens in the case redis detects the protocol error? AFAIU, it behaves similar to the case of dmc -> client interaction, e.g., sends an -ERR Protocol error reply and gracefully closes the connection. 
+With binary headers enabled, DMC should not parse the commands at all (apart from the binary header itself). So, now only redis is able to detect the protocol errors. What happens in the case redis detects the protocol error? AFAIU, it behaves similar to the case of dmc -> client interaction, e.g., sends an -ERR Protocol error reply and gracefully closes the connection.
 
-Such a behavior, when the client is dmc may be problematic, as at the time a protocol errror is detected, there may be multiple transactions in flight from different clients. Once redis closes the connection, dmc will have to drain and close all of them. This means that innocent clients may be affected by one misbehaved client. 
+Such a behavior, when the client is dmc may be problematic, as at the time a protocol errror is detected, there may be multiple transactions in flight from different clients. Once redis closes the connection, dmc will have to drain and close all of them. This means that innocent clients may be affected by one misbehaved client.
 
 Possible solution
 In the nutshell: redis will not close the connection in the case of binhdr protocol error. Instead, it will send a special reply, that will indicate to dmc, that the protocol error occurred. DMC will decide what to do with the offending transaction and the connection to the server.
 
 redis behavior:
 
-Upon detecting the protocol error, redis will behave as follows: 
+Upon detecting the protocol error, redis will behave as follows:
 
 For raw RESP messages, exactly as today: send -ERR Protocol error and close the connection.
 
-For binhdr messages: send a binhdr reply, packing all pending replies into one reply messages, where the high bit of the number of commands field is set to 1. This will indicate to DMC, that the message contains a protocol error and it will behave accrodingly. 
+For binhdr messages: send a binhdr reply, packing all pending replies into one reply messages, where the high bit of the number of commands field is set to 1. This will indicate to DMC, that the message contains a protocol error and it will behave accrodingly.
 
 Discard the rest of the offending message. We can do it, since the lenght of the message is in the binary header.
 
@@ -291,7 +270,7 @@ Close the connection to the client.
 
 If dmc is still sending the offending transaction to the server, it will stop sending, close the connection to the server and frees its client-related state. After all, in the case the offending message contains a total garbage with enormous length, we definitely don't want to send it to the server and stuck the server connection. This connection closing will not affect other clients, as no other clients are using this connection at this time.
 
-If DMC already sent the offending transaction to the server, it will not close the connection to the server. Instead, offending client will behave as if the server gracefully closed the connection, but other clients will behave as nothing happened. This may lead to the situation, where in respect to the offending client, its commands towards the server are executed, even after the command that caused the protocol error. 
+If DMC already sent the offending transaction to the server, it will not close the connection to the server. Instead, offending client will behave as if the server gracefully closed the connection, but other clients will behave as nothing happened. This may lead to the situation, where in respect to the offending client, its commands towards the server are executed, even after the command that caused the protocol error.
 
 
 Redis behavior

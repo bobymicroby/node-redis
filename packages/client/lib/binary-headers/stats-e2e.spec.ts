@@ -128,8 +128,8 @@ describe('Binary Headers Stats E2E', function () {
     return client;
   }
 
-  function getClientStats(): BinaryHeaderStats {
-    const stats = (client.options as any).binaryHeaders?.getStats?.();
+  function getClientStats(redisClient: RedisClientType = client): BinaryHeaderStats {
+    const stats = redisClient.getBinaryHeaderStats();
     assert.ok(stats, 'Stats should be available when stats-collector is enabled');
     return stats;
   }
@@ -430,6 +430,28 @@ describe('Binary Headers Stats E2E', function () {
 
       assert.equal(snapshot1.totalCommandCount, 1, 'snapshot1 unchanged');
       assert.equal(snapshot2.totalCommandCount, 2, 'snapshot2 has both');
+    });
+
+    it('duplicate starts with fresh stats without replacing parent stats', async function () {
+      await createConnectedClient();
+
+      await client.sendCommand(['SET', 'parent', 'v'] as const);
+      assert.equal(getClientStats().totalCommandCount, 1, 'parent records its command before duplicate');
+
+      const duplicate = client.duplicate();
+      duplicate.on('error', () => {});
+      await duplicate.connect();
+
+      try {
+        assert.equal(getClientStats(duplicate).totalCommandCount, 0, 'duplicate starts with fresh stats');
+
+        await duplicate.sendCommand(['SET', 'duplicate', 'v'] as const);
+
+        assert.equal(getClientStats(duplicate).totalCommandCount, 1, 'duplicate records its own command');
+        assert.equal(getClientStats().totalCommandCount, 1, 'parent stats remain unchanged');
+      } finally {
+        duplicate.destroy();
+      }
     });
 
     it('client and server command counts always match', async function () {

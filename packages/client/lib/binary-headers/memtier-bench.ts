@@ -1645,8 +1645,7 @@ async function runMode(
   if (binaryHeaders) {
     let aggregated: typeof BinaryHeaderStatsClass | undefined;
     for (const c of clients) {
-      const clientOptions = (c.client as any).options;
-      const s = clientOptions?.binaryHeaders?.getStats?.();
+      const s = (c.client as any).getBinaryHeaderStats?.();
       if (s) {
         aggregated = aggregated ? aggregated.plus(s) : s;
       }
@@ -1839,8 +1838,7 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
   if (binaryHeaders) {
     let aggregated: typeof BinaryHeaderStatsClass | undefined;
     for (const c of clients) {
-      const clientOptions = (c.client as any).options;
-      const s = clientOptions?.binaryHeaders?.getStats?.();
+      const s = (c.client as any).getBinaryHeaderStats?.();
       if (s) {
         aggregated = aggregated ? aggregated.plus(s) : s;
       }

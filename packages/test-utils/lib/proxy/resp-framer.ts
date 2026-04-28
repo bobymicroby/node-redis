@@ -38,7 +38,7 @@ export default class RespFramer extends EventEmitter {
     }
   }
 
-  private findMessageEnd(buffer: Buffer, start: number): number {
+  public findMessageEnd(buffer: Buffer, start: number): number {
     if (start >= buffer.length) {
       return -1;
     }

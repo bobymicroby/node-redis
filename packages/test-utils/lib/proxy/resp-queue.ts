@@ -5,6 +5,8 @@ import { Socket } from "node:net";
 interface Request {
   resolve: (data: Buffer) => void;
   reject: (reason: any) => void;
+  remaining: number;
+  chunks: Buffer[];
 }
 
 export default class RespQueue extends EventEmitter {
@@ -18,15 +20,20 @@ export default class RespQueue extends EventEmitter {
   }
 
   handleMessage(data: Buffer) {
-    const request = this.queue.shift();
+    const request = this.queue[0];
     if (request) {
-      request.resolve(data);
+      request.chunks.push(data);
+      request.remaining--;
+      if (request.remaining === 0) {
+        this.queue.shift();
+        request.resolve(Buffer.concat(request.chunks));
+      }
     } else {
       this.emit("push", data);
     }
   }
 
-  request(data: Buffer): Promise<Buffer> {
+  request(data: Buffer, expectedReplies = 1): Promise<Buffer> {
     let resolve: (data: Buffer) => void;
     let reject: (reason: any) => void;
 
@@ -36,7 +43,7 @@ export default class RespQueue extends EventEmitter {
     });
 
     //@ts-ignore
-    this.queue.push({ resolve, reject });
+    this.queue.push({ resolve, reject, remaining: expectedReplies, chunks: [] });
     this.serverSocket.write(data);
     return promise;
   }

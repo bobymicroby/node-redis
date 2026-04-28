@@ -9,6 +9,7 @@ import {
   createSentinel,
   RedisClientOptions,
   RedisClientType,
+  type BinaryHeadersOptions,
   RedisSentinelOptions,
   RedisSentinelType,
   RedisPoolOptions,
@@ -26,7 +27,7 @@ import { hideBin } from 'yargs/helpers';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { RedisProxy, getFreePortNumber } from './proxy/redis-proxy';
+import { RedisProxy, getFreePortNumber, type DmcBinaryHeadersProxyConfig } from './proxy/redis-proxy';
 import ProxyController from './proxy/proxy-controller';
 import {
   CreateDatabaseConfig,
@@ -105,7 +106,16 @@ interface ClientTestOptions<
 > extends CommonTestOptions {
   clientOptions?: Partial<RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>>;
   disableClientSetup?: boolean;
+  dmcBinaryHeadersProxy?: DmcBinaryHeadersProxyConfig;
 }
+
+interface ClientTestContext {
+  readonly redisPort: number;
+  readonly dmcBinaryHeadersProxy?: RedisProxy;
+  readonly proxyPort?: number;
+}
+
+const FORCE_DMC_BINARY_HEADERS_PROXY = process.env.REDIS_TEST_FORCE_BINARY_HEADERS === '1';
 
 interface TlsClientTestOptions<
   M extends RedisModules,
@@ -374,7 +384,10 @@ export default class TestUtils {
     TYPE_MAPPING extends TypeMapping = {}
   >(
     title: string,
-    fn: (client: RedisClientType<M, F, S, RESP, TYPE_MAPPING>) => unknown,
+    fn: (
+      client: RedisClientType<M, F, S, RESP, TYPE_MAPPING>,
+      context: ClientTestContext
+    ) => unknown,
     options: ClientTestOptions<M, F, S, RESP, TYPE_MAPPING>
   ): void {
     let dockerPromise: ReturnType<typeof spawnRedisServer>;
@@ -392,30 +405,126 @@ export default class TestUtils {
       if (options.skipTest) return this.skip();
       if (!dockerPromise) return this.skip();
 
+      const docker = await dockerPromise;
+      const dmcBinaryHeadersProxyConfig = TestUtils.#getDmcBinaryHeadersProxyConfig(options);
+      const proxy = await TestUtils.#startDmcBinaryHeadersProxy(
+        docker.port,
+        options.clientOptions,
+        dmcBinaryHeadersProxyConfig,
+      );
+      const context = TestUtils.#createClientTestContext(docker.port, proxy);
+
       const client = createClient({
         ...options.clientOptions,
+        binaryHeaders: dmcBinaryHeadersProxyConfig !== undefined
+          ? TestUtils.#enableBinaryHeaders(options.clientOptions?.binaryHeaders)
+          : options.clientOptions?.binaryHeaders,
         socket: {
           ...options.clientOptions?.socket,
-          port: (await dockerPromise).port
+          port: proxy?.config.listenPort ?? docker.port,
+          ...(proxy === undefined ? undefined : { host: proxy.config.listenHost })
         }
       });
 
-      if (options.disableClientSetup) {
-        return fn(client);
-      }
-
-      await client.connect();
-
       try {
-        await client.flushAll();
-        await fn(client);
-      } finally {
-        if (client.isOpen) {
+        if (options.disableClientSetup) {
+          return await fn(client, context);
+        }
+
+        await client.connect();
+
+        try {
           await client.flushAll();
-          client.destroy();
+          await fn(client, context);
+        } finally {
+          if (client.isOpen) {
+            await client.flushAll();
+            client.destroy();
+          }
+        }
+      } finally {
+        if (proxy !== undefined) {
+          await proxy.stop();
         }
       }
     });
+  }
+
+  static #getDmcBinaryHeadersProxyConfig<
+    M extends RedisModules,
+    F extends RedisFunctions,
+    S extends RedisScripts,
+    RESP extends RespVersions,
+    TYPE_MAPPING extends TypeMapping
+  >(
+    options: ClientTestOptions<M, F, S, RESP, TYPE_MAPPING>
+  ): DmcBinaryHeadersProxyConfig | undefined {
+    return options.dmcBinaryHeadersProxy ?? (
+      FORCE_DMC_BINARY_HEADERS_PROXY
+        ? { validateEligibility: false }
+        : undefined
+    );
+  }
+
+  static async #startDmcBinaryHeadersProxy<
+    M extends RedisModules,
+    F extends RedisFunctions,
+    S extends RedisScripts,
+    RESP extends RespVersions,
+    TYPE_MAPPING extends TypeMapping
+  >(
+    redisPort: number,
+    clientOptions: Partial<RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>> | undefined,
+    dmcBinaryHeadersProxy: DmcBinaryHeadersProxyConfig | undefined
+  ): Promise<RedisProxy | undefined> {
+    if (dmcBinaryHeadersProxy === undefined) {
+      return undefined;
+    }
+
+    const freePort = await getFreePortNumber();
+    const socketOptions = clientOptions?.socket as any;
+    const proxy = new RedisProxy({
+      listenHost: '127.0.0.1',
+      listenPort: freePort,
+      targetPort: redisPort,
+      targetHost: socketOptions?.host ?? '127.0.0.1',
+      dmcBinaryHeadersProxy,
+      enableLogging: dmcBinaryHeadersProxy.enableLogging
+    });
+    await proxy.start();
+    return proxy;
+  }
+
+  static #createClientTestContext(
+    redisPort: number,
+    proxy: RedisProxy | undefined
+  ): ClientTestContext {
+    if (proxy === undefined) {
+      return {
+        redisPort
+      };
+    }
+
+    return {
+      redisPort,
+      proxyPort: proxy.config.listenPort,
+      dmcBinaryHeadersProxy: proxy
+    };
+  }
+
+  static #enableBinaryHeaders(
+    binaryHeaders: boolean | BinaryHeadersOptions | undefined
+  ): BinaryHeadersOptions {
+    if (binaryHeaders && typeof binaryHeaders === 'object') {
+      return {
+        ...binaryHeaders,
+        enabled: true
+      };
+    }
+
+    return {
+      enabled: true
+    };
   }
 
   /**
