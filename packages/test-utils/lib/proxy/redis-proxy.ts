@@ -24,7 +24,7 @@ import RespQueue from './resp-queue';
  * headers. Replies to binary-header requests are wrapped before they are
  * written back to the client.
  */
-export interface DmcBinaryHeadersProxyConfig {
+export interface DmcProxyConfig {
   readonly bindhrEnabled?: boolean;
   readonly supportedCommands?: ReadonlyArray<CommandRecord>;
   readonly enableLogging?: boolean;
@@ -32,7 +32,7 @@ export interface DmcBinaryHeadersProxyConfig {
 }
 
 /**
- * Listen socket and Redis target.
+ * Listen socket, Redis target, and optional proxy plugins.
  */
 interface ProxyConfig {
   readonly listenPort: number;
@@ -41,10 +41,11 @@ interface ProxyConfig {
   readonly targetPort: number;
   readonly timeout?: number;
   readonly enableLogging?: boolean;
-  readonly dmcBinaryHeadersProxy?: DmcBinaryHeadersProxyConfig;
+  readonly plugins?: readonly PipelinePlugin[];
+  readonly dmcBinaryHeadersProxy?: DmcProxyConfig;
 }
 
-interface ConnectionInfoCommon {
+interface ConnectionBase {
   readonly id: string;
   readonly clientAddress: string;
   readonly clientPort: number;
@@ -54,10 +55,10 @@ interface ConnectionInfoCommon {
 /**
  * One client request group parsed by the DMC plugin.
  *
- * `raw` is one complete RESP message. `binary` is one DMC request frame whose
+ * `raw` is one RESP command message. `binary` is one DMC request frame whose
  * payload contains `commandCount` RESP command arrays.
  */
-export interface DmcBinaryHeadersProxyRequestRecord {
+export interface DmcRequest {
   readonly connectionId: string;
   readonly type: 'raw' | 'binary';
   readonly bindhrEnabled: boolean;
@@ -71,31 +72,26 @@ export interface DmcBinaryHeadersProxyRequestRecord {
 }
 
 /**
- * DMC state kept for one live client connection.
- */
-export interface DmcBinaryHeadersProxyConnectionInfo {
-  readonly bindhrEnabled: boolean;
-  readonly requests: readonly DmcBinaryHeadersProxyRequestRecord[];
-}
-
-/**
  * Per-connection DMC state returned to tests.
  */
-export interface DmcBinaryHeadersProxyConnectionStats extends ConnectionInfoCommon, DmcBinaryHeadersProxyConnectionInfo {}
+export interface DmcConnection extends ConnectionBase {
+  readonly bindhrEnabled: boolean;
+  readonly requests: readonly DmcRequest[];
+}
 
 /**
  * Copies of all DMC records kept by the plugin.
  */
-export interface DmcBinaryHeadersProxyStats {
-  readonly connections: readonly DmcBinaryHeadersProxyConnectionStats[];
-  readonly requests: readonly DmcBinaryHeadersProxyRequestRecord[];
+export interface DmcStats {
+  readonly connections: readonly DmcConnection[];
+  readonly requests: readonly DmcRequest[];
 }
 
-interface ConnectionInfo extends ConnectionInfoCommon {
+interface ConnectionInfo extends ConnectionBase {
   readonly interceptors: InterceptorState[];
 }
 
-interface ActiveConnection extends ConnectionInfoCommon {
+interface ActiveConnection extends ConnectionBase {
   readonly clientSocket: net.Socket;
   readonly serverSocket: net.Socket;
   interceptors: Interceptor[];
@@ -105,7 +101,7 @@ type SendResult =
   | { readonly success: true; readonly connectionId: string }
   | { readonly success: false; readonly error: string; readonly connectionId: string };
 
-type DataDirection = 'client->server' | 'server->client';
+type Direction = 'client->server' | 'server->client';
 
 interface ProxyStats {
   readonly activeConnections: number;
@@ -120,7 +116,7 @@ interface ProxyStats {
  * `raw.data` is a complete RESP message. `binary.payload` is the RESP bytes
  * inside one DMC request frame.
  */
-type DmcBinaryHeadersRequestFrame =
+type DmcFrame =
   | { readonly type: 'raw'; readonly data: Buffer }
   | {
       readonly type: 'binary';
@@ -140,7 +136,7 @@ interface ProxyEvents {
   /** Emitted after connection cleanup removes the socket pair. */
   'disconnect': (connectionInfo: ConnectionInfo) => void;
   /** Emitted for bytes written toward Redis or toward the client. */
-  'data': (connectionId: string, direction: DataDirection, data: Buffer) => void;
+  'data': (connectionId: string, direction: Direction, data: Buffer) => void;
   /** Emitted for client, Redis-side, or proxy server socket errors. */
   'error': (error: Error, connectionId?: string) => void;
   /** Emitted after the proxy listen socket is bound. */
@@ -152,24 +148,22 @@ interface ProxyEvents {
 /**
  * Continuation passed to public RESP interceptors.
  *
- * `data` is RESP bytes for one or more command arrays. `next()` passes those
- * bytes to later interceptors and then to Redis, and resolves with the RESP
- * replies. DMC headers and reply counts are outside this API.
+ * Pass RESP bytes to the next interceptor or Redis writer. Resolves with RESP
+ * replies.
  */
 export type Next = (data: Buffer) => Promise<Buffer>;
 
 /**
  * Public RESP interceptor.
  *
- * It runs after client input has been converted to RESP bytes and before those
- * bytes are written to Redis. In DMC mode the binary header is already stripped.
+ * Runs after the proxy byte pipeline and before the Redis writer.
  */
-export type InterceptorFunction = (data: Buffer, next: Next, state: InterceptorState) => Promise<Buffer>;
+export type InterceptorFn = (data: Buffer, next: Next, state: InterceptorState) => Promise<Buffer>;
 
-export interface InterceptorDescription {
+export interface InterceptorSpec {
   name: string;
   matchLimit?: number;
-  fn: InterceptorFunction;
+  fn: InterceptorFn;
 }
 
 export interface InterceptorState {
@@ -182,56 +176,64 @@ export interface InterceptorState {
 interface Interceptor {
   name: string;
   state: InterceptorState;
-  fn: InterceptorFunction;
+  fn: InterceptorFn;
 }
 
-type StageNext<O, R> = (output: O) => Promise<R>;
+export type NextStage<O, R> = (output: O) => Promise<R>;
 
 /**
- * Request pipeline stage.
+ * Proxy stage.
  *
- * A stage may emit zero or more values and may change the value type. The
- * return value is the response bytes for the input it consumed.
+ * A stage may emit zero or more values and may change the value type. Returned
+ * values are the responses produced while handling the input.
  */
-interface Stage<I, O, R = Buffer> {
-  write(input: I, next: StageNext<O, R>): Promise<readonly R[]>;
+export interface Stage<I, O, R = Buffer> {
+  write(input: I, next: NextStage<O, R>): Promise<readonly R[]>;
 }
 
 /**
- * Parser from client socket chunks to RESP bytes.
+ * Composable proxy stage.
+ *
+ * A stage can change request bytes before `next()` and response bytes after
+ * `next()` resolves.
  */
-type RequestParserStage = Stage<Buffer, Buffer>;
+export type PipelineStage = Stage<Buffer, Buffer>;
 
-interface DmcBinaryHeadersConnectionState extends ConnectionInfoCommon {
+interface DmcState extends ConnectionBase {
   bindhrEnabled: boolean;
-  requests: DmcBinaryHeadersProxyRequestRecord[];
+  requests: DmcRequest[];
 }
 
 /**
- * Optional parser for client input before public RESP interceptors.
+ * Proxy plugin.
  *
- * Output must be RESP bytes accepted by the Redis writer.
+ * Runs before public RESP interceptors.
  */
-interface RequestPipelinePlugin {
-  initialize(): Promise<void>;
+export interface PipelinePlugin {
+  initialize?(): Promise<void> | void;
 
-  createRequestStage(connection: ActiveConnection): RequestParserStage;
+  createStage(connection: ConnectionInfo): PipelineStage;
 
-  cleanupConnection(connectionId: string): void;
+  cleanupConnection?(connectionId: string): void;
+}
+
+/**
+ * A pipeline plugin that exposes DMC request records.
+ */
+interface DmcStatsSource extends PipelinePlugin {
+  getDmcStats(): DmcStats;
+
+  clearDmcStats(): void;
 }
 
 type ResolvedProxyConfig = Omit<Required<ProxyConfig>, 'dmcBinaryHeadersProxy'> & {
-  readonly dmcBinaryHeadersProxy?: DmcBinaryHeadersProxyConfig;
+  readonly dmcBinaryHeadersProxy?: DmcProxyConfig;
 };
 
 /**
- * Keep adjacent pipeline types explicit.
- *
- * DMC parsing is `Buffer -> DmcBinaryHeadersRequestFrame -> Buffer`.
- * Pairwise composition gives the proxy core one parser without a list whose
- * elements have different input and output types.
+ * Compose two stages whose adjacent types match.
  */
-function composeStages<A, B, C>(
+export function composeStages<A, B, C>(
   first: Stage<A, B>,
   second: Stage<B, C>
 ): Stage<A, C> {
@@ -244,12 +246,37 @@ function composeStages<A, B, C>(
 }
 
 /**
+ * Compose same-boundary proxy stages from left to right.
+ */
+function composeBufferStages(stages: readonly PipelineStage[]): PipelineStage {
+  if (stages.length === 0) {
+    return {
+      write: async (input, next) => [await next(input)],
+    };
+  }
+
+  let stage = stages[0];
+  for (let i = 1; i < stages.length; i++) {
+    stage = composeStages(stage, stages[i]);
+  }
+  return stage;
+}
+
+function hasDmcStats(
+  plugin: PipelinePlugin
+): plugin is DmcStatsSource {
+  const candidate: Partial<DmcStatsSource> = plugin;
+  return typeof candidate.getDmcStats === 'function' &&
+    typeof candidate.clearDmcStats === 'function';
+}
+
+/**
  * Incremental framer for DMC mode.
  *
  * The client stream may contain RESP messages and DMC request frames in the
  * same connection.
  */
-class DmcBinaryHeadersRequestFramer extends EventEmitter {
+class DmcFramer extends EventEmitter {
   readonly #respFramer = new RespFramer();
   readonly #headerDecoder = new RequestHeaderDecoder();
   #buffer = Buffer.alloc(0);
@@ -280,7 +307,7 @@ class DmcBinaryHeadersRequestFramer extends EventEmitter {
   /**
    * Return null if the buffer does not yet hold a full frame.
    */
-  #readFrame(start: number): { frame: DmcBinaryHeadersRequestFrame; end: number } | null {
+  #readFrame(start: number): { frame: DmcFrame; end: number } | null {
     if (this.#buffer[start] !== RequestHeaderEncoder.designatorConstantValue()) {
       const messageEnd = this.#respFramer.findMessageEnd(this.#buffer, start);
       if (messageEnd === -1) {
@@ -377,17 +404,45 @@ function commandNames(commands: ReadonlyArray<ReadonlyArray<RedisArgument>>): st
 }
 
 /**
- * Parser plugin for the DMC binary-header subset used by client tests.
+ * Default parser for client byte streams that contain plain RESP only.
+ */
+class RespPlugin implements PipelinePlugin {
+  public createStage(): PipelineStage {
+    const framer = new RespFramer();
+    return {
+      write: async (chunk, next) => {
+        const frames: Buffer[] = [];
+        const onMessage = (frame: Buffer) => frames.push(frame);
+        framer.on('message', onMessage);
+
+        try {
+          framer.write(chunk);
+        } finally {
+          framer.off('message', onMessage);
+        }
+
+        const responses: Buffer[] = [];
+        for (const frame of frames) {
+          responses.push(await next(frame));
+        }
+        return responses;
+      },
+    };
+  }
+}
+
+/**
+ * Parser for client byte streams that may contain DMC binary-header frames.
  *
  * Raw RESP is passed through. Binary-header requests are checked, stripped to
  * RESP before Redis sees them, and wrapped again on the reply path.
  */
-class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
-  private readonly config: DmcBinaryHeadersProxyConfig;
+class DmcPlugin implements DmcStatsSource {
+  private readonly config: DmcProxyConfig;
   private eligibilityResolver?: EligibilityResolver;
-  private readonly connections = new Map<string, DmcBinaryHeadersConnectionState>();
+  private readonly connections = new Map<string, DmcState>();
 
-  constructor(config: DmcBinaryHeadersProxyConfig) {
+  constructor(config: DmcProxyConfig) {
     this.config = config;
   }
 
@@ -406,7 +461,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   /**
    * Each connection has its own framer; partial TCP chunks are per socket.
    */
-  public createRequestStage(connection: ActiveConnection): RequestParserStage {
+  public createStage(connection: ConnectionInfo): PipelineStage {
     return composeStages(
       this.createFrameStage(),
       this.createDmcRequestStage(this.createConnectionState(connection)),
@@ -418,9 +473,9 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   }
 
   /**
-   * Return copies; tests must not mutate live connection state.
+   * Return copied per-connection records.
    */
-  public getStats(): DmcBinaryHeadersProxyStats {
+  public getDmcStats(): DmcStats {
     const connections = Array.from(this.connections.values())
       .map((connection) => ({
         id: connection.id,
@@ -437,21 +492,21 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
     };
   }
 
-  public clearStats(): void {
+  public clearDmcStats(): void {
     for (const connection of this.connections.values()) {
       connection.requests.splice(0);
     }
   }
 
   /**
-   * First DMC parser step: client bytes to RESP/DMC frames.
+   * Frame client byte chunks as RESP or DMC messages.
    */
-  private createFrameStage(): Stage<Buffer, DmcBinaryHeadersRequestFrame> {
-    const framer = new DmcBinaryHeadersRequestFramer();
+  private createFrameStage(): Stage<Buffer, DmcFrame> {
+    const framer = new DmcFramer();
     return {
       write: async (chunk, next) => {
-        const frames: DmcBinaryHeadersRequestFrame[] = [];
-        const onMessage = (frame: DmcBinaryHeadersRequestFrame) => frames.push(frame);
+        const frames: DmcFrame[] = [];
+        const onMessage = (frame: DmcFrame) => frames.push(frame);
         framer.on('message', onMessage);
 
         try {
@@ -470,11 +525,11 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   }
 
   /**
-   * Second DMC parser step: framer output to RESP bytes.
+   * Strip binary request headers and wrap their replies.
    */
   private createDmcRequestStage(
-    state: DmcBinaryHeadersConnectionState
-  ): Stage<DmcBinaryHeadersRequestFrame, Buffer> {
+    state: DmcState
+  ): Stage<DmcFrame, Buffer> {
     return {
       write: async (frame, next) => frame.type === 'binary'
         ? this.handleRequestFrame(state, frame, next)
@@ -483,14 +538,14 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   }
 
   private createConnectionState(
-    connection: ActiveConnection
-  ): DmcBinaryHeadersConnectionState {
+    connection: ConnectionInfo
+  ): DmcState {
     const existing = this.connections.get(connection.id);
     if (existing !== undefined) {
       return existing;
     }
 
-    const state: DmcBinaryHeadersConnectionState = {
+    const state: DmcState = {
       id: connection.id,
       clientAddress: connection.clientAddress,
       clientPort: connection.clientPort,
@@ -506,13 +561,13 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
    * Record raw RESP and forward it unchanged.
    */
   private async handleRawFrame(
-    state: DmcBinaryHeadersConnectionState,
+    state: DmcState,
     data: Buffer,
-    next: StageNext<Buffer, Buffer>
+    next: NextStage<Buffer, Buffer>
   ): Promise<readonly Buffer[]> {
     const commands = parseRespCommandArrays(data);
     const names = commandNames(commands);
-    const record: DmcBinaryHeadersProxyRequestRecord = {
+    const record: DmcRequest = {
       connectionId: state.id,
       type: 'raw',
       bindhrEnabled: state.bindhrEnabled,
@@ -529,9 +584,9 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
    * Strip a valid DMC request to RESP; wrap the RESP replies on return.
    */
   private async handleRequestFrame(
-    state: DmcBinaryHeadersConnectionState,
-    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
-    next: StageNext<Buffer, Buffer>
+    state: DmcState,
+    frame: Extract<DmcFrame, { type: 'binary' }>,
+    next: NextStage<Buffer, Buffer>
   ): Promise<readonly Buffer[]> {
     let commands: ReadonlyArray<ReadonlyArray<RedisArgument>> = [];
     let validationError = this.validateRequestHeader(frame);
@@ -545,7 +600,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
       }
     }
 
-    const record: DmcBinaryHeadersProxyRequestRecord = {
+    const record: DmcRequest = {
       connectionId: state.id,
       type: 'binary',
       bindhrEnabled: state.bindhrEnabled,
@@ -575,7 +630,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
    * Header checks do not require RESP payload decoding.
    */
   private validateRequestHeader(
-    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
+    frame: Extract<DmcFrame, { type: 'binary' }>,
   ): string | null {
     if (frame.header.commandCount < RequestHeaderEncoder.commandCountMinValue()) {
       return `Invalid binary-header command count ${frame.header.commandCount}`;
@@ -599,9 +654,9 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
    * Enforce the static eligibility config used by this test proxy.
    */
   private validateCommands(
-    frame: Extract<DmcBinaryHeadersRequestFrame, { type: 'binary' }>,
+    frame: Extract<DmcFrame, { type: 'binary' }>,
     commands: ReadonlyArray<ReadonlyArray<RedisArgument>>,
-    state: DmcBinaryHeadersConnectionState,
+    state: DmcState,
   ): string | null {
     if (!state.bindhrEnabled) {
       return 'Binary headers are disabled for this connection';
@@ -670,7 +725,7 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
   }
 
   /**
-   * Return enough RESP errors to satisfy the client's reply tracker.
+   * Return one RESP error per expected command, wrapped as a protocol-error DMC reply.
    */
   private createProtocolErrorResponse(
     message: string,
@@ -695,9 +750,9 @@ class DmcBinaryHeadersProxyPlugin implements RequestPipelinePlugin {
 /**
  * TCP proxy between node-redis and a Redis test server.
  *
- * Client bytes are parsed to RESP bytes, passed through public RESP
- * interceptors, then written to Redis. DMC request frames are stripped before
- * the public interceptors run.
+ * Client bytes pass through a built-in parser, configured proxy plugins,
+ * public RESP interceptors, then the Redis writer. Enabling the DMC config
+ * swaps the built-in RESP parser for the DMC parser.
  */
 export class RedisProxy extends EventEmitter {
   private readonly server: net.Server;
@@ -705,7 +760,7 @@ export class RedisProxy extends EventEmitter {
   private readonly connections: Map<string, ActiveConnection>;
   private isRunning: boolean;
   private globalInterceptors: Interceptor[] = [];
-  private readonly requestPipelinePlugin?: RequestPipelinePlugin;
+  private readonly plugins: readonly PipelinePlugin[];
 
   constructor(config: ProxyConfig) {
     super();
@@ -715,21 +770,22 @@ export class RedisProxy extends EventEmitter {
     this.config = {
       listenHost: '127.0.0.1',
       timeout: 30000,
+      plugins: [],
       ...config,
       enableLogging
     };
 
     this.connections = new Map();
     this.isRunning = false;
-    this.requestPipelinePlugin = this.createRequestPipelinePlugin();
+    this.plugins = this.createPlugins();
     this.server = this.createServer();
   }
 
   /**
-   * Initialize the parser before accepting client sockets.
+   * Initialize plugins before accepting client sockets.
    */
   public async start(): Promise<void> {
-    await this.initializeRequestPipelinePlugin();
+    await this.initializePlugins();
 
     return new Promise((resolve, reject) => {
       if (this.isRunning) {
@@ -752,22 +808,21 @@ export class RedisProxy extends EventEmitter {
     });
   }
 
-  /**
-   * DMC replaces the plain RESP parser when binary-header mode is enabled.
-   */
-  private createRequestPipelinePlugin(): RequestPipelinePlugin | undefined {
-    if (this.config.dmcBinaryHeadersProxy === undefined) {
-      return undefined;
-    }
+  private createPlugins(): readonly PipelinePlugin[] {
+    const parserPlugin = this.config.dmcBinaryHeadersProxy === undefined
+      ? new RespPlugin()
+      : new DmcPlugin(this.config.dmcBinaryHeadersProxy);
 
-    return new DmcBinaryHeadersProxyPlugin(this.config.dmcBinaryHeadersProxy);
+    return [
+      parserPlugin,
+      ...(this.config.plugins ?? []),
+    ];
   }
 
-  /**
-   * Parser setup may load command eligibility data.
-   */
-  private async initializeRequestPipelinePlugin(): Promise<void> {
-    await this.requestPipelinePlugin?.initialize();
+  private async initializePlugins(): Promise<void> {
+    for (const plugin of this.plugins) {
+      await plugin.initialize?.();
+    }
   }
 
   public async stop(): Promise<void> {
@@ -790,8 +845,8 @@ export class RedisProxy extends EventEmitter {
     });
   }
 
-  private makeInterceptor(description: InterceptorDescription): Interceptor {
-    const { name, fn, matchLimit } = description;
+  private makeInterceptor(spec: InterceptorSpec): Interceptor {
+    const { name, fn, matchLimit } = spec;
     return {
       name,
       fn,
@@ -808,16 +863,16 @@ export class RedisProxy extends EventEmitter {
    * Existing connections use the new list on their next request.
    */
   public setGlobalInterceptors(
-    interceptorDescriptions: Array<InterceptorDescription>,
+    interceptorSpecs: Array<InterceptorSpec>,
   ) {
-    const interceptors: Interceptor[] = interceptorDescriptions.map(this.makeInterceptor);
+    const interceptors: Interceptor[] = interceptorSpecs.map(this.makeInterceptor);
     this.globalInterceptors = interceptors;
   }
 
   public addGlobalInterceptor(
-    interceptorDescription: InterceptorDescription,
+    interceptorSpec: InterceptorSpec,
   ) {
-    const interceptor = this.makeInterceptor(interceptorDescription);
+    const interceptor = this.makeInterceptor(interceptorSpec);
     this.globalInterceptors = [interceptor, ...this.globalInterceptors.filter(i => i.name !== interceptor.name)];
   }
 
@@ -839,27 +894,27 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * DMC records are separate from `getStats()` socket/interceptor counters.
+   * DMC request records live on the parser plugin.
    */
-  public getDmcBinaryHeadersProxyStats(): DmcBinaryHeadersProxyStats {
-    return this.getDmcBinaryHeadersProxyPlugin()?.getStats() ?? {
+  public getDmcStats(): DmcStats {
+    return this.getDmcStatsSource()?.getDmcStats() ?? {
       connections: [],
       requests: [],
     };
   }
 
-  public clearDmcBinaryHeadersProxyStats(): void {
-    this.getDmcBinaryHeadersProxyPlugin()?.clearStats();
+  public clearDmcStats(): void {
+    this.getDmcStatsSource()?.clearDmcStats();
   }
 
-  private getDmcBinaryHeadersProxyPlugin(): DmcBinaryHeadersProxyPlugin | undefined {
-    return this.requestPipelinePlugin instanceof DmcBinaryHeadersProxyPlugin
-      ? this.requestPipelinePlugin
-      : undefined;
+  private getDmcStatsSource(): DmcStatsSource | undefined {
+    return this.plugins.find(hasDmcStats);
   }
 
-  private cleanupRequestPipelinePlugin(connectionId: string): void {
-    this.requestPipelinePlugin?.cleanupConnection(connectionId);
+  private cleanupPlugins(connectionId: string): void {
+    for (const plugin of this.plugins) {
+      plugin.cleanupConnection?.(connectionId);
+    }
   }
 
   public closeConnection(connectionId: string): boolean {
@@ -871,7 +926,7 @@ export class RedisProxy extends EventEmitter {
     connection.clientSocket.destroy();
     connection.serverSocket.destroy();
     this.connections.delete(connectionId);
-    this.cleanupRequestPipelinePlugin(connectionId);
+    this.cleanupPlugins(connectionId);
     this.emit('disconnect', connection);
     return true;
   }
@@ -973,11 +1028,11 @@ export class RedisProxy extends EventEmitter {
     });
 
     const respQueue = new RespQueue(serverSocket);
-    const requestParser = this.createRequestParserStage(connectionInfo);
+    const pipelineStage = this.createPipelineStage(connectionInfo);
     const interceptorStage = this.createInterceptorChainStage(connectionInfo);
     const sendToRedis = this.createRedisTerminal(connectionInfo, respQueue);
 
-    this.attachRequestPipeline(connectionInfo, requestParser, interceptorStage, sendToRedis);
+    this.attachPipeline(connectionInfo, pipelineStage, interceptorStage, sendToRedis);
     this.attachPushHandler(connectionInfo, respQueue);
     this.attachSocketLifecycleHandlers(connectionInfo);
   }
@@ -1004,46 +1059,33 @@ export class RedisProxy extends EventEmitter {
     };
   }
 
-  /**
-   * Choose the client-byte parser for this connection.
-   */
-  private createRequestParserStage(connection: ActiveConnection): RequestParserStage {
-    return this.requestPipelinePlugin?.createRequestStage(connection) ?? this.createRespFrameStage();
-  }
-
-  /**
-   * Plain RESP parser: one complete client message becomes one Redis request.
-   */
-  private createRespFrameStage(): Stage<Buffer, Buffer> {
-    const framer = new RespFramer();
+  private getConnectionInfo(connection: ActiveConnection): ConnectionInfo {
     return {
-      write: async (chunk, next) => {
-        const frames: Buffer[] = [];
-        const onMessage = (frame: Buffer) => frames.push(frame);
-        framer.on('message', onMessage);
-
-        try {
-          framer.write(chunk);
-        } finally {
-          framer.off('message', onMessage);
-        }
-
-        const responses: Buffer[] = [];
-        for (const frame of frames) {
-          responses.push(await next(frame));
-        }
-        return responses;
-      },
+      id: connection.id,
+      clientAddress: connection.clientAddress,
+      clientPort: connection.clientPort,
+      connectedAt: connection.connectedAt,
+      interceptors: connection.interceptors.map((interceptor) => interceptor.state),
     };
   }
 
   /**
-   * Run public interceptors between parsing and the Redis writer.
+   * Build this connection's byte pipeline.
+   */
+  private createPipelineStage(connection: ActiveConnection): PipelineStage {
+    const connectionInfo = this.getConnectionInfo(connection);
+    return composeBufferStages(
+      this.plugins.map((plugin) => plugin.createStage(connectionInfo))
+    );
+  }
+
+  /**
+   * Run public RESP interceptors after the proxy pipeline.
    */
   private createInterceptorChainStage(connection: ActiveConnection): Stage<Buffer, Buffer> {
     return {
       write: async (data, next) => {
-        const interceptorChain = connection.interceptors.concat(this.globalInterceptors).reduceRight<StageNext<Buffer, Buffer>>(
+        const interceptorChain = connection.interceptors.concat(this.globalInterceptors).reduceRight<NextStage<Buffer, Buffer>>(
           (nextInterceptor, interceptor) => (data) =>
             interceptor.fn(
               data,
@@ -1064,7 +1106,7 @@ export class RedisProxy extends EventEmitter {
   private createRedisTerminal(
     connection: ActiveConnection,
     respQueue: RespQueue
-  ): StageNext<Buffer, Buffer> {
+  ): NextStage<Buffer, Buffer> {
     return async (data) => {
       this.emit('data', connection.id, 'client->server', data);
       return respQueue.request(data, countRespMessages(data));
@@ -1074,13 +1116,13 @@ export class RedisProxy extends EventEmitter {
   /**
    * Keep response order equal to request read order.
    */
-  private attachRequestPipeline(
+  private attachPipeline(
     connection: ActiveConnection,
-    requestParser: RequestParserStage,
+    pipelineStage: PipelineStage,
     interceptorStage: Stage<Buffer, Buffer>,
-    terminal: StageNext<Buffer, Buffer>
+    terminal: NextStage<Buffer, Buffer>
   ): void {
-    const requestStage = composeStages(requestParser, interceptorStage);
+    const requestStage = composeStages(pipelineStage, interceptorStage);
     let responseChain = Promise.resolve();
 
     connection.clientSocket.on('data', (chunk) => {
@@ -1157,7 +1199,7 @@ export class RedisProxy extends EventEmitter {
     const connection = this.connections.get(connectionId);
     if (connection) {
       this.connections.delete(connectionId);
-      this.cleanupRequestPipelinePlugin(connectionId);
+      this.cleanupPlugins(connectionId);
       this.emit('disconnect', connection);
     }
   }
@@ -1192,4 +1234,4 @@ export function getFreePortNumber(): Promise<number> {
 }
 
 export { RedisProxy as RedisTransparentProxy };
-export type { ProxyConfig, ConnectionInfo, ProxyEvents, SendResult, DataDirection, ProxyStats };
+export type { ProxyConfig, ConnectionInfo, ProxyEvents, SendResult, Direction, ProxyStats };

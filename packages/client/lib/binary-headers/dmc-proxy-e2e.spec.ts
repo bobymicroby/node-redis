@@ -6,7 +6,7 @@ import { RequestHeaderEncoder } from './generated/request-header-codec';
 import { ResponseHeaderDecoder } from './generated/response-header-codec';
 import { STATIC_COMMAND_RECORDS, type CommandRecord } from './eligibility';
 
-function createDmcBinaryHeadersProxyOptions(supportedCommands: ReadonlyArray<CommandRecord> = STATIC_COMMAND_RECORDS) {
+function createDmcProxyOptions(supportedCommands: ReadonlyArray<CommandRecord> = STATIC_COMMAND_RECORDS) {
   return {
     ...GLOBAL.SERVERS.OPEN,
     clientOptions: {
@@ -51,12 +51,12 @@ describe('Binary Headers DMC Proxy E2E', function () {
   testUtils.testWithClient('eligible SET/GET go through the proxy as binary-header requests', async (client, context) => {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
     const proxy = context.dmcBinaryHeadersProxy;
-    proxy.clearDmcBinaryHeadersProxyStats();
+    proxy.clearDmcStats();
 
     assert.equal(await client.set('dmc-proxy:key', 'value'), 'OK');
     assert.equal(await client.get('dmc-proxy:key'), 'value');
 
-    const requests = proxy.getDmcBinaryHeadersProxyStats().requests;
+    const requests = proxy.getDmcStats().requests;
     const setRequest = requests.find((request) => request.commandNames[0] === 'SET');
     const getRequest = requests.find((request) => request.commandNames[0] === 'GET');
 
@@ -69,12 +69,12 @@ describe('Binary Headers DMC Proxy E2E', function () {
     assert.equal(typeof setRequest.clientIdx, 'number');
     assert.equal(typeof getRequest.clientIdx, 'number');
     assert.equal(setRequest.slot, getRequest.slot, 'same key should use same slot');
-  }, createDmcBinaryHeadersProxyOptions());
+  }, createDmcProxyOptions());
 
   testUtils.testWithClient('timer-backed auto-pipelining packs same-slot commands through the proxy', async (client, context) => {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
     const proxy = context.dmcBinaryHeadersProxy;
-    proxy.clearDmcBinaryHeadersProxyStats();
+    proxy.clearDmcStats();
 
     const replies = await Promise.all([
       client.set('{dmc-proxy-timer}a', '1'),
@@ -84,32 +84,32 @@ describe('Binary Headers DMC Proxy E2E', function () {
 
     assert.deepEqual(replies, ['OK', 'OK', '1']);
 
-    const packedRequest = proxy.getDmcBinaryHeadersProxyStats().requests.find(
+    const packedRequest = proxy.getDmcStats().requests.find(
       (request) => request.type === 'binary' && request.commandCount > 1,
     );
     assert.ok(packedRequest, 'same-slot commands should be packed by the binary-header timer');
     assert.equal(packedRequest.clientIdx, 0);
-  }, createDmcBinaryHeadersProxyOptions());
+  }, createDmcProxyOptions());
 
   testUtils.testWithClient('commands outside binary-header eligibility remain raw RESP through the proxy', async (client, context) => {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
     const proxy = context.dmcBinaryHeadersProxy;
-    proxy.clearDmcBinaryHeadersProxyStats();
+    proxy.clearDmcStats();
 
     const count = await client.sendCommand(['COMMAND', 'COUNT'] as const);
     assert.equal(typeof count, 'number');
 
-    const commandRequest = proxy.getDmcBinaryHeadersProxyStats().requests.find(
+    const commandRequest = proxy.getDmcStats().requests.find(
       (request) => request.commandNames[0] === 'COMMAND',
     );
     assert.ok(commandRequest, 'COMMAND COUNT should be observed');
     assert.equal(commandRequest.type, 'raw');
-  }, createDmcBinaryHeadersProxyOptions());
+  }, createDmcProxyOptions());
 
   testUtils.testWithClient('mixed raw and binary-header requests preserve reply order', async (client, context) => {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
     const proxy = context.dmcBinaryHeadersProxy;
-    proxy.clearDmcBinaryHeadersProxyStats();
+    proxy.clearDmcStats();
 
     const [commandCount, setReply] = await Promise.all([
       client.sendCommand(['COMMAND', 'COUNT'] as const),
@@ -119,20 +119,20 @@ describe('Binary Headers DMC Proxy E2E', function () {
     assert.equal(typeof commandCount, 'number');
     assert.equal(setReply, 'OK');
 
-    const requests = proxy.getDmcBinaryHeadersProxyStats().requests.filter((request) =>
+    const requests = proxy.getDmcStats().requests.filter((request) =>
       request.commandNames[0] === 'COMMAND' || request.commandNames[0] === 'SET'
     );
     assert.deepEqual(
       requests.map((request) => request.type),
       ['raw', 'binary'],
     );
-  }, createDmcBinaryHeadersProxyOptions());
+  }, createDmcProxyOptions());
 
   testUtils.testWithClient('proxy rejects BINDHR inside binary-header traffic', async (_client, context) => {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
     assert.ok(context.proxyPort, 'test requires proxy port');
     const proxy = context.dmcBinaryHeadersProxy;
-    proxy.clearDmcBinaryHeadersProxyStats();
+    proxy.clearDmcStats();
 
     const payload = chunkToBuffer(encodeCommand(['BINDHR', 'STATUS']));
     const frame = Buffer.concat([
@@ -155,7 +155,7 @@ describe('Binary Headers DMC Proxy E2E', function () {
         /BINDHR must be sent as raw RESP/,
       );
 
-      const bindhrRequest = proxy.getDmcBinaryHeadersProxyStats().requests.find(
+      const bindhrRequest = proxy.getDmcStats().requests.find(
         (request) => request.commandNames[0] === 'BINDHR',
       );
       assert.ok(bindhrRequest, 'BINDHR should be observed');
@@ -164,7 +164,7 @@ describe('Binary Headers DMC Proxy E2E', function () {
     } finally {
       socket.destroy();
     }
-  }, createDmcBinaryHeadersProxyOptions());
+  }, createDmcProxyOptions());
 
   testUtils.testWithClient('MONITOR RESET can return to normal binary-header commands', async (client) => {
     await Promise.all([
@@ -174,27 +174,27 @@ describe('Binary Headers DMC Proxy E2E', function () {
 
     assert.equal(await client.set('dmc-proxy:monitor-reset', 'ok'), 'OK');
     assert.equal(await client.get('dmc-proxy:monitor-reset'), 'ok');
-  }, createDmcBinaryHeadersProxyOptions());
+  }, createDmcProxyOptions());
 
   testUtils.testWithClient('proxy rejects binary-header traffic for commands excluded by proxy eligibility', async (client, context) => {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
     const proxy = context.dmcBinaryHeadersProxy;
     client.on('error', () => {});
-    proxy.clearDmcBinaryHeadersProxyStats();
+    proxy.clearDmcStats();
 
     await assert.rejects(
       client.sendCommand(['DBSIZE'] as const),
       /DMC binary header proxy rejected request: DBSIZE is not binary-header eligible/,
     );
 
-    const dbsizeRequest = proxy.getDmcBinaryHeadersProxyStats().requests.find(
+    const dbsizeRequest = proxy.getDmcStats().requests.find(
       (request) => request.commandNames[0] === 'DBSIZE',
     );
     assert.ok(dbsizeRequest, 'DBSIZE should be observed');
     assert.equal(dbsizeRequest.type, 'binary');
     assert.equal(dbsizeRequest.rejected, true);
     assert.match(dbsizeRequest.error ?? '', /DBSIZE is not binary-header eligible/);
-  }, createDmcBinaryHeadersProxyOptions([
+  }, createDmcProxyOptions([
     { name: 'SET' },
     { name: 'GET' },
   ]));
@@ -203,7 +203,7 @@ describe('Binary Headers DMC Proxy E2E', function () {
     assert.ok(context.dmcBinaryHeadersProxy, 'test requires DMC binary-headers proxy');
     assert.ok(context.proxyPort, 'test requires proxy port');
     const proxy = context.dmcBinaryHeadersProxy;
-    proxy.clearDmcBinaryHeadersProxyStats();
+    proxy.clearDmcStats();
 
     const payload = chunkToBuffer(encodeCommand(['XREAD', 'BLOCK', '1', 'STREAMS', 'stream', '0']));
     const frame = Buffer.concat([
@@ -226,7 +226,7 @@ describe('Binary Headers DMC Proxy E2E', function () {
         /XREAD is not binary-header eligible/,
       );
 
-      const xreadRequest = proxy.getDmcBinaryHeadersProxyStats().requests.find(
+      const xreadRequest = proxy.getDmcStats().requests.find(
         (request) => request.commandNames[0] === 'XREAD',
       );
       assert.ok(xreadRequest, 'XREAD should be observed');
@@ -235,7 +235,7 @@ describe('Binary Headers DMC Proxy E2E', function () {
     } finally {
       socket.destroy();
     }
-  }, createDmcBinaryHeadersProxyOptions([
+  }, createDmcProxyOptions([
     { name: 'XREAD', blocking: { type: 'conditional', argName: 'BLOCK' } },
   ]));
 

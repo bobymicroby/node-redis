@@ -1,7 +1,8 @@
 import { strict as assert } from 'node:assert';
 import { Buffer } from 'node:buffer';
 import { testUtils, GLOBAL } from '../test-utils';
-import { InterceptorDescription, RedisProxy } from './redis-proxy';
+import { RedisProxy } from './redis-proxy';
+import type { InterceptorSpec, PipelinePlugin } from './redis-proxy';
 import type { RedisClientType } from '@redis/client/lib/client/index.js';
 
 describe('RedisSocketProxy', function () {
@@ -109,6 +110,66 @@ describe('RedisSocketProxy', function () {
 
     }, GLOBAL.SERVERS.OPEN_RESP_3);
 
+  testUtils.testWithClient('proxy plugins compose in order', async (client: RedisClientType<any, any, any, any, any>) => {
+    const socketOptions = client?.options?.socket;
+    //@ts-ignore
+    assert(socketOptions?.port, 'Test requires a TCP connection to Redis');
+
+    const order: string[] = [];
+    const createPlugin = (name: string): PipelinePlugin => ({
+      createStage: () => ({
+        write: async (data, next) => {
+          order.push(`${name}:request`);
+          const response = await next(data);
+          order.push(`${name}:response`);
+          return [response];
+        },
+      }),
+    });
+
+    const proxyPort = 50000 + Math.floor(Math.random() * 10000);
+    const proxy = new RedisProxy({
+      listenHost: '127.0.0.1',
+      listenPort: proxyPort,
+      //@ts-ignore
+      targetPort: socketOptions.port,
+      //@ts-ignore
+      targetHost: socketOptions.host || '127.0.0.1',
+      plugins: [
+        createPlugin('first'),
+        createPlugin('second'),
+      ],
+    });
+
+    try {
+      await proxy.start();
+
+      const proxyClient = client.duplicate({
+        socket: {
+          port: proxyPort,
+          host: '127.0.0.1'
+        },
+      });
+
+      await proxyClient.connect();
+      try {
+        order.splice(0);
+        assert.equal(await proxyClient.ping(), 'PONG');
+      } finally {
+        proxyClient.destroy();
+      }
+    } finally {
+      await proxy.stop();
+    }
+
+    assert.deepEqual(order, [
+      'first:request',
+      'second:request',
+      'second:response',
+      'first:response',
+    ]);
+  }, GLOBAL.SERVERS.OPEN_RESP_3);
+
   describe("Middleware", () => {
     testUtils.testWithProxiedClient(
       "Modify request/response via middleware",
@@ -118,7 +179,7 @@ describe('RedisSocketProxy', function () {
       ) => {
 
         // Intercept PING commands and modify the response
-        const pingInterceptor: InterceptorDescription = {
+        const pingInterceptor: InterceptorSpec = {
           name: `ping`,
           fn: async (data, next) => {
             if (data.includes('PING')) {
@@ -130,7 +191,7 @@ describe('RedisSocketProxy', function () {
 
         // Only intercept GET responses and double numeric values
         // Does not modify other commands or non-numeric GET responses
-        const doubleNumberGetInterceptor: InterceptorDescription = {
+        const doubleNumberGetInterceptor: InterceptorSpec = {
           name: `double-number-get`,
           fn: async (data, next) => {
             const response = await next(data);
