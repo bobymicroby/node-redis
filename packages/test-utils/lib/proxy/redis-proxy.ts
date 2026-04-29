@@ -25,7 +25,7 @@ import RespFramer from './resp-framer';
 import RespQueue from './resp-queue';
 
 /**
- * Listen socket, Redis target, and optional proxy plugins.
+ * Listen socket, Redis target, and optional plugin operators.
  */
 interface ProxyConfig {
   readonly listenPort: number;
@@ -72,6 +72,12 @@ interface ProxyEvents {
   'close': () => void;
 }
 
+/**
+ * Runtime copy of a registered RESP interceptor.
+ *
+ * The function comes from `RespInterceptorSpec`; the state object is reused
+ * across requests and reported through proxy stats.
+ */
 interface Interceptor {
   name: string;
   state: RespInterceptorState;
@@ -92,7 +98,10 @@ function countRespMessages(data: Buffer): number {
 }
 
 /**
- * Default parser for client byte streams that contain plain RESP only.
+ * First operator for plain RESP connections.
+ *
+ * Socket chunks are arbitrary. This operator emits one complete RESP request
+ * buffer at a time to the next operator.
  */
 class RespPlugin implements ProxyPlugin {
   public createTransformer(): BufferTransformer {
@@ -120,11 +129,12 @@ class RespPlugin implements ProxyPlugin {
 }
 
 /**
- * TCP proxy between node-redis and a Redis test server.
+ * TCP proxy between a Redis client and a Redis server.
  *
- * Client bytes pass through a built-in parser, configured proxy plugins,
- * public RESP interceptors, then the Redis sink. Enabling the DMC config
- * swaps the built-in RESP parser for the DMC parser.
+ * Per connection, socket chunks flow through plugin operators, then the RESP
+ * interceptor adapter, then the Redis sink. The first plugin is always a
+ * framer: plain RESP by default, or DMC when binary-header proxy mode is
+ * enabled.
  */
 export class RedisProxy extends EventEmitter {
   private readonly server: net.Server;
@@ -154,7 +164,7 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Initialize plugins before accepting client sockets.
+   * Initialize plugin factories before accepting client sockets.
    */
   public async start(): Promise<void> {
     await this.initializePlugins();
@@ -232,7 +242,10 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Existing connections use the new list on their next request.
+   * Replace the global RESP interceptors.
+   *
+   * Existing connections use the new list on their next request. State for each
+   * interceptor is recreated from the supplied spec.
    */
   public setGlobalInterceptors(
     interceptorSpecs: Array<RespInterceptorSpec>,
@@ -241,6 +254,9 @@ export class RedisProxy extends EventEmitter {
     this.globalInterceptors = interceptors;
   }
 
+  /**
+   * Add or replace one global RESP interceptor by name.
+   */
   public addGlobalInterceptor(
     interceptorSpec: RespInterceptorSpec,
   ) {
@@ -380,8 +396,8 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Do not read client bytes until the Redis socket exists and the stream
-   * handlers are installed.
+   * Do not read client bytes until the Redis socket exists and the stream has a
+   * sink.
    */
   private handleClientConnection(clientSocket: net.Socket): void {
     clientSocket.pause();
@@ -442,7 +458,7 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Build this connection's byte transformer chain.
+   * Compose the plugin operators for one connection.
    */
   private createProxyTransformer(connection: ActiveConnection): BufferTransformer {
     const connectionInfo = this.getConnectionInfo(connection);
@@ -453,6 +469,10 @@ export class RedisProxy extends EventEmitter {
 
   /**
    * Run public RESP interceptors after proxy plugins.
+   *
+   * This adapter folds the narrower interceptor contract into the transformer
+   * stream. Interceptors still see one RESP request buffer and return one RESP
+   * reply buffer.
    */
   private createInterceptorTransformer(connection: ActiveConnection): Transformer<Buffer, Buffer> {
     return {
@@ -473,7 +493,10 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Write RESP bytes to Redis. Reply count is derived after interceptors run.
+   * Sink for RESP request bytes.
+   *
+   * Reply count is derived after interceptors run, because interceptors may
+   * rewrite the request buffer before it reaches Redis.
    */
   private createRedisSink(
     connection: ActiveConnection,
@@ -486,7 +509,10 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Keep response order equal to request read order.
+   * Subscribe socket chunks to the composed operator stream.
+   *
+   * Response writes are serialized so the client observes the same order as
+   * the proxy read from the socket.
    */
   private attachStream(
     connection: ActiveConnection,

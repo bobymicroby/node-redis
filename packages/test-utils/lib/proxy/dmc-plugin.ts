@@ -24,10 +24,10 @@ import {
 } from './transformer';
 
 /**
- * DMC binary-header mode for this test proxy.
+ * DMC binary-header mode for the proxy.
  *
  * Client input may be RESP or DMC binary-header request frames. The proxy
- * writes RESP only to Redis: the test Redis server does not decode binary
+ * writes RESP only to Redis: the target Redis server does not decode binary
  * headers. Replies to binary-header requests are wrapped before they are
  * written back to the client.
  */
@@ -58,7 +58,7 @@ export interface DmcRequest {
 }
 
 /**
- * Per-connection DMC state returned to tests.
+ * Per-connection DMC state returned by stats.
  */
 export interface DmcConnection extends ConnectionBase {
   readonly bindhrEnabled: boolean;
@@ -255,7 +255,7 @@ export class DmcPlugin implements DmcStatsSource {
   }
 
   /**
-   * Build the static command eligibility table used by this test proxy.
+   * Build the static command eligibility table used by this proxy.
    */
   public async initialize(): Promise<void> {
     if (this.eligibilityResolver !== undefined) {
@@ -459,7 +459,7 @@ export class DmcPlugin implements DmcStatsSource {
   }
 
   /**
-   * Enforce the static eligibility config used by this test proxy.
+   * Enforce the static eligibility config used by this proxy.
    */
   private validateCommands(
     frame: Extract<DmcFrame, { type: 'binary' }>,
