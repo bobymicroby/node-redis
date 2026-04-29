@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert';
 import { Buffer } from 'node:buffer';
 import { testUtils, GLOBAL } from '../test-utils';
 import { RedisProxy } from './redis-proxy';
-import type { InterceptorSpec, PipelinePlugin } from './redis-proxy';
+import type { ProxyPlugin, RespInterceptorSpec } from './redis-proxy';
 import type { RedisClientType } from '@redis/client/lib/client/index.js';
 
 describe('RedisSocketProxy', function () {
@@ -116,9 +116,9 @@ describe('RedisSocketProxy', function () {
     assert(socketOptions?.port, 'Test requires a TCP connection to Redis');
 
     const order: string[] = [];
-    const createPlugin = (name: string): PipelinePlugin => ({
-      createStage: () => ({
-        write: async (data, next) => {
+    const createPlugin = (name: string): ProxyPlugin => ({
+      createTransformer: () => ({
+        transform: async (data, next) => {
           order.push(`${name}:request`);
           const response = await next(data);
           order.push(`${name}:response`);
@@ -179,7 +179,7 @@ describe('RedisSocketProxy', function () {
       ) => {
 
         // Intercept PING commands and modify the response
-        const pingInterceptor: InterceptorSpec = {
+        const pingInterceptor: RespInterceptorSpec = {
           name: `ping`,
           fn: async (data, next) => {
             if (data.includes('PING')) {
@@ -191,7 +191,7 @@ describe('RedisSocketProxy', function () {
 
         // Only intercept GET responses and double numeric values
         // Does not modify other commands or non-numeric GET responses
-        const doubleNumberGetInterceptor: InterceptorSpec = {
+        const doubleNumberGetInterceptor: RespInterceptorSpec = {
           name: `double-number-get`,
           fn: async (data, next) => {
             const response = await next(data);

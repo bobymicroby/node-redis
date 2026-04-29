@@ -9,18 +9,18 @@ import {
   type DmcStatsSource,
 } from './dmc-plugin';
 import {
-  composeBufferStages,
-  composeStages,
+  composeBufferTransformers,
+  composeTransformers,
   type ConnectionBase,
   type ConnectionInfo,
-  type InterceptorFn,
-  type InterceptorSpec,
-  type InterceptorState,
-  type NextStage,
-  type PipelinePlugin,
-  type PipelineStage,
-  type Stage,
-} from './pipeline';
+  type BufferTransformer,
+  type ProxyPlugin,
+  type RespInterceptorFn,
+  type RespInterceptorSpec,
+  type RespInterceptorState,
+  type Sink,
+  type Transformer,
+} from './transformer';
 import RespFramer from './resp-framer';
 import RespQueue from './resp-queue';
 
@@ -34,7 +34,7 @@ interface ProxyConfig {
   readonly targetPort: number;
   readonly timeout?: number;
   readonly enableLogging?: boolean;
-  readonly plugins?: readonly PipelinePlugin[];
+  readonly plugins?: readonly ProxyPlugin[];
   readonly dmcBinaryHeadersProxy?: DmcProxyConfig;
 }
 
@@ -54,7 +54,7 @@ interface ProxyStats {
   readonly activeConnections: number;
   readonly totalConnections: number;
   readonly connections: readonly ConnectionInfo[];
-  readonly globalInterceptors: InterceptorState[];
+  readonly globalInterceptors: RespInterceptorState[];
 }
 
 interface ProxyEvents {
@@ -74,8 +74,8 @@ interface ProxyEvents {
 
 interface Interceptor {
   name: string;
-  state: InterceptorState;
-  fn: InterceptorFn;
+  state: RespInterceptorState;
+  fn: RespInterceptorFn;
 }
 
 type ResolvedProxyConfig = Omit<Required<ProxyConfig>, 'dmcBinaryHeadersProxy'> & {
@@ -94,11 +94,11 @@ function countRespMessages(data: Buffer): number {
 /**
  * Default parser for client byte streams that contain plain RESP only.
  */
-class RespPlugin implements PipelinePlugin {
-  public createStage(): PipelineStage {
+class RespPlugin implements ProxyPlugin {
+  public createTransformer(): BufferTransformer {
     const framer = new RespFramer();
     return {
-      write: async (chunk, next) => {
+      transform: async (chunk, next) => {
         const frames: Buffer[] = [];
         const onMessage = (frame: Buffer) => frames.push(frame);
         framer.on('message', onMessage);
@@ -123,7 +123,7 @@ class RespPlugin implements PipelinePlugin {
  * TCP proxy between node-redis and a Redis test server.
  *
  * Client bytes pass through a built-in parser, configured proxy plugins,
- * public RESP interceptors, then the Redis writer. Enabling the DMC config
+ * public RESP interceptors, then the Redis sink. Enabling the DMC config
  * swaps the built-in RESP parser for the DMC parser.
  */
 export class RedisProxy extends EventEmitter {
@@ -132,7 +132,7 @@ export class RedisProxy extends EventEmitter {
   private readonly connections: Map<string, ActiveConnection>;
   private isRunning: boolean;
   private globalInterceptors: Interceptor[] = [];
-  private readonly plugins: readonly PipelinePlugin[];
+  private readonly plugins: readonly ProxyPlugin[];
 
   constructor(config: ProxyConfig) {
     super();
@@ -180,7 +180,7 @@ export class RedisProxy extends EventEmitter {
     });
   }
 
-  private createPlugins(): readonly PipelinePlugin[] {
+  private createPlugins(): readonly ProxyPlugin[] {
     const parserPlugin = this.config.dmcBinaryHeadersProxy === undefined
       ? new RespPlugin()
       : new DmcPlugin(this.config.dmcBinaryHeadersProxy);
@@ -217,7 +217,7 @@ export class RedisProxy extends EventEmitter {
     });
   }
 
-  private makeInterceptor(spec: InterceptorSpec): Interceptor {
+  private makeInterceptor(spec: RespInterceptorSpec): Interceptor {
     const { name, fn, matchLimit } = spec;
     return {
       name,
@@ -235,14 +235,14 @@ export class RedisProxy extends EventEmitter {
    * Existing connections use the new list on their next request.
    */
   public setGlobalInterceptors(
-    interceptorSpecs: Array<InterceptorSpec>,
+    interceptorSpecs: Array<RespInterceptorSpec>,
   ) {
     const interceptors: Interceptor[] = interceptorSpecs.map(this.makeInterceptor);
     this.globalInterceptors = interceptors;
   }
 
   public addGlobalInterceptor(
-    interceptorSpec: InterceptorSpec,
+    interceptorSpec: RespInterceptorSpec,
   ) {
     const interceptor = this.makeInterceptor(interceptorSpec);
     this.globalInterceptors = [interceptor, ...this.globalInterceptors.filter(i => i.name !== interceptor.name)];
@@ -380,8 +380,8 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Do not read client bytes until the Redis socket exists and the pipeline is
-   * installed.
+   * Do not read client bytes until the Redis socket exists and the stream
+   * handlers are installed.
    */
   private handleClientConnection(clientSocket: net.Socket): void {
     clientSocket.pause();
@@ -400,11 +400,11 @@ export class RedisProxy extends EventEmitter {
     });
 
     const respQueue = new RespQueue(serverSocket);
-    const pipelineStage = this.createPipelineStage(connectionInfo);
-    const interceptorStage = this.createInterceptorChainStage(connectionInfo);
-    const sendToRedis = this.createRedisTerminal(connectionInfo, respQueue);
+    const proxyTransformer = this.createProxyTransformer(connectionInfo);
+    const interceptorTransformer = this.createInterceptorTransformer(connectionInfo);
+    const redisSink = this.createRedisSink(connectionInfo, respQueue);
 
-    this.attachPipeline(connectionInfo, pipelineStage, interceptorStage, sendToRedis);
+    this.attachStream(connectionInfo, proxyTransformer, interceptorTransformer, redisSink);
     this.attachPushHandler(connectionInfo, respQueue);
     this.attachSocketLifecycleHandlers(connectionInfo);
   }
@@ -442,22 +442,22 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Build this connection's byte pipeline.
+   * Build this connection's byte transformer chain.
    */
-  private createPipelineStage(connection: ActiveConnection): PipelineStage {
+  private createProxyTransformer(connection: ActiveConnection): BufferTransformer {
     const connectionInfo = this.getConnectionInfo(connection);
-    return composeBufferStages(
-      this.plugins.map((plugin) => plugin.createStage(connectionInfo))
+    return composeBufferTransformers(
+      this.plugins.map((plugin) => plugin.createTransformer(connectionInfo))
     );
   }
 
   /**
-   * Run public RESP interceptors after the proxy pipeline.
+   * Run public RESP interceptors after proxy plugins.
    */
-  private createInterceptorChainStage(connection: ActiveConnection): Stage<Buffer, Buffer> {
+  private createInterceptorTransformer(connection: ActiveConnection): Transformer<Buffer, Buffer> {
     return {
-      write: async (data, next) => {
-        const interceptorChain = connection.interceptors.concat(this.globalInterceptors).reduceRight<NextStage<Buffer, Buffer>>(
+      transform: async (data, next) => {
+        const interceptorChain = connection.interceptors.concat(this.globalInterceptors).reduceRight<Sink<Buffer, Buffer>>(
           (nextInterceptor, interceptor) => (data) =>
             interceptor.fn(
               data,
@@ -473,12 +473,12 @@ export class RedisProxy extends EventEmitter {
   }
 
   /**
-   * Redis writer. Reply count is derived after interceptors have run.
+   * Write RESP bytes to Redis. Reply count is derived after interceptors run.
    */
-  private createRedisTerminal(
+  private createRedisSink(
     connection: ActiveConnection,
     respQueue: RespQueue
-  ): NextStage<Buffer, Buffer> {
+  ): Sink<Buffer, Buffer> {
     return async (data) => {
       this.emit('data', connection.id, 'client->server', data);
       return respQueue.request(data, countRespMessages(data));
@@ -488,18 +488,18 @@ export class RedisProxy extends EventEmitter {
   /**
    * Keep response order equal to request read order.
    */
-  private attachPipeline(
+  private attachStream(
     connection: ActiveConnection,
-    pipelineStage: PipelineStage,
-    interceptorStage: Stage<Buffer, Buffer>,
-    terminal: NextStage<Buffer, Buffer>
+    proxyTransformer: BufferTransformer,
+    interceptorTransformer: Transformer<Buffer, Buffer>,
+    redisSink: Sink<Buffer, Buffer>
   ): void {
-    const requestStage = composeStages(pipelineStage, interceptorStage);
+    const requestTransformer = composeTransformers(proxyTransformer, interceptorTransformer);
     let responseChain = Promise.resolve();
 
     connection.clientSocket.on('data', (chunk) => {
       responseChain = responseChain.then(async () => {
-        const responses = await requestStage.write(chunk, terminal);
+        const responses = await requestTransformer.transform(chunk, redisSink);
         for (const response of responses) {
           this.writeResponseToClient(connection, response);
         }
@@ -608,13 +608,13 @@ export { RedisProxy as RedisTransparentProxy };
 export type { DmcConnection, DmcProxyConfig, DmcRequest, DmcStats } from './dmc-plugin';
 export type {
   ConnectionInfo,
-  InterceptorFn,
-  InterceptorSpec,
-  InterceptorState,
-  Next,
-  NextStage,
-  PipelinePlugin,
-  PipelineStage,
-  Stage,
-} from './pipeline';
+  BufferTransformer,
+  ProxyPlugin,
+  RespInterceptorFn,
+  RespInterceptorNext,
+  RespInterceptorSpec,
+  RespInterceptorState,
+  Sink,
+  Transformer,
+} from './transformer';
 export type { ProxyConfig, ProxyEvents, SendResult, Direction, ProxyStats };

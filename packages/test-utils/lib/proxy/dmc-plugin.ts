@@ -14,14 +14,14 @@ import {
 } from '@redis/client/lib/binary-headers/eligibility';
 import RespFramer from './resp-framer';
 import {
-  composeStages,
+  composeTransformers,
   type ConnectionBase,
   type ConnectionInfo,
-  type NextStage,
-  type PipelinePlugin,
-  type PipelineStage,
-  type Stage,
-} from './pipeline';
+  type BufferTransformer,
+  type ProxyPlugin,
+  type Sink,
+  type Transformer,
+} from './transformer';
 
 /**
  * DMC binary-header mode for this test proxy.
@@ -74,9 +74,9 @@ export interface DmcStats {
 }
 
 /**
- * A pipeline plugin that exposes DMC request records.
+ * Proxy plugin that exposes DMC request records.
  */
-export interface DmcStatsSource extends PipelinePlugin {
+export interface DmcStatsSource extends ProxyPlugin {
   getDmcStats(): DmcStats;
 
   clearDmcStats(): void;
@@ -108,7 +108,7 @@ interface DmcState extends ConnectionBase {
 }
 
 export function hasDmcStats(
-  plugin: PipelinePlugin
+  plugin: ProxyPlugin
 ): plugin is DmcStatsSource {
   const candidate: Partial<DmcStatsSource> = plugin;
   return typeof candidate.getDmcStats === 'function' &&
@@ -269,10 +269,10 @@ export class DmcPlugin implements DmcStatsSource {
   /**
    * Each connection has its own framer; partial TCP chunks are per socket.
    */
-  public createStage(connection: ConnectionInfo): PipelineStage {
-    return composeStages(
-      this.createFrameStage(),
-      this.createDmcRequestStage(this.createConnectionState(connection)),
+  public createTransformer(connection: ConnectionInfo): BufferTransformer {
+    return composeTransformers(
+      this.createFrameTransformer(),
+      this.createDmcRequestTransformer(this.createConnectionState(connection)),
     );
   }
 
@@ -309,10 +309,10 @@ export class DmcPlugin implements DmcStatsSource {
   /**
    * Frame client byte chunks as RESP or DMC messages.
    */
-  private createFrameStage(): Stage<Buffer, DmcFrame> {
+  private createFrameTransformer(): Transformer<Buffer, DmcFrame> {
     const framer = new DmcFramer();
     return {
-      write: async (chunk, next) => {
+      transform: async (chunk, next) => {
         const frames: DmcFrame[] = [];
         const onMessage = (frame: DmcFrame) => frames.push(frame);
         framer.on('message', onMessage);
@@ -335,11 +335,11 @@ export class DmcPlugin implements DmcStatsSource {
   /**
    * Strip binary request headers and wrap their replies.
    */
-  private createDmcRequestStage(
+  private createDmcRequestTransformer(
     state: DmcState
-  ): Stage<DmcFrame, Buffer> {
+  ): Transformer<DmcFrame, Buffer> {
     return {
-      write: async (frame, next) => frame.type === 'binary'
+      transform: async (frame, next) => frame.type === 'binary'
         ? this.handleRequestFrame(state, frame, next)
         : this.handleRawFrame(state, frame.data, next),
     };
@@ -371,7 +371,7 @@ export class DmcPlugin implements DmcStatsSource {
   private async handleRawFrame(
     state: DmcState,
     data: Buffer,
-    next: NextStage<Buffer, Buffer>
+    next: Sink<Buffer, Buffer>
   ): Promise<readonly Buffer[]> {
     const commands = parseRespCommandArrays(data);
     const names = commandNames(commands);
@@ -394,7 +394,7 @@ export class DmcPlugin implements DmcStatsSource {
   private async handleRequestFrame(
     state: DmcState,
     frame: Extract<DmcFrame, { type: 'binary' }>,
-    next: NextStage<Buffer, Buffer>
+    next: Sink<Buffer, Buffer>
   ): Promise<readonly Buffer[]> {
     let commands: ReadonlyArray<ReadonlyArray<RedisArgument>> = [];
     let validationError = this.validateRequestHeader(frame);
