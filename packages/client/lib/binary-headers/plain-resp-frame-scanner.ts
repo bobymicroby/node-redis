@@ -8,30 +8,36 @@ const ASCII_NINE = 0x39;
 const BOOL_TRUE = 0x74;
 const BOOL_FALSE = 0x66;
 
-const enum ParseState {
-  EXPECT_TYPE,
-  READ_SIMPLE_LINE,
-  READ_LENGTH_LINE,
-  READ_BOOLEAN_VALUE,
-  EXPECT_BOOLEAN_CR,
-  EXPECT_BOOLEAN_LF,
-  EXPECT_NULL_CR,
-  EXPECT_NULL_LF,
-  READ_BULK_DATA,
-  EXPECT_BULK_CR,
-  EXPECT_BULK_LF,
-}
+const ParseState = {
+  EXPECT_TYPE: 0,
+  READ_SIMPLE_LINE: 1,
+  READ_LENGTH_LINE: 2,
+  READ_BOOLEAN_VALUE: 3,
+  EXPECT_BOOLEAN_CR: 4,
+  EXPECT_BOOLEAN_LF: 5,
+  EXPECT_NULL_CR: 6,
+  EXPECT_NULL_LF: 7,
+  READ_BULK_DATA: 8,
+  EXPECT_BULK_CR: 9,
+  EXPECT_BULK_LF: 10
+} as const;
 
-const enum LengthKind {
-  BULK,
-  AGGREGATE,
-}
+type ParseState = typeof ParseState[keyof typeof ParseState];
 
-const enum ByteConsumeResult {
-  CONTINUE,
-  COMPLETE,
-  INVALID,
-}
+const LengthKind = {
+  BULK: 0,
+  AGGREGATE: 1
+} as const;
+
+type LengthKind = typeof LengthKind[keyof typeof LengthKind];
+
+const ByteConsumeResult = {
+  CONTINUE: 0,
+  COMPLETE: 1,
+  INVALID: 2
+} as const;
+
+type ByteConsumeResult = typeof ByteConsumeResult[keyof typeof ByteConsumeResult];
 
 export const PLAIN_FRAME_NEED_MORE = -1;
 export const PLAIN_FRAME_INVALID = -2;
@@ -42,7 +48,7 @@ export const PLAIN_FRAME_INVALID = -2;
  */
 export class PlainRespFrameScanner {
   #frameInProgress = false;
-  #parseState = ParseState.EXPECT_TYPE;
+  #parseState: ParseState = ParseState.EXPECT_TYPE;
   #sawCR = false;
   #lengthValue = 0;
   #lengthNegative = false;
