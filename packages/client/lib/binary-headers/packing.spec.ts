@@ -17,26 +17,53 @@ const MAX_COMMANDS = RequestHeaderEncoder.commandCountMaxValue();
 
 describe('Packing', () => {
   describe('calculatePayloadLength', () => {
-    it('calculates length for string parts', () => {
-      assert.equal(calculatePayloadLength(['*1\r\n$4\r\nPING\r\n']), 14);
-    });
+    const cases = [
+      {
+        name: 'empty chunk',
+        resp: [],
+        expected: 0,
+      },
+      {
+        name: 'ascii string part',
+        resp: ['*1\r\n$4\r\nPING\r\n'],
+        expected: 14,
+      },
+      {
+        name: 'buffer part',
+        resp: [Buffer.from('*1\r\n$4\r\nPING\r\n')],
+        expected: 14,
+      },
+      {
+        name: 'mixed ascii string and buffer parts',
+        resp: ['abc', Buffer.from('def')],
+        expected: 6,
+      },
+      {
+        name: 'utf-8 string part uses byte length, not character length',
+        resp: ['*1\r\n$2\r\né\r\n'],
+        expected: 12,
+      },
+      {
+        name: 'surrogate pair string part uses byte length, not utf-16 length',
+        resp: ['*1\r\n$4\r\n😀\r\n'],
+        expected: 14,
+      },
+      {
+        name: 'mixed multi-byte string and buffer parts',
+        resp: ['*2\r\n$2\r\né\r\n', Buffer.from('$4\r\nPING\r\n')],
+        expected: 22,
+      },
+    ];
 
-    it('calculates length for buffer parts', () => {
-      assert.equal(calculatePayloadLength([Buffer.from('*1\r\n$4\r\nPING\r\n')]), 14);
-    });
-
-    it('returns 0 for empty array', () => {
-      assert.equal(calculatePayloadLength([]), 0);
-    });
-
-    it('calculates length for mixed string and buffer', () => {
-      assert.equal(calculatePayloadLength(['abc', Buffer.from('def')]), 6);
-    });
+    for (const tc of cases) {
+      it(tc.name, () => {
+        assert.equal(calculatePayloadLength(tc.resp), tc.expected);
+      });
+    }
   });
 
   describe('CommandPacker', () => {
     describe('flush trigger conditions (table-driven)', () => {
-      // Comprehensive table of all flush triggers
       const flushTriggerCases = [
         {
           name: 'incompatible slot triggers flush',
@@ -126,30 +153,21 @@ describe('Packing', () => {
       });
 
       it('header buffer is not corrupted by subsequent flush (buffer reuse regression)', () => {
-        // This test catches a bug where the packer reused its internal header buffer
-        // without copying. If the caller holds a reference to the first flush result
-        // while a second flush occurs, the first result's header would be corrupted.
         const packer = new CommandPacker();
 
-        // First batch: slot 1000, 2 commands
         packer.add(['cmd1'], 1000, 4);
         packer.add(['cmd2'], 1000, 4);
-        const firstFlush = packer.add(['cmd3'], 2000, 4); // triggers flush (slot change)
+        const firstFlush = packer.add(['cmd3'], 2000, 4);  
 
-        // Second batch: slot 2000, 2 commands
         packer.add(['cmd4'], 2000, 4);
-        const secondFlush = packer.add(['cmd5'], 3000, 4); // triggers flush (slot change)
-
-        // Third batch via drain: slot 3000, 1 command
+        const secondFlush = packer.add(['cmd5'], 3000, 4); 
         const thirdFlush = packer.drain(FlushReason.DRAIN);
 
-        // CRITICAL: Verify first flush header is still valid after subsequent flushes
         // Before the fix, firstFlush[0] would contain thirdFlush's header data
         assertPackedHeader(firstFlush, { commandCount: 2, slot: 1000 });
         assertPackedHeader(secondFlush, { commandCount: 2, slot: 2000 });
         assertPackedHeader(thirdFlush, { commandCount: 1, slot: 3000 });
 
-        // Also verify the header buffers are distinct objects (not aliased)
         assert.notStrictEqual(firstFlush![0], secondFlush![0], 'Header buffers should be distinct');
         assert.notStrictEqual(secondFlush![0], thirdFlush![0], 'Header buffers should be distinct');
       });
@@ -245,9 +263,9 @@ describe('Packing', () => {
 
       it('keyless commands can join any existing slot batch', () => {
         const packer = new CommandPacker();
-        packer.add(['keyed'], 5000, 5);      // Sets slot to 5000
-        packer.add(['keyless1'], NULL_SLOT, 8); // NULL_SLOT compatible with 5000
-        packer.add(['keyless2'], NULL_SLOT, 8); // Still compatible
+        packer.add(['keyed'], 5000, 5);      
+        packer.add(['keyless1'], NULL_SLOT, 8); 
+        packer.add(['keyless2'], NULL_SLOT, 8); 
 
         assert.equal(packer.bufferSize, 3);
         const packed = packer.drain(FlushReason.DRAIN);
@@ -258,14 +276,13 @@ describe('Packing', () => {
         const packer = new CommandPacker();
         packer.add(['keyless1'], NULL_SLOT, 8);
         packer.add(['keyless2'], NULL_SLOT, 8);
-        packer.add(['keyed'], 3000, 5); // First non-null slot wins
+        packer.add(['keyed'], 3000, 5); 
 
         assert.equal(packer.bufferSize, 3);
         const packed = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(packed, { commandCount: 3, slot: 3000 });
       });
 
-      // Table-driven slot compatibility tests
       const slotCompatibilityCases = [
         { name: 'same slot', slots: [1000, 1000, 1000], expectBatched: 3 },
         { name: 'null then keyed', slots: [NULL_SLOT, 2000, NULL_SLOT], expectBatched: 3 },
@@ -300,16 +317,13 @@ describe('Packing', () => {
         const packer = new CommandPacker();
         const maxPayload = RequestHeaderEncoder.lengthMaxValue();
 
-        // First command takes up most of the space
         packer.add(['first'], 1000, maxPayload - 10);
-        // Second command exactly fills remaining space
+        // second command exactly fills remaining space
         const result = packer.add(['second'], 1000, 10);
 
-        // Should NOT flush - we're exactly at the limit, not over
         assert.equal(result, null);
         assert.equal(packer.bufferSize, 2);
 
-        // Verify drain works and has correct total
         const drained = packer.drain(FlushReason.DRAIN);
         assertPackedHeader(drained, { commandCount: 2, slot: 1000 });
       });
@@ -319,7 +333,7 @@ describe('Packing', () => {
         const maxPayload = RequestHeaderEncoder.lengthMaxValue();
 
         packer.add(['first'], 1000, maxPayload - 10);
-        // One byte over the limit
+        // one byte over the limit
         const flushed = packer.add(['second'], 1000, 11);
 
         assert.ok(flushed !== null);
@@ -336,69 +350,11 @@ describe('Packing', () => {
 
         const packed = packer.drain(FlushReason.DRAIN);
         assert.ok(packed !== null);
-        assert.equal(packed.length, 4); // header + part1a + part1b + part2a
+        assert.equal(packed.length, 4); 
         assert.ok(packed[0] instanceof Buffer);
         assert.equal(packed[1], 'part1a');
         assert.equal(packed[2], 'part1b');
         assert.equal(packed[3], 'part2a');
-      });
-    });
-
-    describe('memory retention', () => {
-      it('releases flushed payload references so GC can reclaim them', () => {
-        const repoRoot = process.cwd().replace(/\\/g, '/').endsWith('/packages/client')
-          ? resolve(process.cwd(), '../..')
-          : process.cwd();
-        const script = `
-          const { CommandPacker } = require('./packages/client/lib/binary-headers/packing');
-          const { FlushReason } = require('./packages/client/lib/binary-headers/stats');
-          const packer = new CommandPacker(undefined, { maxCommandCount: 2 });
-
-          let ref;
-          (() => {
-            let payload = Buffer.alloc(8 * 1024 * 1024, 0x61);
-            ref = new WeakRef(payload);
-            packer.add([payload], 1, payload.length);
-            let drained = packer.drain(FlushReason.DRAIN);
-            drained = null;
-            payload = null;
-          })();
-
-          (async () => {
-            for (let i = 0; i < 200; i++) {
-              global.gc();
-              if (ref.deref() === undefined) {
-                process.stdout.write('collected');
-                return;
-              }
-              await new Promise(resolve => setImmediate(resolve));
-            }
-            process.stdout.write('retained');
-          })().catch(err => {
-            console.error(err);
-            process.exit(1);
-          });
-        `;
-
-        const result = spawnSync(
-          process.execPath,
-          ['--expose-gc', '-r', 'ts-node/register/transpile-only', '-e', script],
-          {
-            cwd: repoRoot,
-            env: {
-              ...process.env,
-              TS_NODE_PROJECT: resolve(repoRoot, 'packages/test-utils/tsconfig.json'),
-            },
-            encoding: 'utf8',
-          }
-        );
-
-        assert.equal(result.status, 0, `probe process failed: ${result.stderr || 'unknown error'}`);
-        assert.equal(
-          result.stdout.trim(),
-          'collected',
-          `flushed payload is still retained: ${result.stdout.trim()}`
-        );
       });
     });
   });

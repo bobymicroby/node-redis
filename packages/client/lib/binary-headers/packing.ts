@@ -4,14 +4,9 @@ import type { SocketChunk, Cancellable, Scheduler } from './wire-codec';
 import { FlushReason, disabledBinaryHeaderStatsCounter } from './stats';
 import type { BinaryHeaderStatsCounter } from './stats';
 
-// Re-export for convenience (canonical source is wire-codec.ts)
 export type { Cancellable, Scheduler };
-
 const NULL_SLOT = RequestHeaderEncoder.slotNullValue();
 
-/**
- * Options for CommandPacker flush thresholds.
- */
 export interface CommandPackerOptions {
   /**
    * Maximum number of commands per batch before triggering a flush.
@@ -74,7 +69,6 @@ export class CommandPacker {
   readonly #statsCounter: BinaryHeaderStatsCounter;
   readonly #maxCommandCount: number;
   readonly #maxPayloadLength: number;
-  // Pre-allocate array to avoid reallocations - use index instead of push/length=0
   readonly #resps: Array<SocketChunk | undefined>;
   #respCount: number = 0;
 
@@ -94,7 +88,6 @@ export class CommandPacker {
     this.#maxCommandCount = options?.maxCommandCount ?? codecMaxCommandCount;
     this.#maxPayloadLength = options?.maxPayloadLength ?? codecMaxPayloadLength;
 
-    // Validate bounds
     if (this.#maxCommandCount < 1 || this.#maxCommandCount > codecMaxCommandCount) {
       throw new Error(`maxCommandCount must be between 1 and ${codecMaxCommandCount}, got ${this.#maxCommandCount}`);
     }
@@ -113,7 +106,6 @@ export class CommandPacker {
     }
     this.#nextClientIdx = initialClientIdx;
 
-    // Pre-allocate array to max size to avoid reallocations
     this.#resps = new Array(this.#maxCommandCount);
   }
 
@@ -204,13 +196,11 @@ export class CommandPacker {
       clientIdx
     );
 
-    // Calculate total parts needed
     let totalParts = 1;
     for (let i = 0; i < count; i++) {
       totalParts += this.#resps[i]!.length;
     }
 
-    // Build result array
     const result = new Array<RedisArgument>(totalParts);
     result[0] = header;
 
@@ -221,11 +211,9 @@ export class CommandPacker {
       for (let j = 0; j < respLen; j++) {
         result[idx++] = resp[j];
       }
-      // Drop references to flushed payload chunks so GC can reclaim buffers promptly.
       this.#resps[i] = undefined;
     }
 
-    // Reset state without reallocating array
     this.#respCount = 0;
     this.#resolvedSlot = NULL_SLOT;
     this.#totalPayloadLength = 0;
