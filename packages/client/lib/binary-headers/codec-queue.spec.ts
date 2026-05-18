@@ -8,11 +8,8 @@ import { RequestHeaderDecoder } from './generated/request-header-codec';
 import { DefaultBinaryHeaderStatsCounter, FlushReason } from './stats';
 import type { WireCodec } from './wire-codec';
 import {
-  // Async utilities
   delay,
-  // Frame utilities
   createBinhdrFrame,
-  // RESP utilities
   parseRespCommands,
   parseRespCommandStrings,
   parseRequestFrames,
@@ -21,19 +18,14 @@ import {
   respBulkString,
   respError,
   respNull,
-  // Chunking utilities
   splitAt,
   splitIntoBytes,
-  // Stress utilities
   largeBuffer,
-  // Collection helpers
   collectYielded,
   collectYieldedParsed,
-  // Assertion helpers
   assertPackedHeader,
   assertPackedData,
   assertStats,
-  // Queue factories
   createNoCodecQueue,
   createBinhdrQueue,
   createBinhdrQueueWithTimer,
@@ -41,23 +33,16 @@ import {
   createBinhdrQueueWithStats,
   createBinhdrQueueWithTimerAndStats,
   forQueues,
-  // Re-exports
   createTimeoutScheduler,
   createImmediateScheduler,
   STATIC_RESOLVER,
   ResponseHeaderEncoder,
-  // Scheduler utilities
   createTrackingScheduler,
-  // Types
   type TestableQueue,
   type TestableQueueWithTimer,
   type TestableQueueWithStats,
   type TestableQueueWithTimerAndStats,
 } from './test-utils';
-
-// ============================================================================
-// Tests for RedisCommandsQueue with codec support
-// ============================================================================
 
 function fakeCommand(args: string[]): CommandToWrite {
   return {
@@ -87,6 +72,24 @@ function decodeOutgoingHeader(chunk: ReadonlyArray<unknown>): { commandCount: nu
     commandCount: decoder.commandCount(),
     clientIdx: decoder.clientIdx(),
   };
+}
+
+function addCommands(queue: Pick<TestableQueue, 'addCommand'>, commands: string[][]): void {
+  for (const command of commands) {
+    queue.addCommand(command);
+  }
+}
+
+function assertSinglePackedWrite(
+  writes: ReadonlyArray<ReadonlyArray<unknown>>,
+  commands: string[][],
+  message = 'expected one packed write'
+): void {
+  assert.equal(writes.length, 1, message);
+  assertPackedData(writes[0], {
+    commandCount: commands.length,
+    commands
+  });
 }
 
 function assertRequestFramesData(
@@ -129,8 +132,9 @@ function responseFramesForWrites(
   return frames;
 }
 
-describe('Codec Queue [codec-queue]', function () {
-  describe('without codec (master vs no-codec verification)', function () {
+describe('Wire Codec', function () {
+describe('queue from master branch behaves the same as the new implementation with no codecs enabled', function () {
+
     forQueues(['master', 'no-codec'], 'single command', (queue) => {
       queue.addCommand(['PING']);
       assert.deepEqual(collectYieldedParsed(queue), [[['PING']]]);
@@ -188,23 +192,19 @@ describe('Codec Queue [codec-queue]', function () {
     });
   });
 
-  describe('with BinaryHeadersCodec (static resolver)', function () {
-    // Table-driven tests for batching behavior
+  describe('with BinaryHeadersCodec using static resolver', function () {
     const batchingCases = [
-      { name: 'single command is batched with header', commands: [['PING']], expectedYields: 1, expectedCommandCount: 1 },
-      { name: 'multiple same-slot commands batched together', commands: [['PING'], ['PING'], ['PING']], expectedYields: 1, expectedCommandCount: 3 },
-      { name: 'keyless commands batch together', commands: [['TIME'], ['PING'], ['ECHO', 'hi']], expectedYields: 1, expectedCommandCount: 3 },
+      { name: 'single command is batched with header', commands: [['PING']] },
+      { name: 'multiple same-slot commands batched together', commands: [['PING'], ['PING'], ['PING']] },
+      { name: 'keyless commands batch together', commands: [['TIME'], ['PING'], ['ECHO', 'hi']] },
     ];
 
-    for (const { name, commands, expectedYields, expectedCommandCount } of batchingCases) {
+    for (const { name, commands } of batchingCases) {
       it(name, function () {
         const queue = createBinhdrQueue();
-        commands.forEach((cmd) => queue.addCommand(cmd));
+        addCommands(queue, commands);
 
-        const results = collectYielded(queue);
-
-        assert.equal(results.length, expectedYields, `Expected ${expectedYields} yield(s)`);
-        assertPackedHeader(results[0], { commandCount: expectedCommandCount });
+        assertSinglePackedWrite(collectYielded(queue), commands);
       });
     }
 
@@ -229,7 +229,8 @@ describe('Codec Queue [codec-queue]', function () {
     for (const { name, commands, expected } of passthroughCases) {
       it(name, function () {
         const queue = createPassthroughQueue();
-        commands.forEach((cmd) => queue.addCommand(cmd));
+        addCommands(queue, commands);
+
         assert.deepEqual(collectYieldedParsed(queue), expected);
       });
     }
@@ -298,18 +299,14 @@ describe('Codec Queue [codec-queue]', function () {
     it('without scheduler: generator drains immediately at end', function () {
       // Create queue WITHOUT timer/scheduler
       const queue = createBinhdrQueue();
+      const commands = [['SET', 'key', 'value1'], ['GET', 'key']];
 
-      queue.addCommand(['SET', 'key', 'value1']);
-      queue.addCommand(['GET', 'key']);
+      addCommands(queue, commands);
 
       const results = collectYielded(queue);
 
       // Should yield because drain happens at end (no scheduler)
-      assert.equal(results.length, 1, 'Generator should drain when no scheduler');
-      assertPackedData(results[0], {
-        commandCount: 2,
-        commands: [['SET', 'key', 'value1'], ['GET', 'key']]
-      });
+      assertSinglePackedWrite(results, commands, 'Generator should drain when no scheduler');
     });
 
     it('timer fires and flushes buffered commands via callback', async function () {
@@ -318,7 +315,8 @@ describe('Codec Queue [codec-queue]', function () {
       queue.setWriteHandler((writes) => { flushedData.push(...writes); });
 
       // Add command and consume generator (yields nothing due to scheduler)
-      queue.addCommand(['SET', 'key', 'value']);
+      const commands = [['SET', 'key', 'value']];
+      addCommands(queue, commands);
       const results = collectYielded(queue);
       assert.equal(results.length, 0, 'Command should be buffered, not yielded');
 
@@ -326,11 +324,7 @@ describe('Codec Queue [codec-queue]', function () {
       await delay(20);
 
       // Timer should have invoked callback with packed data
-      assert.equal(flushedData.length, 1, 'Timer callback should have been called once');
-      assertPackedData(flushedData[0], {
-        commandCount: 1,
-        commands: [['SET', 'key', 'value']]
-      });
+      assertSinglePackedWrite(flushedData, commands, 'Timer callback should have been called once');
     });
 
     it('timer is cancelled when slot incompatibility causes flush, new timer scheduled for remaining', async function () {
@@ -961,14 +955,11 @@ describe('Codec Queue [codec-queue]', function () {
       let callbackCalled = false;
       (queue as RedisCommandsQueue).setWriteHandler(() => { callbackCalled = true; });
 
-      queue.addCommand(['SET', 'key', 'value']);
+      const commands = [['SET', 'key', 'value']];
+      addCommands(queue, commands);
       const results = collectYielded(queue);
 
-      assert.equal(results.length, 1, 'Command should be drained at end of generator');
-      assertPackedData(results[0], {
-        commandCount: 1,
-        commands: [['SET', 'key', 'value']]
-      });
+      assertSinglePackedWrite(results, commands, 'Command should be drained at end of generator');
 
       await delay(20);
       assert.equal(callbackCalled, false, 'Callback should never be invoked without timer');
@@ -978,19 +969,15 @@ describe('Codec Queue [codec-queue]', function () {
   describe('integration with existing components', function () {
     it('works with STATIC_RESOLVER for slot-based batching', function () {
       const queue = createBinhdrQueue();
+      const commands = [['SET', 'key1', 'value1'], ['GET', 'key1']];
 
       // Commands with same key hash to same slot
-      queue.addCommand(['SET', 'key1', 'value1']);
-      queue.addCommand(['GET', 'key1']);
+      addCommands(queue, commands);
 
       const results = collectYielded(queue);
 
       // Should be batched together (same slot)
-      assert.equal(results.length, 1);
-      assertPackedData(results[0], {
-        commandCount: 2,
-        commands: [['SET', 'key1', 'value1'], ['GET', 'key1']]
-      });
+      assertSinglePackedWrite(results, commands);
     });
 
     it('handles inbound binary header frames correctly', async function () {
@@ -1749,20 +1736,15 @@ describe('Auto-pipelining behavior', function () {
         // Note: no maxWaitMs, no scheduler
       });
       const queue = new RedisCommandsQueue(2, null, () => {}, '', interceptor);
+      const commands = [['SET', 'key1', 'value1'], ['GET', 'key1'], ['DEL', 'key1']];
 
       // Same-tick commands with same slot
-      queue.addCommand(['SET', 'key1', 'value1']);
-      queue.addCommand(['GET', 'key1']);
-      queue.addCommand(['DEL', 'key1']);
+      addCommands(queue, commands);
 
       // Consume generator - should yield ONE packed batch (drained at end)
       const results = collectYielded(queue);
 
-      assert.equal(results.length, 1, 'Should yield 1 packed batch');
-      assertPackedData(results[0], {
-        commandCount: 3,
-        commands: [['SET', 'key1', 'value1'], ['GET', 'key1'], ['DEL', 'key1']]
-      });
+      assertSinglePackedWrite(results, commands, 'Should yield 1 packed batch');
     });
 
     it('flushes on slot change and drains remaining at end', function () {
@@ -2338,7 +2320,7 @@ describe('Chunking scenarios (table-driven)', function () {
       const writes = collectYielded(queue);
 
       const frame = createBinhdrFrame(tc.payload, 1, decodeOutgoingHeader(writes[0]).clientIdx);
-      const chunks = tc.chunk(frame);
+      const chunks = tc.chunk(frame)
 
       for (const chunk of chunks) {
         queue.processIncomingData(chunk);
