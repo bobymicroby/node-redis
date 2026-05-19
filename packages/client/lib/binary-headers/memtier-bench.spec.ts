@@ -1,6 +1,8 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, afterEach } from 'mocha';
+import { build as buildHistogram, encodeIntoCompressedBase64 } from 'hdr-histogram-js';
 import RedisCommandsQueue from '../client/commands-queue';
+import { aggregateWorkerIntervalStats } from './memtier-bench';
 import type { Scheduler } from './wire-codec';
 import { BinaryHeadersCodec } from './codec';
 import { STATIC_RESOLVER } from './eligibility';
@@ -999,5 +1001,45 @@ describe('Explicit Pipeline (chainId) - No Timer Flush', function () {
       assert.equal(schedulerStats.scheduleCount, 0,
         'Timer should never be scheduled for explicit pipelines');
     });
+  });
+});
+
+describe('aggregateWorkerIntervalStats', function () {
+  function buildLatencyHistogram() {
+    return buildHistogram({
+      lowestDiscernibleValue: 10,
+      highestTrackableValue: 600_000_000,
+      numberOfSignificantValueDigits: 2,
+    });
+  }
+
+  function encodeEmpty() {
+    return encodeIntoCompressedBase64(buildLatencyHistogram());
+  }
+
+  it('returns the true combined p50 across workers, not the mean of per-worker p50s', function () {
+    // Worker A: 1000 SET samples at 100µs → per-worker p50 = 103µs
+    // Worker B:   10 SET samples at 10000µs → per-worker p50 = 10047µs
+    // True combined p50 (1010 samples, 99% of mass at 100µs): 103µs.
+    const histA = buildLatencyHistogram();
+    for (let i = 0; i < 1000; i++) histA.recordValue(100);
+
+    const histB = buildLatencyHistogram();
+    for (let i = 0; i < 10; i++) histB.recordValue(10000);
+
+    const workerA = {
+      setHistogram: encodeIntoCompressedBase64(histA),
+      getHistogram: encodeEmpty(),
+      errors: 0,
+    };
+    const workerB = {
+      setHistogram: encodeIntoCompressedBase64(histB),
+      getHistogram: encodeEmpty(),
+      errors: 0,
+    };
+
+    const result = aggregateWorkerIntervalStats([workerA, workerB], 1);
+
+    assert.equal(result.set.p50, 103_000);
   });
 });

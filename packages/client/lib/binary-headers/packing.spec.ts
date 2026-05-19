@@ -63,7 +63,7 @@ describe('Packing', () => {
   });
 
   describe('CommandPacker', () => {
-    describe('flush trigger conditions (table-driven)', () => {
+    describe('flush trigger conditions ', () => {
       const flushTriggerCases = [
         {
           name: 'incompatible slot triggers flush',

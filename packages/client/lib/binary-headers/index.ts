@@ -1,4 +1,3 @@
-// Binary Header Protocol Types
 export type {
   RequestHeader as BinaryRequestHeader,
 } from './generated/request-header-codec';
@@ -6,7 +5,6 @@ export type {
   ResponseHeader as BinaryResponseHeader,
 } from './generated/response-header-codec';
 
-// Binary Header Encoders/Decoders (generated low-level codecs)
 export {
   RequestHeaderEncoder,
   RequestHeaderDecoder,
@@ -19,7 +17,6 @@ export {
   hasProtocolError,
 } from './generated/response-header-codec';
 
-// Packing
 export {
   CommandPacker,
   createTimeoutScheduler,
@@ -27,7 +24,6 @@ export {
   calculatePayloadLength,
 } from './packing';
 
-// Eligibility
 export type {
   EligibilityResult,
   CommandRecord,
@@ -48,7 +44,6 @@ export {
   createEligibilityResolver,
 } from './eligibility';
 
-// Wire codec interfaces
 export type {
   OutboundCodec,
   InboundCodec,
@@ -64,7 +59,6 @@ export type {
   WriteBatch,
 } from './wire-codec';
 
-// Binary Headers Codec (integrates with commands-queue)
 export type {
   OnHeader,
   OnProtocolError,

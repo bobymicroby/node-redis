@@ -592,8 +592,8 @@ interface IntervalStatsMessage {
   type: 'interval-stats';
   workerId: number;
   intervalSec: number;
-  set: { count: number; p50: number; p99: number };
-  get: { count: number; p50: number; p99: number };
+  setHistogram: string;
+  getHistogram: string;
   errors: number;
 }
 
@@ -935,6 +935,27 @@ function computeSummaryFromHistogram(histogram: Histogram, durationSeconds: numb
   };
 }
 
+export function aggregateWorkerIntervalStats(
+  workerStats: ReadonlyArray<Pick<IntervalStatsMessage, 'setHistogram' | 'getHistogram' | 'errors'>>,
+  intervalSeconds: number
+): { set: StatsSummary; get: StatsSummary; errors: number } {
+  const mergedSet = createLatencyHistogram();
+  const mergedGet = createLatencyHistogram();
+  let errors = 0;
+
+  for (const stat of workerStats) {
+    mergedSet.add(decodeFromCompressedBase64(stat.setHistogram));
+    mergedGet.add(decodeFromCompressedBase64(stat.getHistogram));
+    errors += stat.errors;
+  }
+
+  return {
+    set: computeSummaryFromHistogram(mergedSet, intervalSeconds),
+    get: computeSummaryFromHistogram(mergedGet, intervalSeconds),
+    errors,
+  };
+}
+
 class MemtierStats {
   // Interval histograms (reset after each interval)
   readonly #setIntervalHist: Histogram = createLatencyHistogram();
@@ -978,6 +999,18 @@ class MemtierStats {
     this.#getIntervalHist.reset();
     this.#intervalErrors = 0;
 
+    return result;
+  }
+
+  snapshotIntervalEncoded(): { setHistogram: string; getHistogram: string; errors: number } {
+    const result = {
+      setHistogram: encodeIntoCompressedBase64(this.#setIntervalHist),
+      getHistogram: encodeIntoCompressedBase64(this.#getIntervalHist),
+      errors: this.#intervalErrors,
+    };
+    this.#setIntervalHist.reset();
+    this.#getIntervalHist.reset();
+    this.#intervalErrors = 0;
     return result;
   }
 
@@ -1807,14 +1840,14 @@ async function runWorkerBenchmark(workerConfig: WorkerConfig): Promise<void> {
 
   const intervalTimer = setInterval(() => {
     intervalCount++;
-    const snapshot = stats.snapshotInterval(config.interval);
+    const snap = stats.snapshotIntervalEncoded();
     const msg: IntervalStatsMessage = {
       type: 'interval-stats',
       workerId,
       intervalSec: intervalCount * config.interval,
-      set: { count: snapshot.set.ops * config.interval, p50: snapshot.set.p50, p99: snapshot.set.p99 },
-      get: { count: snapshot.get.ops * config.interval, p50: snapshot.get.p50, p99: snapshot.get.p99 },
-      errors: snapshot.errors,
+      setHistogram: snap.setHistogram,
+      getHistogram: snap.getHistogram,
+      errors: snap.errors,
     };
     process.send!(msg);
   }, config.interval * 1000);
@@ -2071,41 +2104,12 @@ async function runModeMultiProcess(
         );
 
         if (allReported && !config.hideHistogram) {
-          // Aggregate stats from all workers for this interval
-          let setOps = 0, getOps = 0, errors = 0;
-          let setP50Sum = 0, setP99Sum = 0, getP50Sum = 0, getP99Sum = 0;
-
+          const reported: IntervalStatsMessage[] = [];
           for (const arr of intervalStats.values()) {
             const stat = arr.find((s) => s.intervalSec === currentInterval);
-            if (stat) {
-              setOps += stat.set.count;
-              getOps += stat.get.count;
-              errors += stat.errors;
-              setP50Sum += stat.set.p50;
-              setP99Sum += stat.set.p99;
-              getP50Sum += stat.get.p50;
-              getP99Sum += stat.get.p99;
-            }
+            if (stat) reported.push(stat);
           }
-
-          const snapshot = {
-            set: {
-              ops: setOps / config.interval,
-              p50: setP50Sum / numWorkers,
-              p95: 0,
-              p99: setP99Sum / numWorkers,
-              p999: 0,
-            },
-            get: {
-              ops: getOps / config.interval,
-              p50: getP50Sum / numWorkers,
-              p95: 0,
-              p99: getP99Sum / numWorkers,
-              p999: 0,
-            },
-            errors,
-          };
-          printIntervalStats(currentInterval, snapshot);
+          printIntervalStats(currentInterval, aggregateWorkerIntervalStats(reported, config.interval));
         }
       } else if (msg.type === 'final-stats') {
         finalStats.set(msg.workerId, msg);
@@ -2376,23 +2380,23 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-// Entry point: detect if running as worker or main process
-if (isWorkerProcess) {
-  // Worker process: get npm version from env if set
-  const workerNpmVersion = process.env.MEMTIER_NPM_VERSION || undefined;
-  const workerUseCluster = process.env.MEMTIER_USE_CLUSTER === '1';
-  initializeRedisClient(workerNpmVersion, workerUseCluster);
-  runWorker()
-    .then(() => {
-      process.exit(0);
-    })
-    .catch((err) => {
-      console.error('Worker fatal error:', err);
+if (require.main === module) {
+  if (isWorkerProcess) {
+    const workerNpmVersion = process.env.MEMTIER_NPM_VERSION || undefined;
+    const workerUseCluster = process.env.MEMTIER_USE_CLUSTER === '1';
+    initializeRedisClient(workerNpmVersion, workerUseCluster);
+    runWorker()
+      .then(() => {
+        process.exit(0);
+      })
+      .catch((err) => {
+        console.error('Worker fatal error:', err);
+        process.exit(1);
+      });
+  } else {
+    main().catch((err) => {
+      console.error('Fatal error:', err);
       process.exit(1);
     });
-} else {
-  main().catch((err) => {
-    console.error('Fatal error:', err);
-    process.exit(1);
-  });
+  }
 }
