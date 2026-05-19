@@ -26,7 +26,7 @@ import {
 export type OnHeader = (header: BinaryResponseHeader) => void;
 export type OnProtocolError = (header: BinaryResponseHeader) => void;
 
-export interface BinaryHeadersOutboundOptions {
+export interface OutboundOptions {
   readonly resolver?: EligibilityResolver;
   /**
    * Maximum number of commands to batch before flushing.
@@ -44,22 +44,22 @@ export interface BinaryHeadersOutboundOptions {
    * Optional timer used for auto-pipelining segments.
    * Explicit pipeline segments always drain at iteration end instead.
    */
-  readonly timer?: BinaryHeadersOutboundTimerOptions;
+  readonly timer?: TimerOptions;
 }
 
-export interface BinaryHeadersOutboundTimerOptions {
+export interface TimerOptions {
   readonly maxWaitMs: number;
   readonly scheduler: Scheduler;
 }
 
-export interface BinaryHeadersInboundOptions {
+export interface InboundOptions {
   readonly onHeader?: OnHeader;
   readonly onProtocolError?: OnProtocolError;
 }
 
-export interface BinaryHeadersCodecOptions {
-  readonly outbound?: BinaryHeadersOutboundOptions;
-  readonly inbound?: BinaryHeadersInboundOptions;
+export interface CodecOptions {
+  readonly outbound?: OutboundOptions;
+  readonly inbound?: InboundOptions;
   readonly statsCounter?: BinaryHeaderStatsCounter;
   /**
    * Validate that inbound reply framing matches the packed requests emitted on
@@ -187,7 +187,7 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
   readonly #requestHeaderDecoder = new RequestHeaderDecoder();
 
   constructor(
-    options: BinaryHeadersOutboundOptions = {},
+    options: OutboundOptions = {},
     statsCounter?: BinaryHeaderStatsCounter,
     replyTracker?: ReplyTracker,
   ) {
@@ -471,7 +471,7 @@ export class BinaryHeadersInboundCodec implements InboundCodec {
   #payloadRemaining = 0;
   #binaryPayloadReplyCount = 0;
 
-  constructor(options: BinaryHeadersInboundOptions = {}, replyTracker?: ReplyTracker) {
+  constructor(options: InboundOptions = {}, replyTracker?: ReplyTracker) {
     this.#replyTracker = replyTracker ?? null;
     this.#onHeader = options.onHeader;
     this.#onProtocolError = options.onProtocolError;
@@ -605,7 +605,7 @@ export class BinaryHeadersCodec implements WireCodec {
   readonly inbound: BinaryHeadersInboundCodec;
   readonly #statsCounter: BinaryHeaderStatsCounter;
 
-  constructor(options: BinaryHeadersCodecOptions = {}) {
+  constructor(options: CodecOptions = {}) {
     this.#statsCounter = options.statsCounter ?? disabledBinaryHeaderStatsCounter();
     const replyTracker = options.validateReplyStream === false ? undefined : new ReplyTracker();
     this.inbound = new BinaryHeadersInboundCodec(options.inbound, replyTracker);

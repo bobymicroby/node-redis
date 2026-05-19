@@ -1,9 +1,8 @@
 /**
  * Binary Headers Statistics
  *
- * Provides statistics collection for binary headers batching,
- * following the same patterns as Caffeine cache.
- *
+ * Provides statistics collection for binary headers batching.
+ 
  * Key metrics:
  * - batchRate(): What percentage of commands are being batched?
  * - averageBatchSize(): How many commands per batch on average?

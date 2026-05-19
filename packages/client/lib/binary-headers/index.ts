@@ -68,10 +68,10 @@ export type {
 export type {
   OnHeader,
   OnProtocolError,
-  BinaryHeadersCodecOptions,
-  BinaryHeadersOutboundOptions,
-  BinaryHeadersOutboundTimerOptions,
-  BinaryHeadersInboundOptions,
+  CodecOptions,
+  OutboundOptions,
+  TimerOptions,
+  InboundOptions,
 } from './codec';
 
 export {
