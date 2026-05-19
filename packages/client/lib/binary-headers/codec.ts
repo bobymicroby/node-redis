@@ -437,11 +437,13 @@ export class BinaryHeadersOutboundCodec implements OutboundCodec {
 
 const HEADER_LENGTH = ResponseHeaderDecoder.ENCODED_LENGTH;
 const DESIGNATOR = ResponseHeaderDecoder.designatorConstantValue();
-const enum HeaderParseResult {
-  CONTINUE,
-  INVALID,
-  BUFFER_PARTIAL,
-}
+const HeaderParseResult = {
+  CONTINUE: 0,
+  INVALID: 1,
+  BUFFER_PARTIAL: 2,
+} as const;
+
+type HeaderParseResult = typeof HeaderParseResult[keyof typeof HeaderParseResult];
 
 /**
  * Developer note: inbound state model

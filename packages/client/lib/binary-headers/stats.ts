@@ -10,13 +10,15 @@
  * - Flush reason breakdown: Why are batches being flushed?
  */
 
-export const enum FlushReason {
-  SLOT_MISMATCH = 0,
-  MAX_COMMANDS = 1,
-  MAX_PAYLOAD = 2,
-  TIMER_EXPIRED = 3,
-  DRAIN = 4,
-}
+export const FlushReason = {
+  SLOT_MISMATCH: 0,
+  MAX_COMMANDS: 1,
+  MAX_PAYLOAD: 2,
+  TIMER_EXPIRED: 3,
+  DRAIN: 4,
+} as const;
+
+export type FlushReason = typeof FlushReason[keyof typeof FlushReason];
 
 /**
  * Immutable snapshot of binary headers statistics.
