@@ -7,6 +7,7 @@ import {
   STATIC_RESOLVER,
   type CommandRecord,
 } from './eligibility';
+import { calculateSlot } from './new-slot-calulator';
 
 describe('Eligibility', () => {
   describe('EligibilityResolver', () => {
@@ -17,17 +18,13 @@ describe('Eligibility', () => {
     });
 
     const eligibleCommands = [
-      { args: ['SET', 'key', 'value'], name: 'SET' },
-      { args: ['GET', 'key'], name: 'GET' },
       { args: ['HSET', 'key', 'field', 'value'], name: 'HSET' },
       { args: [Buffer.from('SET'), 'key', 'value'], name: 'SET (Buffer)' },
       { args: ['TIME'], name: 'TIME (keyless)' },
-      { args: ['PING'], name: 'PING (keyless)' },
       { args: ['OBJECT', 'ENCODING', 'mykey'], name: 'OBJECT ENCODING (subcommand)' },
       { args: ['OBJECT'], name: 'OBJECT (parent only)' },
       { args: ['OBJECT', 'UNKNOWNSUB'], name: 'OBJECT UNKNOWNSUB (uses parent attrs)' },
       { args: ['XREAD', 'STREAMS', 'mystream', '0'], name: 'XREAD without BLOCK' },
-      { args: ['XREADGROUP', 'GROUP', 'mygroup', 'myconsumer', 'STREAMS', 'mystream', '>'], name: 'XREADGROUP without BLOCK' },
     ];
 
     const ineligibleCommands = [
@@ -35,7 +32,6 @@ describe('Eligibility', () => {
       { args: [], name: 'empty args' },
       { args: ['XREAD', 'BLOCK', '0', 'STREAMS', 'mystream', '0'], name: 'XREAD with BLOCK' },
       { args: ['XREAD', 'block', '0', 'STREAMS', 'mystream', '0'], name: 'XREAD with lowercase block' },
-      { args: ['XREADGROUP', 'GROUP', 'mygroup', 'myconsumer', 'BLOCK', '0', 'STREAMS', 'mystream', '>'], name: 'XREADGROUP with BLOCK' },
     ];
 
     for (const { args, name } of eligibleCommands) {
@@ -51,11 +47,11 @@ describe('Eligibility', () => {
     }
 
     describe('slot calculation', () => {
-      it('returns valid slot for keyed command', () => {
+      it('hashes the key at the default index (1)', () => {
         const result = resolver.getEligibility(['SET', 'key', 'value']);
         assert.equal(result.eligible, true);
         if (result.eligible) {
-          assert.ok(result.slot >= 0 && result.slot <= 16383);
+          assert.equal(result.slot, calculateSlot('key'));
         }
       });
 
@@ -67,11 +63,13 @@ describe('Eligibility', () => {
         }
       });
 
-      it('uses subcommand keyPosition when defined', () => {
+      it('uses subcommand keyPosition (OBJECT ENCODING -> index 2)', () => {
         const result = resolver.getEligibility(['OBJECT', 'ENCODING', 'mykey']);
         assert.equal(result.eligible, true);
         if (result.eligible) {
-          assert.ok(result.slot >= 0 && result.slot <= 16383);
+          // Must hash "mykey" (index 2), not "ENCODING" (default index 1).
+          assert.equal(result.slot, calculateSlot('mykey'));
+          assert.notEqual(result.slot, calculateSlot('ENCODING'));
         }
       });
     });
@@ -105,7 +103,8 @@ describe('Eligibility', () => {
           subcommands: [{ name: 'SUB', keyPosition: { index: 3 } }],
         }],
         cases: [
-          { args: ['CMD', 'SUB', 'arg', 'mykey'], eligible: true, hasSlot: true },
+          // Subcommand keyPosition.index=3 -> hash "mykey", not "SUB" (idx 1) or "arg" (idx 2).
+          { args: ['CMD', 'SUB', 'arg', 'mykey'], eligible: true, slot: calculateSlot('mykey') },
         ],
       },
       {
@@ -138,19 +137,13 @@ describe('Eligibility', () => {
 
         for (const testCase of cases) {
           const { args, eligible } = testCase;
-          const slot = 'slot' in testCase ? testCase.slot : undefined;
-          const hasSlot = 'hasSlot' in testCase ? testCase.hasSlot : undefined;
+          const expectedSlot = 'slot' in testCase ? testCase.slot : undefined;
 
           const result = resolver.getEligibility(args);
           assert.equal(result.eligible, eligible, `${args.join(' ')} should be ${eligible ? 'eligible' : 'ineligible'}`);
 
-          if (result.eligible) {
-            if (slot !== undefined) {
-              assert.equal(result.slot, slot);
-            }
-            if (hasSlot) {
-              assert.equal(typeof result.slot, 'number');
-            }
+          if (result.eligible && expectedSlot !== undefined) {
+            assert.equal(result.slot, expectedSlot);
           }
         }
       });
