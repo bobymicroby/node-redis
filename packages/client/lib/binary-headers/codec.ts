@@ -574,29 +574,21 @@ export class BinaryHeadersInboundCodec implements InboundCodec {
     this.#payloadRemaining = this.#headerDecoder.length();
     this.#plainFrameScanner.reset();
 
-    if (this.#replyTracker !== null && (this.#onHeader !== undefined || this.#onProtocolError !== undefined)) {
+    const protocolErrorWanted =
+      this.#onProtocolError !== undefined && this.#headerDecoder.protocolError();
+    const needsHeader =
+      this.#replyTracker !== null || this.#onHeader !== undefined || protocolErrorWanted;
+
+    if (needsHeader) {
       const header = this.#headerDecoder.toObject();
-      this.#binaryPayloadReplyCount += this.#replyTracker.consumeBinaryHeader(header);
+      if (this.#replyTracker !== null) {
+        this.#binaryPayloadReplyCount += this.#replyTracker.consumeBinaryHeader(header);
+      }
       if (this.#onHeader !== undefined) {
         this.#onHeader(header);
       }
-      if (this.#onProtocolError !== undefined && header.protocolError) {
-        this.#onProtocolError(header);
-      }
-      return HeaderParseResult.CONTINUE;
-    }
-
-    if (this.#replyTracker !== null) {
-      this.#binaryPayloadReplyCount += this.#replyTracker.consumeBinaryHeader(this.#headerDecoder.toObject());
-    }
-
-    if (this.#onHeader !== undefined || (this.#onProtocolError !== undefined && this.#headerDecoder.protocolError())) {
-      const header = this.#headerDecoder.toObject();
-      if (this.#onHeader !== undefined) {
-        this.#onHeader(header);
-      }
-      if (this.#onProtocolError !== undefined && header.protocolError) {
-        this.#onProtocolError(header);
+      if (protocolErrorWanted) {
+        this.#onProtocolError!(header);
       }
     }
 
